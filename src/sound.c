@@ -1367,8 +1367,12 @@ static void out_feed(void)
         int manual = S.manual_mix;
         sound_mix(g_pcm, BUF_FRAMES);
         S.manual_mix = manual;
-        if (SDL_QueueAudio(g_dev, g_pcm, sizeof g_pcm) != 0)
+        if (SDL_QueueAudio(g_dev, g_pcm, sizeof g_pcm) != 0) {
+#ifdef RAMPAGE_XBOX
+            fprintf(stderr, "Xbox audio queue failed: %s\n", SDL_GetError());
+#endif
             break;
+        }
     }
 }
 
@@ -1376,8 +1380,12 @@ int sound_start(void)
 {
     if (g_dev)
         return 0;
-    if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0)
+    if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
+#ifdef RAMPAGE_XBOX
+        fprintf(stderr, "Xbox audio initialization failed: %s\n", SDL_GetError());
+#endif
         return -1;
+    }
     SDL_AudioSpec want, have;
     memset(&want, 0, sizeof want);
     want.freq = SOUND_RATE;
@@ -1386,11 +1394,20 @@ int sound_start(void)
     want.samples = BUF_FRAMES;
     want.callback = NULL;                        /* SDL_QueueAudio */
     if (!(g_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0))) {   /* SDL converts to what the device takes */
+#ifdef RAMPAGE_XBOX
+        fprintf(stderr, "Xbox audio device failed: %s\n", SDL_GetError());
+#endif
         SDL_QuitSubSystem(SDL_INIT_AUDIO);
         return -1;
     }
     out_feed();
     SDL_PauseAudioDevice(g_dev, 0);
+#ifdef RAMPAGE_XBOX
+    printf("Xbox audio: driver=%s rate=%d channels=%u format=%04x frames=%u queued=%lu bytes\n",
+           SDL_GetCurrentAudioDriver(), have.freq, (unsigned)have.channels, (unsigned)have.format,
+           (unsigned)have.samples, (unsigned long)SDL_GetQueuedAudioSize(g_dev));
+    fflush(stdout);
+#endif
     return 0;
 }
 

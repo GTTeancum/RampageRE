@@ -529,6 +529,16 @@ void rnd_video(Renderer *r, const uint8_t *rgba, int w, int h)
     r->video_w = w;
     r->video_h = h;
     r->video_new = 1;
+#ifdef RAMPAGE_XBOX
+    /* Release the movie's GPU allocation before loading the shell/world. Flush
+     * deferred GL draws and wait for DMA before the backend frees this storage. */
+    if (!rgba && r->video_tex) {
+        glFinish();
+        glDeleteTextures(1, &r->video_tex);
+        r->video_tex = 0;
+        r->video_tex_w = r->video_tex_h = 0;
+    }
+#endif
 }
 
 /* the movie's texture, uploaded when it changed */
