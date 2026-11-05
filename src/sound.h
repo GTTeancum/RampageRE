@@ -88,7 +88,12 @@ void sound_wrap_volumes(int on);
 /* introspection (tools, tests) */
 int  sound_event_count(void);
 const char *sound_event_name(int i);
-/* a sample of a bank (0 Rampage, 1 RShell) by its SDIR index, decoded: PCM, length, rate, loop start (-1 none) */
+/* A sample of a bank (0 Rampage, 1 RShell) by its SDIR index, decoded: PCM, length, rate, loop start (-1 none).
+ * In a bounded-cache build the returned PCM is borrowed until the next sample request/sound_update;
+ * callers that need it beyond that point must copy it. Active playback samples remain pinned. */
 int  sound_sample_pcm(int bank, int index, const int16_t **pcm, int *n, int *rate, int *loop);
+
+/* Decoded PCM cache bytes and peak (active samples are pinned; the cache limit is a soft target). */
+void sound_memory_usage(size_t *bytes, size_t *peak);
 
 #endif

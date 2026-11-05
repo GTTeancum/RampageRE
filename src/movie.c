@@ -6,6 +6,13 @@
 #include "plat.h"
 #include "movie.h"
 
+/* The original Xbox has SSE1, but no SSE2. Keep the portable path for other targets.
+ * RAMPAGE_MOVIE_XBOX_FAST permits the same code to be tested on a host. */
+#if defined(_XBOX) || defined(NXDK) || defined(RAMPAGE_MOVIE_XBOX_FAST)
+#define MOVIE_XBOX_FAST 1
+#include <xmmintrin.h>
+#endif
+
 /* ---------------------------------------------------------------- the variable length codes (Annex B) */
 typedef struct { const char *code; int val; } Code;
 typedef struct { int maxlen; int32_t *t; } Vlc;      /* t[peek(maxlen)] = val << 8 | length, 0 none */
@@ -132,33 +139,77 @@ static void vlc_add(Vlc *v, const Code *c, int n)
     }
 }
 
-static void vlc_new(Vlc *v, int maxlen)
+static int vlc_new(Vlc *v, int maxlen)
 {
     v->maxlen = maxlen;
     v->t = calloc((size_t)1 << maxlen, sizeof *v->t);
+    return v->t != NULL;
 }
 
-static void vlc_init(void)
+static int vlc_init(void)
 {
     if (vlc_ready)
-        return;
-    vlc_new(&V_MBA, 11); vlc_add(&V_MBA, MBA, N(MBA));
-    vlc_new(&V_MBT[0], 2); vlc_add(&V_MBT[0], MBT_I, N(MBT_I));
-    vlc_new(&V_MBT[1], 6); vlc_add(&V_MBT[1], MBT_P, N(MBT_P));
-    vlc_new(&V_MBT[2], 6); vlc_add(&V_MBT[2], MBT_B, N(MBT_B));
-    vlc_new(&V_CBP, 9); vlc_add(&V_CBP, CBP, N(CBP));
-    vlc_new(&V_MOTION, 10); vlc_add(&V_MOTION, MOTION, N(MOTION));
-    vlc_new(&V_DCY, 9); vlc_add(&V_DCY, DC_Y, N(DC_Y));
-    vlc_new(&V_DCC, 10); vlc_add(&V_DCC, DC_C, N(DC_C));
+        return 1;
+    Vlc *all[] = { &V_MBA, &V_MBT[0], &V_MBT[1], &V_MBT[2], &V_CBP, &V_MOTION, &V_DCY, &V_DCC, &V_DCT[0], &V_DCT[1] };
+    const int sizes[] = { 11, 2, 6, 6, 9, 10, 9, 10, 16, 16 };
+    for (int i = 0; i < N(all); i++) {
+        if (!vlc_new(all[i], sizes[i])) {
+            for (int j = 0; j <= i; j++) { free(all[j]->t); all[j]->t = NULL; }
+            return 0;
+        }
+    }
+    vlc_add(&V_MBA, MBA, N(MBA));
+    vlc_add(&V_MBT[0], MBT_I, N(MBT_I));
+    vlc_add(&V_MBT[1], MBT_P, N(MBT_P));
+    vlc_add(&V_MBT[2], MBT_B, N(MBT_B));
+    vlc_add(&V_CBP, CBP, N(CBP));
+    vlc_add(&V_MOTION, MOTION, N(MOTION));
+    vlc_add(&V_DCY, DC_Y, N(DC_Y));
+    vlc_add(&V_DCC, DC_C, N(DC_C));
     for (int t = 0; t < 2; t++) {
-        vlc_new(&V_DCT[t], 16);
         vlc_add(&V_DCT[t], t ? DCT1 : DCT0, t ? N(DCT1) : N(DCT0));
         vlc_add(&V_DCT[t], DCT_SHARED, N(DCT_SHARED));
     }
     vlc_ready = 1;
+    return 1;
 }
 
 /* ---------------------------------------------------------------- the bits */
+#ifdef MOVIE_XBOX_FAST
+/* MPEG-2 syntax and our VLC tables peek at most 23 bits. A 32-bit cache avoids
+ * software 64-bit shifts in the Pentium III inner loop. Zero padding is counted
+ * separately so even a truncated slice never forms a pointer beyond its object. */
+typedef struct { const uint8_t *p, *end; uint32_t cache; int bits, padding; } Bits;
+
+static void br_init(Bits *b, const uint8_t *p, const uint8_t *end)
+{
+    b->p = p; b->end = end; b->cache = 0; b->bits = 0; b->padding = 0;
+}
+static inline void br_fill(Bits *b)
+{
+    while ((unsigned)b->bits <= 24) {
+        uint32_t c = 0;
+        if (b->p < b->end) c = *b->p++;
+        else b->padding++;
+        b->cache |= c << (24 - b->bits);
+        b->bits += 8;
+    }
+}
+static inline uint32_t br_peek(Bits *b, int n)
+{
+    if (b->bits < n) br_fill(b);
+    return b->cache >> (32 - n);
+}
+static inline void br_skip(Bits *b, int n) { b->cache <<= n; b->bits -= n; }
+static inline uint32_t br_get(Bits *b, int n)
+{
+    if (n <= 0) return 0;
+    uint32_t v = br_peek(b, n);
+    br_skip(b, n);
+    return v;
+}
+static inline int br_over(const Bits *b) { return b->padding - b->bits / 8 > 2; }
+#else
 typedef struct { const uint8_t *p, *end; uint64_t cache; int bits; } Bits;
 
 static void br_init(Bits *b, const uint8_t *p, const uint8_t *end)
@@ -188,6 +239,7 @@ static inline uint32_t br_get(Bits *b, int n)
     return v;
 }
 static inline int br_over(const Bits *b) { return b->p - b->bits / 8 > b->end + 2; }   /* read past the end */
+#endif
 static inline int vlc_get(Bits *b, const Vlc *v)       /* the value, -1 no such code */
 {
     int32_t e = v->t[br_peek(b, v->maxlen)];
@@ -216,13 +268,19 @@ static const double FPS[16] = { 0, 24000.0 / 1001, 24, 25, 30000.0 / 1001, 30, 5
 
 typedef struct { uint8_t *p[3]; } Frame;               /* Y, Cb, Cr */
 
+#ifdef MOVIE_XBOX_FAST
+#define AU_CAP_MAX (512 << 10)
+#define STREAM_COMPACT (64 << 10)
+#else
 #define AU_CAP_MAX (4 << 20)                           /* the sound kept when nobody pulls it */
+#define STREAM_COMPACT (1 << 20)
+#endif
 
 struct Movie {
     FILE *f;
     int64_t base, size, at;                            /* the file's bytes in the Vol, read up to `at` */
     uint8_t io[1 << 16]; int io_n, io_pos;
-    int eof;
+    int eof, failed;
     uint8_t pes[65536 + 16];
     /* the video's elementary stream */
     uint8_t *es; size_t es_n, es_cap, es_pos;
@@ -273,14 +331,22 @@ static int getn(Movie *m, uint8_t *dst, int n)
     return n;
 }
 
-static void grow(uint8_t **buf, size_t *cap, size_t need)
+/* Preserve the old allocation if memory is exhausted. The 64 MB Xbox must be
+ * able to leave a movie cleanly instead of dereferencing a failed realloc. */
+static int grow(uint8_t **buf, size_t *cap, size_t need)
 {
     if (need <= *cap)
-        return;
+        return 1;
     size_t c = *cap ? *cap : 1 << 16;
-    while (c < need) c *= 2;
-    *buf = realloc(*buf, c);
+    while (c < need) {
+        if (c > SIZE_MAX / 2) { c = need; break; }
+        c *= 2;
+    }
+    uint8_t *next = realloc(*buf, c);
+    if (!next) return 0;
+    *buf = next;
     *cap = c;
+    return 1;
 }
 
 /* a packet's sound: the four bytes before the data (FF A1 00 00), the stream's header in the first */
@@ -292,8 +358,9 @@ static void audio_data(Movie *m, const uint8_t *p, int n)
     n -= 4;
     if (!m->au_head) {
         if (n >= 8 && !memcmp(p, "SShd", 4)) {
-            int sz = (int)rd32(p + 4);
-            if (sz >= 16 && n >= 8 + sz) {
+            uint32_t sz = rd32(p + 4);
+            if (sz > (uint32_t)(n - 8)) { m->eof = m->failed = 1; return; }
+            if (sz >= 16) {
                 m->au_rate = (int)rd32(p + 12);
                 m->au_ch = (int)rd32(p + 16);
                 m->au_inter = (int)rd32(p + 20);
@@ -315,12 +382,12 @@ static void audio_data(Movie *m, const uint8_t *p, int n)
     size_t blk = (size_t)m->au_ch * m->au_inter;
     if (m->au_n - m->au_pos > AU_CAP_MAX)                /* nobody listens: the oldest goes */
         m->au_pos += (m->au_n - m->au_pos - AU_CAP_MAX / 2) / blk * blk;
-    if (m->au_pos > (1 << 20)) {
+    if (m->au_pos > STREAM_COMPACT) {
         memmove(m->au, m->au + m->au_pos, m->au_n - m->au_pos);
         m->au_n -= m->au_pos;
         m->au_pos = 0;
     }
-    grow(&m->au, &m->au_cap, m->au_n + (size_t)n);
+    if (!grow(&m->au, &m->au_cap, m->au_n + (size_t)n)) { m->eof = m->failed = 1; return; }
     memcpy(m->au + m->au_n, p, (size_t)n);
     m->au_n += (size_t)n;
 }
@@ -380,12 +447,12 @@ static int demux(Movie *m)
     if (k >= len)
         return 1;
     if (id == 0xE0) {
-        if (m->es_pos > (1 << 20)) {
+        if (m->es_pos > STREAM_COMPACT) {
             memmove(m->es, m->es + m->es_pos, m->es_n - m->es_pos);
             m->es_n -= m->es_pos;
             m->es_pos = 0;
         }
-        grow(&m->es, &m->es_cap, m->es_n + (size_t)(len - k));
+        if (!grow(&m->es, &m->es_cap, m->es_n + (size_t)(len - k))) { m->eof = m->failed = 1; return 0; }
         memcpy(m->es + m->es_n, p + k, (size_t)(len - k));
         m->es_n += (size_t)(len - k);
     } else
@@ -430,6 +497,9 @@ static int next_unit(Movie *m, size_t *at, size_t *s, size_t *e)
 }
 
 /* ---------------------------------------------------------------- the IDCT (separable, float) */
+#ifdef MOVIE_XBOX_FAST
+static float IDCT_CT[8][8];                            /* [u][x], for four x values at once */
+#endif
 static float IDCT_C[8][8];                             /* [x][u] = C(u) / 2 cos((2x + 1) u pi / 16) */
 
 static void idct_init(void)
@@ -437,8 +507,48 @@ static void idct_init(void)
     for (int x = 0; x < 8; x++)
         for (int u = 0; u < 8; u++)
             IDCT_C[x][u] = (u ? 0.5f : 0.35355339f) * (float)cos((2 * x + 1) * u * 3.14159265358979 / 16);
+#ifdef MOVIE_XBOX_FAST
+    for (int u = 0; u < 8; u++)
+        for (int x = 0; x < 8; x++)
+            IDCT_CT[u][x] = IDCT_C[x][u];
+#endif
 }
 
+#ifdef MOVIE_XBOX_FAST
+/* SSE1 only. Four pixels share the same coefficients, so the arithmetic order
+ * of the scalar reference is preserved in each lane. No MMX state is used. */
+static void idct(const int16_t in[64], int out[64])
+{
+    float tmp[64];
+    for (int v = 0; v < 8; v++) {
+        const int16_t *r = in + 8 * v;
+        int any = 0;
+        for (int u = 1; u < 8; u++) any |= r[u];
+        for (int x = 0; x < 8; x += 4) {
+            __m128 s = _mm_mul_ps(_mm_set1_ps((float)r[0]), _mm_loadu_ps(IDCT_CT[0] + x));
+            if (any)
+                for (int u = 1; u < 8; u++)
+                    s = _mm_add_ps(s, _mm_mul_ps(_mm_set1_ps((float)r[u]), _mm_loadu_ps(IDCT_CT[u] + x)));
+            _mm_storeu_ps(tmp + 8 * v + x, s);
+        }
+    }
+    for (int y = 0; y < 8; y++)
+        for (int x = 0; x < 8; x += 4) {
+            __m128 s = _mm_setzero_ps();
+            for (int v = 0; v < 8; v++)
+                s = _mm_add_ps(s, _mm_mul_ps(_mm_loadu_ps(tmp + 8 * v + x), _mm_set1_ps(IDCT_C[y][v])));
+            s = _mm_add_ps(s, _mm_set1_ps(0.5f));
+            /* cvttss2si is SSE1. Truncation needs a correction below zero to
+             * implement floor(s + 0.5), rather than MXCSR's current rounding. */
+            for (int lane = 0; lane < 4; lane++) {
+                float f = _mm_cvtss_f32(s);
+                int i = _mm_cvttss_si32(s);
+                out[8 * y + x + lane] = i - ((float)i > f);
+                s = _mm_shuffle_ps(s, s, _MM_SHUFFLE(0, 3, 2, 1));
+            }
+        }
+}
+#else
 static void idct(const int16_t in[64], int out[64])
 {
     float tmp[64];
@@ -460,6 +570,8 @@ static void idct(const int16_t in[64], int out[64])
             out[8 * y + x] = (int)floorf(s + 0.5f);
         }
 }
+
+#endif
 
 static inline uint8_t clamp8(int v) { return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v); }
 
@@ -750,20 +862,29 @@ static void slice(Movie *m, const uint8_t *p, const uint8_t *end, int row)
 }
 
 /* ---------------------------------------------------------------- the headers */
-static void frames_alloc(Movie *m)
+static int frames_alloc(Movie *m)
 {
+    size_t y = (size_t)m->w * m->h;
+    uint8_t *frames[3] = { NULL, NULL, NULL };
+    uint8_t *rgba = calloc(y, 4);
+    for (int i = 0; i < 3; i++) frames[i] = malloc(y + y / 2);
+    if (!rgba || !frames[0] || !frames[1] || !frames[2]) {
+        free(rgba);
+        for (int i = 0; i < 3; i++) free(frames[i]);
+        return 0;
+    }
     for (int i = 0; i < 3; i++) {
         free(m->fr[i].p[0]);
-        size_t y = (size_t)m->w * m->h;
-        m->fr[i].p[0] = malloc(y + y / 2);
+        m->fr[i].p[0] = frames[i];
         memset(m->fr[i].p[0], 16, y);
         memset(m->fr[i].p[0] + y, 128, y / 2);
         m->fr[i].p[1] = m->fr[i].p[0] + y;
-        m->fr[i].p[2] = m->fr[i].p[1] + y / 4;
+        m->fr[i].p[2] = m->fr[i].p[0] + y + y / 4;
     }
     free(m->rgba);
-    m->rgba = calloc((size_t)m->w * m->h, 4);
+    m->rgba = rgba;
     m->ref_old = m->ref_new = m->disp = -1;
+    return 1;
 }
 
 static void load_matrix(Bits *b, uint8_t q[64])
@@ -791,7 +912,7 @@ static void sequence_header(Movie *m, Bits *b)
         m->h = h;
         m->mbw = w / 16;
         m->mbh = h / 16;
-        frames_alloc(m);
+        if (!frames_alloc(m)) { m->eof = m->failed = 1; m->have_seq = 0; return; }
     }
     m->have_seq = 1;
 }
@@ -864,6 +985,7 @@ static void picture_begin(Movie *m)
 static int decode_picture(Movie *m)
 {
     for (;;) {
+        if (m->failed) return 0;
         size_t at, s, e;
         int code = next_unit(m, &at, &s, &e);
         if (code < 0) {
@@ -908,9 +1030,10 @@ Movie *movie_open(const Vol *v, const char *name)
     const VolFile *vf = v ? vol_find(v, path) : NULL;
     if (!vf || vf->size < 2048 || vf->path)               /* streamed from the VOL; the Wii's movies are Bink */
         return NULL;
-    vlc_init();
+    if (!vlc_init()) return NULL;
     if (IDCT_C[0][0] == 0) idct_init();
     Movie *m = calloc(1, sizeof *m);
+    if (!m) return NULL;
     m->f = v->f;
     m->base = v->base + vf->offset;                      /* (a disc image: from the VOL's start in it) */
     m->size = vf->size;
@@ -927,7 +1050,7 @@ Movie *movie_open(const Vol *v, const char *name)
         if (!demux(m))
             break;
     }
-    if (!m->w) {
+    if (!m->w || m->failed) {
         movie_close(m);
         return NULL;
     }
@@ -1030,7 +1153,7 @@ const uint8_t *movie_video(Movie *m, double t, int *changed)
             m->flushed = 1;
         }
     }
-    if (m->disp < 0)
+    if (m->disp < 0 || m->failed)
         return NULL;
     if (!m->conv)
         convert(m);
@@ -1051,7 +1174,7 @@ int movie_planes(const Movie *m, const uint8_t *plane[3], int stride[3])
 
 int movie_done(const Movie *m, double t)
 {
-    return !m || (m->flushed && t * movie_fps(m) >= m->shown);
+    return !m || m->failed || (m->flushed && t * movie_fps(m) >= m->shown);
 }
 
 /* ---------------------------------------------------------------- the sound */

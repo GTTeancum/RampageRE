@@ -4,6 +4,9 @@
 #include <stdio.h>
 #include <string.h>
 #include "profile.h"
+#ifdef RAMPAGE_XBOX
+#include "plat.h"
+#endif
 
 #define CAMPAIGN 2                                   /* gCommon.getPlayType */
 

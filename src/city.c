@@ -3950,9 +3950,15 @@ static Bundle *own_bundle(const Vol *vol, Scene *s, const char *file)
 {
     uint32_t size;
     uint8_t *data = vol_read(vol, file, &size);
-    if (!data || s->nown == (int)(sizeof s->own / sizeof *s->own))
-        return free(data), NULL;
+    if (!data || s->nown == (int)(sizeof s->own / sizeof *s->own)) {
+        free(data);
+        return NULL;
+    }
     Bundle *b = calloc(1, sizeof *b);
+    if (!b) {
+        free(data);
+        return NULL;
+    }
     if (bdp_load(b, data, size) != 0) {
         free(data);
         free(b);

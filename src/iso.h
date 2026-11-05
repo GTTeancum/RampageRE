@@ -38,7 +38,7 @@ int data_parts(const char *path, DataPart part[3]);
 int data_find(char *out, size_t cap);
 int data_usable(const char *path);                       /* 1 = path is a RAMPAGE.VOL or an image (APK) with one */
 int data_remember(const char *path);                     /* path into the user's data folder's disc.txt; 1 = written */
-#if defined _WIN32 && !defined RAMPAGE_TOOL
+#if defined _WIN32 && !defined RAMPAGE_TOOL && !defined RAMPAGE_XBOX
 /* the first start on Windows (not under --shot): a message, then a file dialog for the disc image or RAMPAGE.VOL,
  * checked (data_usable) and remembered (data_remember). 1 = chosen (out), 0 = cancelled (plat_told set) */
 int data_ask(char *out, size_t cap);

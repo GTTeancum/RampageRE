@@ -16,7 +16,11 @@ static const char *const LANGUAGE_NAMES[8] = { "japanese", "english", "french", 
 
 static void defaults(Settings *s)
 {
+    #ifdef RAMPAGE_XBOX
+    s->width = 640; s->height = 480; s->fullscreen = 1; s->vsync = 1;
+#else
     s->width = 1280; s->height = 720; s->fullscreen = 0; s->vsync = 1;
+#endif
     s->ao = 0; s->ao_radius = 4;
     s->aniso = 1; s->mips = 0;
     s->smaa = 0; s->msaa = 0;

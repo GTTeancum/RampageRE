@@ -70,6 +70,24 @@ const VolFile *vol_find(const Vol *v, const char *name)
     return find_in(v->wii, v->nwii, wii);
 }
 
+int vol_read_range(const Vol *v, const VolFile *file, uint32_t offset, void *out, size_t size)
+{
+    if (!v || !file || offset > file->size || size > file->size - offset || (!out && size))
+        return -1;
+    if (!size)
+        return 0;
+    FILE *h = file->path ? fopen(file->path, "rb") : v->f;
+    int64_t base = file->path ? 0 : v->base;
+    if (base < 0 || base > INT64_MAX - (int64_t)file->offset - offset) {
+        if (file->path && h) fclose(h);
+        return -1;
+    }
+    int ok = h && _fseeki64(h, base + file->offset + offset, SEEK_SET) == 0 && fread(out, 1, size, h) == size;
+    if (file->path && h)
+        fclose(h);
+    return ok ? 0 : -1;
+}
+
 uint8_t *vol_read(const Vol *v, const char *name, uint32_t *size)
 {
     const VolFile *f = vol_find(v, name);

@@ -8,12 +8,15 @@
 #include <string.h>
 #include "autoplay.h"
 #include "game.h"
-#ifdef _WIN32
+#ifdef RAMPAGE_XBOX
+#include "plat.h"
+#endif
+#if defined(_WIN32) && !defined(RAMPAGE_XBOX)
 #define PSAPI_VERSION 2                              /* K32GetProcessMemoryInfo, in kernel32 */
 #include <windows.h>
 #include <psapi.h>
 #include <dbghelp.h>                                 /* the crash's stack, by the program's .pdb */
-#elif !defined __SWITCH__ && !defined __vita__       /* (no getrusage on the Switch, none with ru_maxrss on the
+#elif !defined __SWITCH__ && !defined __vita__ && !defined RAMPAGE_XBOX       /* (no getrusage on the Switch, none with ru_maxrss on the
                                                      * Vita: no memory figures) */
 #define AP_RUSAGE 1
 #include <sys/resource.h>
@@ -62,7 +65,7 @@ static Autoplay *g_ap;                               /* for the crash handlers *
 
 double ap_peak_mb(void)
 {
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(RAMPAGE_XBOX)
     PROCESS_MEMORY_COUNTERS pmc;
     if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc))
         return (double)pmc.PeakWorkingSetSize / (1024.0 * 1024.0);
@@ -83,7 +86,7 @@ double ap_peak_mb(void)
 
 static double mem_now(void)                          /* the working set now (MB), -1 unknown */
 {
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(RAMPAGE_XBOX)
     PROCESS_MEMORY_COUNTERS pmc;
     if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc))
         return (double)pmc.WorkingSetSize / (1024.0 * 1024.0);
@@ -175,7 +178,7 @@ static void crash_write(const char *what)
     fprintf(g_ap->log, "CRASH t=%.1f what=%s last=\"%s\"\n", g_ap->t, what, g_ap->summary);
     fflush(g_ap->log);
 }
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(RAMPAGE_XBOX)
 static LONG WINAPI crash_filter(EXCEPTION_POINTERS *e)
 {
     char what[128];
@@ -256,7 +259,7 @@ Autoplay *ap_open(const char *log, const char *shots, const ApLimits *lim, const
     fprintf(a->log, "RUN %s\n", what ? what : "");
     fflush(a->log);
     g_ap = a;
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(RAMPAGE_XBOX)
     SetUnhandledExceptionFilter(crash_filter);
 #else
     signal(SIGSEGV, crash_signal);

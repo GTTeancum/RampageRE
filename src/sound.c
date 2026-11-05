@@ -48,9 +48,27 @@ static inline double spu_step(int rate)
 }
 
 /* ---- the banks ([R] FORMAT_SOUND.md: UBER = PROJ, POOL, SDIR, group counts, group names, names) */
-typedef struct { int16_t *pcm; int n, loop, rate, tried; } Sample;
+/* Cache is unlimited for existing platforms. Low-memory builds evict idle samples
+ * before decoding a new one. Active voices are always pinned, even if their working
+ * set exceeds the target; no sound is silently omitted to satisfy a soft budget. */
+#ifndef RAMPAGE_AUDIO_CACHE_BYTES
+#ifdef RAMPAGE_LOW_MEMORY
+#define RAMPAGE_AUDIO_CACHE_BYTES (4u * 1024u * 1024u)
+#else
+#define RAMPAGE_AUDIO_CACHE_BYTES 0u
+#endif
+#endif
+#define AUDIO_READ_BYTES 4096u
 typedef struct {
-    uint8_t *uber, *samp;
+    int16_t *pcm;
+    int n, loop, rate, tried;
+    size_t bytes;
+    uint64_t used;
+} Sample;
+typedef struct {
+    uint8_t *uber;
+    const Vol *vol;
+    VolFile sample_file;
     uint32_t uber_size, samp_size;
     uint8_t *proj, *pool, *sdir;         /* their headers; entries from +0x10 */
     int nproj, npool, nsdir;
@@ -111,8 +129,10 @@ typedef struct {
 
 /* a music slot (SoundDevice +0x3D4, 0x14 each) and its stream */
 typedef struct {
-    uint8_t *data;
-    uint32_t size;
+    VolFile file;
+    uint32_t head;
+    uint8_t data[2][AUDIO_READ_BYTES];
+    int cached_block, cached_frame, cached_frames;
     int on, loop, ch, rate, inter, blocks;   /* on: +0x00 (the stream's handle) not -1 */
     int block, frame;                    /* the next ADPCM frame */
     int16_t pcm[2][28];
@@ -129,6 +149,8 @@ static struct {
     const Vol *vol;
     Bank bank[MAX_BANKS];
     int nbanks;
+    size_t sample_bytes, sample_peak;
+    uint64_t sample_clock;
     Inst inst[MAX_INST];
     Voice voice[MAX_INST];               /* one per instance slot */
     Track track[MAX_TRACKS];
@@ -177,6 +199,57 @@ static void adpcm_frame(const uint8_t *f, int16_t *out, int *h1, int *h2)
     }
 }
 
+static void sample_make_room(size_t bytes)
+{
+    size_t target = RAMPAGE_AUDIO_CACHE_BYTES;
+    if (!target)
+        return;
+    while (S.sample_bytes > target || bytes > target - S.sample_bytes) {
+        Sample *oldest = NULL;
+        for (int b = 0; b < S.nbanks; b++)
+            for (int i = 0; i < S.bank[b].nsdir; i++) {
+                Sample *candidate = &S.bank[b].smp[i];
+                if (!candidate->pcm)
+                    continue;
+                int pinned = 0;
+                for (int j = 0; j < MAX_INST; j++)
+                    if (S.voice[j].on && S.voice[j].s == candidate) { pinned = 1; break; }
+                if (!pinned && (!oldest || candidate->used < oldest->used))
+                    oldest = candidate;
+            }
+        if (!oldest)
+            break;
+        S.sample_bytes -= oldest->bytes;
+        free(oldest->pcm);
+        memset(oldest, 0, sizeof *oldest);  /* evicted is not failed: it can be decoded again */
+    }
+}
+
+static int sample_alloc(Sample *s, size_t bytes)
+{
+    sample_make_room(bytes);
+    s->pcm = malloc(bytes ? bytes : 1);
+    if (!s->pcm) {
+        s->tried = 0;                  /* retry after transient memory pressure */
+        return -1;
+    }
+    s->bytes = bytes;
+    s->used = ++S.sample_clock;
+    S.sample_bytes += bytes;
+    if (S.sample_bytes > S.sample_peak)
+        S.sample_peak = S.sample_bytes;
+    return 0;
+}
+
+static void sample_discard(Sample *s)
+{
+    if (s->pcm) {
+        S.sample_bytes -= s->bytes;
+        free(s->pcm);
+    }
+    memset(s, 0, sizeof *s);             /* a failed I/O can be retried on the next request */
+}
+
 /* a Wii sample (tools/sound.py dsp_decode, FORMAT_SOUND.md "The Wii's banks"): its SDIR entry (64 bytes, big endian)
  * u32 nibble address of the first sample, u32 nibbles, u32 flags, u32 rate, s16[16] the DSP-ADPCM coefficients; the
  * .samp 8-byte frames of a header (predictor << 4 | scale, its two nibbles counted in the addresses) and 14 nibbles. A
@@ -190,15 +263,26 @@ static Sample *wii_sample(Bank *b, int idx, Sample *s)
         coef[k] = (int16_t)rd16be(e + 16 + 2 * k);
     if (start == 0xFFFFFFFFu || ((uint64_t)start + count + 15) / 16 * 8 > b->samp_size)
         return NULL;
-    s->pcm = malloc(sizeof(int16_t) * (count ? count : 1));
-    if (!s->pcm)
+    if (count > INT32_MAX || sample_alloc(s, sizeof(int16_t) * (size_t)count) != 0)
         return NULL;
+    uint8_t chunk[AUDIO_READ_BYTES];
+    uint32_t chunk_at = UINT32_MAX, chunk_size = 0;
     s->rate = (int)rd32be(e + 12);
     int h1 = 0, h2 = 0, n = 0;
-    for (uint32_t a = start; a < start + count; a++) {
+    for (uint64_t a = start; a < (uint64_t)start + count; a++) {
         if (a % 16 < 2)                  /* the frame's header */
             continue;
-        uint8_t ps = b->samp[a / 16 * 8], byte = b->samp[a / 2];
+        uint32_t byte_at = a / 2;
+        if (chunk_at == UINT32_MAX || byte_at < chunk_at || byte_at - chunk_at >= chunk_size) {
+            chunk_at = (byte_at / AUDIO_READ_BYTES) * AUDIO_READ_BYTES;
+            chunk_size = b->samp_size - chunk_at;
+            if (chunk_size > AUDIO_READ_BYTES) chunk_size = AUDIO_READ_BYTES;
+            if (vol_read_range(b->vol, &b->sample_file, chunk_at, chunk, chunk_size) != 0) {
+                sample_discard(s);
+                return NULL;
+            }
+        }
+        uint8_t ps = chunk[a / 16 * 8 - chunk_at], byte = chunk[byte_at - chunk_at];
         int nib = a % 2 ? byte & 15 : byte >> 4;
         int v = ((nib ^ 8) - 8) * (1 << (ps & 15)) * 2048;   /* the signed nibble, scaled */
         v = (v + 1024 + coef[2 * (ps >> 4)] * h1 + coef[2 * (ps >> 4) + 1] * h2) >> 11;
@@ -217,8 +301,10 @@ static Sample *sample_get(Bank *b, int idx)
     if (idx <= 0 || idx >= b->nsdir)
         return NULL;
     Sample *s = &b->smp[idx];
-    if (s->tried)
+    if (s->tried) {
+        if (s->pcm) s->used = ++S.sample_clock;
         return s->pcm ? s : NULL;
+    }
     s->tried = 1;
     if (b->wii)
         return wii_sample(b, idx, s);
@@ -227,14 +313,23 @@ static Sample *sample_get(Bank *b, int idx)
     if (off == 0xFFFFFFFFu || off > b->samp_size || size > b->samp_size - off)
         return NULL;
     int frames = (int)(size / 16);
-    s->pcm = malloc(sizeof(int16_t) * 28 * (frames ? frames : 1));
-    if (!s->pcm)
+    if ((uint32_t)frames > INT32_MAX / 28 ||
+        sample_alloc(s, sizeof(int16_t) * 28 * (size_t)frames) != 0)
         return NULL;
+    uint8_t chunk[AUDIO_READ_BYTES];
     s->rate = (int)rd32(e + 12);
     s->loop = -1;
     int h1 = 0, h2 = 0, n = 0, start = 0;
     for (int i = 0; i < frames; i++) {
-        const uint8_t *f = b->samp + off + 16 * i;
+        if (i % (AUDIO_READ_BYTES / 16) == 0) {
+            uint32_t left = size - 16u * (uint32_t)i;
+            if (left > AUDIO_READ_BYTES) left = AUDIO_READ_BYTES;
+            if (vol_read_range(b->vol, &b->sample_file, off + 16u * (uint32_t)i, chunk, left) != 0) {
+                sample_discard(s);
+                return NULL;
+            }
+        }
+        const uint8_t *f = chunk + 16 * (i % (AUDIO_READ_BYTES / 16));
         if (f[1] & 4)                    /* [R] loop start */
             start = n;
         adpcm_frame(f, s->pcm + n, &h1, &h2);
@@ -293,8 +388,13 @@ static int bank_load(Bank *b, const Vol *v, const char *name, int wii)
     snprintf(path, sizeof path, "%s.uber", name);
     b->uber = wii ? vol_read_wii(v, path, &b->uber_size) : vol_read(v, path, &b->uber_size);
     snprintf(path, sizeof path, "%s.samp", name);
-    b->samp = wii ? vol_read_wii(v, path, &b->samp_size) : vol_read(v, path, &b->samp_size);
-    if (!b->uber || !b->samp || b->uber_size < 0x20 || memcmp(b->uber, wii ? "REBU" : "UBER", 4) != 0 ||
+    const VolFile *vf = wii ? NULL : vol_find(v, path);
+    if (wii)
+        for (uint32_t i = 0; i < v->nwii; i++)
+            if (!_stricmp(v->wii[i].name, path)) { vf = &v->wii[i]; break; }
+    b->vol = v;
+    if (vf) { b->sample_file = *vf; b->samp_size = vf->size; }
+    if (!b->uber || !vf || b->uber_size < 0x20 || memcmp(b->uber, wii ? "REBU" : "UBER", 4) != 0 ||
         (wii && wii_tables(b) != 0))
         goto bad;
     b->wii = wii;
@@ -330,7 +430,8 @@ static int bank_load(Bank *b, const Vol *v, const char *name, int wii)
     return 0;
 bad:
     free(b->uber);
-    free(b->samp);
+    free(b->smp);
+    free((void *)b->names);
     memset(b, 0, sizeof *b);
     return -1;
 }
@@ -849,7 +950,6 @@ static void effects_tick(void)
 /* ---- music ([R] 0x26FF60: "<name>.mic", 2 slots (SoundDevice +0x3D4), group 3's volume) */
 static void music_off(Music *m)
 {
-    free(m->data);
     memset(m, 0, sizeof *m);
 }
 
@@ -857,18 +957,20 @@ static int music_open(Music *m, const char *name)
 {
     char path[48];
     snprintf(path, sizeof path, "%s%s", name, strchr(name, '.') ? "" : ".mic");   /* [R] 0x26FF98 */
-    uint32_t size;
-    uint8_t *d = S.vol ? vol_read(S.vol, path, &size) : NULL;
-    if (!d || size < 0x40)
-        goto bad;
+    const VolFile *vf = S.vol ? vol_find(S.vol, path) : NULL;
+    uint8_t d[0x40];
+    if (!vf || vf->size < sizeof d || vol_read_range(S.vol, vf, 0, d, sizeof d) != 0)
+        return -1;
+    uint32_t size = vf->size;
     int head = (int)rd32(d), ch = (int)rd32(d + 8), rate = (int)rd32(d + 12), inter = (int)rd32(d + 16),
         blocks = (int)rd32(d + 20);
     if (head < 0x18 || ch < 1 || ch > 2 || rate <= 0 || inter < 16 || inter % 16 || blocks <= 0 ||
         (uint64_t)head + (uint64_t)blocks * inter * ch > size)
         goto bad;
-    free(m->data);
-    m->data = d;
-    m->size = size;
+    m->file = *vf;
+    m->head = (uint32_t)head;
+    m->cached_block = -1;
+    m->cached_frame = m->cached_frames = 0;
     m->ch = ch;
     m->rate = rate;
     m->inter = inter;
@@ -886,7 +988,6 @@ static int music_open(Music *m, const char *name)
         printf("music %s (slot %d, group 3 at %d)\n", name, (int)(m - S.music), S.group_vol[GROUP_MUSIC]);
     return 0;
 bad:
-    free(d);
     return -1;
 }
 
@@ -898,9 +999,21 @@ static int music_next_frame(Music *m)
         m->block = m->frame = 0;
         memset(m->hist, 0, sizeof m->hist);
     }
-    int head = (int)rd32(m->data);
+    if (m->cached_block != m->block || m->frame < m->cached_frame ||
+        m->frame - m->cached_frame >= m->cached_frames) {
+        m->cached_block = m->block;
+        m->cached_frame = m->frame;
+        m->cached_frames = m->inter / 16 - m->frame;
+        if (m->cached_frames > (int)(AUDIO_READ_BYTES / 16)) m->cached_frames = AUDIO_READ_BYTES / 16;
+        for (int c = 0; c < m->ch; c++) {
+            uint64_t offset = m->head + ((uint64_t)m->block * m->ch + c) * m->inter + 16u * m->frame;
+            if (offset > UINT32_MAX || vol_read_range(S.vol, &m->file, (uint32_t)offset,
+                    m->data[c], (size_t)m->cached_frames * 16) != 0)
+                return 0;
+        }
+    }
     for (int c = 0; c < m->ch; c++) {
-        const uint8_t *f = m->data + head + ((size_t)m->block * m->ch + c) * m->inter + 16 * m->frame;
+        const uint8_t *f = m->data[c] + 16 * (m->frame - m->cached_frame);
         adpcm_frame(f, m->pcm[c], &m->hist[c][0], &m->hist[c][1]);
     }
     if (++m->frame == m->inter / 16) {
@@ -1145,7 +1258,7 @@ int sound_mix(int16_t *out, int frames)
 }
 
 /* ---- the output: on Windows waveOut, from winmm.dll loaded when asked for (so the viewer links nothing new) */
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(RAMPAGE_XBOX)
 #include <mmsystem.h>
 #define NBUF 12
 #define BUF_FRAMES 1024
@@ -1370,10 +1483,11 @@ void sound_free(void)
         free(b->smp);
         free((void *)b->names);
         free(b->uber);
-        free(b->samp);
         memset(b, 0, sizeof *b);
     }
     S.nbanks = 0;
+    S.sample_bytes = S.sample_peak = 0;
+    S.sample_clock = 0;
     S.ready = 0;
 }
 
@@ -1538,4 +1652,12 @@ int sound_sample_pcm(int bank, int index, const int16_t **pcm, int *n, int *rate
     *rate = s->rate;
     *loop = s->loop;
     return 0;
+}
+
+/* Source-owned decoded PCM only, not GPU/platform allocations. The peak can exceed
+ * the idle-cache target while active voices pin their samples. */
+void sound_memory_usage(size_t *bytes, size_t *peak)
+{
+    if (bytes) *bytes = S.sample_bytes;
+    if (peak) *peak = S.sample_peak;
 }

@@ -27,6 +27,9 @@ enum { VOL_UNREADABLE = -1, VOL_NOT_IN_IMAGE = -2 };
 int vol_open(Vol *v, const char *path);
 /* case-insensitive: the VOL's file, else the Wii folder's of that name, else its .bdg / .cmg for a .bdp / .cmp */
 const VolFile *vol_find(const Vol *v, const char *name);
+/* A checked, allocation-free slice of a VOL/Wii/APK member. Main-thread use only: the
+ * underlying FILE position is shared, so every caller seeks before reading. 0 = ok. */
+int vol_read_range(const Vol *v, const VolFile *file, uint32_t offset, void *out, size_t size);
 uint8_t *vol_read(const Vol *v, const char *name, uint32_t *size);   /* malloc'd copy of a file, NULL if absent */
 /* the player's extracted Wii disc (wii_data=, docs/WII_PLAN.md): the files of its Game, Shell and Audio folders, found
  * under dir, dir/DATA/files or dir/files, or in a bundle APK's assets/wii (dir the APK, make_android_bundle.bat), added

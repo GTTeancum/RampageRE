@@ -69,7 +69,7 @@ int gl_offscreen(int width, int height)
     return status(0x8D40) == 0x8CD5 ? 0 : -1;              /* GL_FRAMEBUFFER_COMPLETE */
 }
 
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(RAMPAGE_XBOX)
 static Window *g_win;
 
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -252,6 +252,7 @@ struct Renderer {
     uint32_t drawn;
     const uint8_t *video; int video_w, video_h, video_new;   /* rnd_video */
     GLuint video_tex;
+    int video_tex_w, video_tex_h;                 /* allocate once, update subsequent FMV frames in place */
     int tex_gen;                                     /* the texture settings the cache was made with */
     int hold;                                        /* draw_mesh holds the blended parts back (gtao_active) */
     double hud_t; int has_hud_t;                     /* the GUI's clock (rnd_hud_time), else the frame's */
@@ -369,6 +370,15 @@ static struct { int tried; BufGen gen; BufDel del; BufBind bind; BufData data; }
 /* the buffer calls, 0 when the GL has none (the client arrays then, as before) */
 static int buffers_ok(void)
 {
+#ifdef RAMPAGE_XBOX
+    /* gl4es keeps a CPU shadow of each buffer, in addition to the scene arrays and
+     * NV2A copy. Start with client arrays to stay within stock Xbox's 64 MB shared
+     * RAM; nxdk-gles11 stages these in its bounded DMA arena. An opt-in preserves
+     * the VBO path for measuring larger-memory/debug machines. */
+    const char *vbo = getenv("RAMPAGE_XBOX_VBO");
+    if (!vbo || *vbo != '1')
+        return 0;
+#endif
     if (!g_buf.tried) {
         g_buf.tried = 1;
         const char *sfx = "", *off = getenv("RAMPAGE_NOVBO");   /* 1: the client arrays (to compare) */
@@ -526,8 +536,15 @@ static GLuint video_texture(Renderer *r)
         r->video_new = 1;
     }
     glBindTexture(GL_TEXTURE_2D, r->video_tex);
-    if (r->video_new)
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, r->video_w, r->video_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, r->video);
+    if (r->video_new) {
+        if (r->video_tex_w != r->video_w || r->video_tex_h != r->video_h) {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, r->video_w, r->video_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, r->video);
+            r->video_tex_w = r->video_w;
+            r->video_tex_h = r->video_h;
+        } else {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, r->video_w, r->video_h, GL_RGBA, GL_UNSIGNED_BYTE, r->video);
+        }
+    }
     r->video_new = 0;
     return r->video_tex;
 }

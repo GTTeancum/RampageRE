@@ -6,7 +6,35 @@
 #define RAMPAGE_PLAT_H
 extern int plat_quiet;                           /* set by --shot: plat_message only prints (stderr), never a box */
 extern int plat_told;                            /* a message box has been shown (the Windows GUI build's last word) */
-#ifdef _WIN32
+#if defined(RAMPAGE_XBOX)
+#include <windows.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#ifndef APIENTRY
+#define APIENTRY __stdcall
+#endif
+#define XBOX_HOME "D:"
+void plat_xbox_home(void);
+void plat_xbox_memory_tick(void); /* sampled total physical memory, not process RSS */
+int plat_xbox_path(const char *path, char *out, size_t cap, int writable);
+FILE *plat_fopen(const char *path, const char *mode);
+int plat_exists(const char *path);
+void (*plat_gl_proc(const char *name))(void);
+void plat_message(const char *text, int warn);
+long long plat_free_kb(const char *path);
+int plat_xbox_stricmp(const char *a, const char *b);
+int plat_xbox_strnicmp(const char *a, const char *b, size_t n);
+int plat_xbox_fseeki64(FILE *f, int64_t off, int whence);
+int64_t plat_xbox_ftelli64(FILE *f);
+HANDLE plat_xbox_find_first(const char *path, WIN32_FIND_DATAA *data);
+#define fopen plat_fopen
+#define _stricmp plat_xbox_stricmp
+#define _strnicmp plat_xbox_strnicmp
+#define _fseeki64 plat_xbox_fseeki64
+#define _ftelli64 plat_xbox_ftelli64
+#define FindFirstFileA plat_xbox_find_first
+#elif defined(_WIN32)
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
@@ -88,6 +116,9 @@ static inline long long plat_free_kb(const char *path)
     struct statvfs st;
     return statvfs(dir, &st) == 0 ? (long long)((unsigned long long)st.f_bavail * st.f_frsize / 1024) : -1;
 }
+
+#endif
+#if defined(RAMPAGE_XBOX) || !defined(_WIN32)
 enum {                                           /* the Windows virtual-key codes (winuser.h) */
     VK_BACK = 0x08, VK_TAB = 0x09, VK_RETURN = 0x0D, VK_SHIFT = 0x10, VK_CONTROL = 0x11, VK_MENU = 0x12, VK_PAUSE = 0x13,
     VK_CAPITAL = 0x14, VK_ESCAPE = 0x1B, VK_SPACE = 0x20, VK_PRIOR = 0x21, VK_NEXT = 0x22, VK_END = 0x23, VK_HOME = 0x24,
@@ -101,4 +132,5 @@ enum {                                           /* the Windows virtual-key code
     VK_OEM_5 = 0xDC, VK_OEM_6 = 0xDD, VK_OEM_7 = 0xDE, VK_OEM_102 = 0xE2
 };
 #endif
+
 #endif

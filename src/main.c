@@ -8423,7 +8423,7 @@ static void keys_pad(const Window *w, int drive, Pad *pd)
         pd->lx = pd->ly = pd->rx = pd->ry = 0;
 }
 
-#if defined RAMPAGE_GUI && defined _WIN32
+#if defined RAMPAGE_GUI && defined _WIN32 && !defined RAMPAGE_XBOX
 /* ---- the player build's own start (main below): where its files go, the log */
 #define LOG_MAX (32L << 20)                          /* rampage.log starts again past this size */
 static int g_gui_log;                                /* stdout and stderr go to rampage.log */
@@ -8512,7 +8512,10 @@ static int viewer_main(int argc, char **argv)
     uint32_t ap_seed = 0;
     Settings gfx, gfx_flags;                         /* the graphics settings (settings.h), the flags among them */
     settings_unset(&gfx_flags);
-#ifdef __SWITCH__
+#ifdef RAMPAGE_XBOX
+    plat_xbox_home();
+    if (argc < 2) v.shell_mode = 1;
+#elif defined __SWITCH__
     plat_switch_home();                              /* sdmc:/switch/rampagere: the data, rampage.cfg, the profile,
                                                       * rampage.log */
     if (argc < 2)                                    /* from the Homebrew Menu: the front end, played on the pads */
@@ -8607,7 +8610,7 @@ static int viewer_main(int argc, char **argv)
             wii_pick = !plat_exists("wii");          /* and the Wii's, which may be left for later */
 #else
             int asked = 0;
-#ifdef _WIN32
+#if defined _WIN32 && !defined RAMPAGE_XBOX
             if (!plat_quiet)                         /* the first start: the disc image in a file dialog, remembered
                                                       * (a --shot run never asks) */
                 asked = data_ask(found, sizeof found);
@@ -8642,13 +8645,13 @@ static int viewer_main(int argc, char **argv)
     if (wii_pick)                                    /* the Wii's data through the file picker, copied into wii */
         android_wii_setup();
 #endif
-#if defined __SWITCH__ || defined __vita__ || defined __ANDROID__ || defined __linux__
+#if defined __SWITCH__ || defined __vita__ || defined __ANDROID__ || defined __linux__ || defined RAMPAGE_XBOX
     if (!gfx.wii_data[0] && plat_exists("wii"))      /* the home folder's wii, found as the game's data there is
                                                       * (docs/NATIVE.md; Linux: the current folder's, beside its
                                                       * rampage.cfg); wii_data= another path (none) leaves it */
         snprintf(gfx.wii_data, sizeof gfx.wii_data, "wii");
 #endif
-#if defined RAMPAGE_GUI && defined _WIN32
+#if defined RAMPAGE_GUI && defined _WIN32 && !defined RAMPAGE_XBOX
     if (!gfx.wii_data[0] && !shot && !v.unattended && !plat_quiet) {   /* the player build: asked once */
         char wd[512];
         int got = wii_ask(wd, sizeof wd);
@@ -8952,6 +8955,9 @@ static int viewer_main(int argc, char **argv)
         }
     }
     while (!w.quit) {
+#ifdef RAMPAGE_XBOX
+        plat_xbox_memory_tick();
+#endif
         win_poll(&w);
         double now = win_time();
         float dt = (float)(now - last);
@@ -9311,7 +9317,7 @@ static int viewer_main(int argc, char **argv)
         }
         win_swap(&w);
         frames++;
-#if defined RAMPAGE_GUI && defined _WIN32
+#if defined RAMPAGE_GUI && defined _WIN32 && !defined RAMPAGE_XBOX
         if (now - title_at > 0.5)
             gui_log_bound();
 #endif
@@ -9345,7 +9351,7 @@ static int viewer_main(int argc, char **argv)
 
 int main(int argc, char **argv)                      /* (Android: SDL_main, android/app/CMakeLists.txt) */
 {
-#if defined RAMPAGE_GUI && defined _WIN32
+#if defined RAMPAGE_GUI && defined _WIN32 && !defined RAMPAGE_XBOX
     gui_start(argc, argv);
     int r = viewer_main(argc, argv);
     fflush(stdout);

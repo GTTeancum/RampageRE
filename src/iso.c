@@ -434,7 +434,9 @@ static int iso_in(const char *dir, char *out, size_t cap)
 static void exe_dir(char *out, size_t cap)
 {
     out[0] = 0;
-#ifdef _WIN32
+#ifdef RAMPAGE_XBOX
+    snprintf(out, cap, "D:\\default.xbe");
+#elif defined _WIN32
     DWORD n = GetModuleFileNameA(NULL, out, (DWORD)cap);
     if (n == 0 || n >= cap)
         out[0] = 0;
@@ -453,7 +455,9 @@ static void exe_dir(char *out, size_t cap)
 
 static void user_dir(char *out, size_t cap)
 {
-#ifdef _WIN32
+#ifdef RAMPAGE_XBOX
+    snprintf(out, cap, "E:\\UDATA\\RampageRE");
+#elif defined _WIN32
     const char *base = getenv("LOCALAPPDATA");
     if (base && base[0])
         snprintf(out, cap, "%s\\RampageRE", base);
@@ -491,11 +495,11 @@ static int remembered(char *out, size_t cap)
         fclose(f);
     line[n] = 0;
     line[strcspn(line, "\r\n")] = 0;
-#ifdef _WIN32
+#if defined _WIN32 && !defined RAMPAGE_XBOX
     UINT em = SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);   /* a disc drive left empty: no box */
 #endif
     int ok = line[0] && data_usable(line);
-#ifdef _WIN32
+#if defined _WIN32 && !defined RAMPAGE_XBOX
     SetErrorMode(em);
 #endif
     if (ok)
@@ -532,7 +536,10 @@ int data_find(char *out, size_t cap)
     }
     exe_dir(exe, sizeof exe);
     user_dir(user, sizeof user);
-#ifdef __SWITCH__
+#ifdef RAMPAGE_XBOX
+    if (vol_in(XBOX_HOME, out, cap) || vol_in("D:\\data", out, cap) || iso_in(XBOX_HOME, out, cap))
+        return 1;
+#elif defined __SWITCH__
     if (vol_in(SWITCH_HOME, out, cap) || iso_in(SWITCH_HOME, out, cap))   /* the SD card's sdmc:/switch/rampagere */
         return 1;
 #elif defined __vita__
@@ -554,7 +561,9 @@ int data_find(char *out, size_t cap)
 
 const char *data_where(void)
 {
-#ifdef _WIN32
+#ifdef RAMPAGE_XBOX
+    return "D:\\ or D:\\data\\ (RAMPAGE.VOL with RAMPAGE.ELF or SLES_538.00 or SLUS_213.23)";
+#elif defined _WIN32
     return "build\\disc, the current folder, data\\, beside the program, %LOCALAPPDATA%\\RampageRE (and the disc image "
            "chosen at an earlier start)";
 #elif defined __SWITCH__
@@ -630,7 +639,7 @@ int data_check(const char *path, const Vol *v, char *msg, size_t cap)
     return 0;
 }
 
-#if defined _WIN32 && !defined RAMPAGE_TOOL
+#if defined _WIN32 && !defined RAMPAGE_TOOL && !defined RAMPAGE_XBOX
 /* ---- the first start on Windows: the disc image chosen in a file dialog (never a search of the drives), remembered */
 #include <commdlg.h>
 #include <shobjidl.h>
