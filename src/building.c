@@ -16,7 +16,7 @@ void building_init(Building *b, const float min[3], const float max[3], int widt
     memcpy(b->max, max, sizeof b->max);
     b->width = width;
     b->depth = depth;
-    b->storeys = b->n = storeys < BUILDING_STOREYS ? storeys : BUILDING_STOREYS;
+    b->storeys = b->n = storeys < 0 ? 0 : storeys < BUILDING_STOREYS ? storeys : BUILDING_STOREYS;
     b->state = BUILDING_STANDING;
     b->hp = b->hp_max = 6 * width * b->n;            /* BuildingHP's default (0x2D2850) */
     for (int s = 0; s < b->n; s++) {

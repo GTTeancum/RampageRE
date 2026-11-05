@@ -15,6 +15,14 @@ extern int plat_told;                            /* a message box has been shown
 #define APIENTRY __stdcall
 #endif
 #define XBOX_HOME "D:"
+#include "xbox_libc.h"
+#define strtod plat_xbox_strtod
+#define strtof plat_xbox_strtof
+#define atof plat_xbox_atof
+#define snprintf plat_xbox_snprintf
+#define vsnprintf plat_xbox_vsnprintf
+int plat_xbox_vfprintf(FILE *f, const char *fmt, va_list ap);
+#define vfprintf plat_xbox_vfprintf
 int plat_xbox_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 int plat_xbox_fprintf(FILE *f, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 #define printf plat_xbox_printf

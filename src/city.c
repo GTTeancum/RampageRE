@@ -2734,7 +2734,7 @@ static void building(City *c, Scene *s, Group inst, float row_offset, float y0, 
         memset(sb->quad, 0xFF, sizeof sb->quad);
         memset(sb->skeleton, 0xFF, sizeof sb->skeleton);
         memset(sb->damaged_skeleton, 0xFF, sizeof sb->damaged_skeleton);
-        sb->light = calloc(BUILDING_STOREYS + 1, sizeof *sb->light);   /* lit at the block's end (light_buildings) */
+        sb->light = calloc((size_t)sb->b.storeys + 1, sizeof *sb->light);   /* lit at the block's end (light_buildings) */
         sb->shade_nb[0] = sb->shade_nb[1] = -1;
         sb->shade_top[0] = sb->shade_top[1] = -1e20f;   /* +0xCC, +0xD4: so the first look builds the shape */
         memset(&sb->shade, 0, sizeof sb->shade);
@@ -2846,8 +2846,14 @@ static void read_lights(Scene *s, const char *text, uint32_t len)
         if (comment)
             *comment = 0;
         float val = 0;
+#ifdef RAMPAGE_XBOX
+        int consumed = 0;
+        if (sscanf(line, "%63s%n", key, &consumed) < 1) continue;
+        val = strtof(line + consumed, NULL); /* nxdk scanf has no floating conversions */
+#else
         if (sscanf(line, "%63s %f", key, &val) < 1)
             continue;
+#endif
         if (!strcmp(key, "BEGIN_LIGHT")) { in_light = 1; memset(v, 0, sizeof v); }
         else if (!strcmp(key, "BEGIN_AMBIENT")) { in_light = 0; memset(v, 0, sizeof v); }
         else if (!strcmp(key, "END_AMBIENT")) { s->ambient[0] = v[0]; s->ambient[1] = v[1]; s->ambient[2] = v[2]; }

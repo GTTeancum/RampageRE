@@ -6,6 +6,7 @@
 #undef fopen
 #undef printf
 #undef fprintf
+#undef vfprintf
 #undef FindFirstFileA
 #include <ctype.h>
 #include <errno.h>
@@ -25,16 +26,27 @@ static const char *save_root = "E:\\UDATA\\RampageRE";
  * to the kernel debug channel and, when mounted, separate persistent logs. */
 static int diagnostic(FILE *f, const char *fmt, va_list ap)
 {
-    if (f != stdout && f != stderr) return vfprintf(f, fmt, ap);
-    char text[2048];
+    char small[2048], *text = small;
     va_list copy;
     va_copy(copy, ap);
-    int n = vsnprintf(text, sizeof text, fmt, copy);
+    int n = plat_xbox_vsnprintf(small, sizeof small, fmt, copy);
     va_end(copy);
-    if (n >= 0) DbgPrint("%s", text);
-    if ((f == stdout && stdout_ready) || (f == stderr && stderr_ready)) return vfprintf(f, fmt, ap);
-    return n;
+    if (n < 0) return n;
+    if ((size_t)n >= sizeof small) {
+        text = malloc((size_t)n + 1);
+        if (!text) return -1;
+        va_copy(copy, ap);
+        plat_xbox_vsnprintf(text, (size_t)n + 1, fmt, copy);
+        va_end(copy);
+    }
+    if (f == stdout || f == stderr) DbgPrint("%s", text);
+    int write = (f != stdout && f != stderr) || (f == stdout && stdout_ready) || (f == stderr && stderr_ready);
+    int ok = !write || fwrite(text, 1, (size_t)n, f) == (size_t)n;
+    if (text != small) free(text);
+    return ok ? n : -1;
 }
+int plat_xbox_vfprintf(FILE *f, const char *fmt, va_list ap) { return diagnostic(f, fmt, ap); }
+
 int plat_xbox_printf(const char *fmt, ...)
 {
     va_list ap;
