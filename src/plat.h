@@ -15,6 +15,10 @@ extern int plat_told;                            /* a message box has been shown
 #define APIENTRY __stdcall
 #endif
 #define XBOX_HOME "D:"
+int plat_xbox_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+int plat_xbox_fprintf(FILE *f, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+#define printf plat_xbox_printf
+#define fprintf plat_xbox_fprintf
 void plat_xbox_home(void);
 void plat_xbox_memory_tick(void); /* sampled total physical memory, not process RSS */
 int plat_xbox_path(const char *path, char *out, size_t cap, int writable);

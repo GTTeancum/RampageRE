@@ -4,10 +4,13 @@
 #ifdef RAMPAGE_XBOX
 #include "plat.h"
 #undef fopen
+#undef printf
+#undef fprintf
 #undef FindFirstFileA
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <hal/debug.h>
 #include <nxdk/mount.h>
@@ -15,7 +18,39 @@
 
 static int home_ready;
 static int save_ready;
+static int stdout_ready, stderr_ready;
 static const char *save_root = "E:\\UDATA\\RampageRE";
+
+/* nxdk's default standard streams have no backing HANDLE. Mirror diagnostics
+ * to the kernel debug channel and, when mounted, separate persistent logs. */
+static int diagnostic(FILE *f, const char *fmt, va_list ap)
+{
+    if (f != stdout && f != stderr) return vfprintf(f, fmt, ap);
+    char text[2048];
+    va_list copy;
+    va_copy(copy, ap);
+    int n = vsnprintf(text, sizeof text, fmt, copy);
+    va_end(copy);
+    if (n >= 0) DbgPrint("%s", text);
+    if ((f == stdout && stdout_ready) || (f == stderr && stderr_ready)) return vfprintf(f, fmt, ap);
+    return n;
+}
+int plat_xbox_printf(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int n = diagnostic(stdout, fmt, ap);
+    va_end(ap);
+    return n;
+}
+int plat_xbox_fprintf(FILE *f, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int n = diagnostic(f, fmt, ap);
+    va_end(ap);
+    return n;
+}
 
 int plat_xbox_strnicmp(const char *a, const char *b, size_t n)
 {
@@ -125,7 +160,7 @@ int plat_xbox_fseeki64(FILE *f, int64_t off, int whence)
 void plat_message(const char *text, int warn)
 {
     (void)warn;
-    fprintf(stderr, "%s\n", text);
+    plat_xbox_fprintf(stderr, "%s\n", text);
     if (!plat_quiet) { debugPrint("%s\n", text); plat_told = 1; }
 }
 void plat_xbox_memory_tick(void)
@@ -146,7 +181,7 @@ void plat_xbox_memory_tick(void)
     if (used_kb > peak_kb) peak_kb = used_kb;
     if (reported && (DWORD)(now - reported_at) < 5000) return;
     reported_at = now; reported = 1;
-    printf("xbox physical_memory total_kb=%lu used_kb=%lu available_kb=%lu peak_sampled_kb=%lu\n",
+    plat_xbox_printf("xbox physical_memory total_kb=%lu used_kb=%lu available_kb=%lu peak_sampled_kb=%lu\n",
            total_kb, used_kb, free_kb, peak_kb);
     fflush(stdout);
 }
@@ -160,9 +195,16 @@ void plat_xbox_home(void)
         CreateDirectoryA(save_root, NULL);
         save_ready = GetFileAttributesA(save_root) != INVALID_FILE_ATTRIBUTES;
     }
-    /* Leave stdout/stderr on nxdk's debug stream so emulator logs remain visible.
-     * The explicit logs/profiles use plat_fopen and the persistent directory. */
+    if (save_ready) {
+        char path[MAX_PATH];
+        if (plat_xbox_path("rampage.log", path, sizeof path, 1))
+            stdout_ready = freopen(path, "w", stdout) != NULL;
+        if (plat_xbox_path("rampage.err", path, sizeof path, 1))
+            stderr_ready = freopen(path, "w", stderr) != NULL;
+        if (stdout_ready) setvbuf(stdout, NULL, _IOLBF, 0);
+        if (stderr_ready) setvbuf(stderr, NULL, _IONBF, 0);
+    }
     plat_xbox_memory_tick();
-    printf("RampageRE Xbox: data D:\\, saves %s (%s)\n", save_root, save_ready ? "ready" : "unavailable");
+    plat_xbox_printf("RampageRE Xbox: data D:\\, saves %s (%s)\n", save_root, save_ready ? "ready" : "unavailable");
 }
 #endif
