@@ -21,7 +21,7 @@ set(GAME_SOURCES
  main.c shot.c render_gl.c city.c vol.c bundle.c tex.c mesh.c prb.c tree.c anim.c camera.c moves.c
  building.c climb.c ik.c people.c fx.c cloth.c sound.c army.c hud.c vehicle.c water.c edible.c game.c
  boss.c look.c shadow.c director.c footstep.c challenge.c reveal.c rail.c parade.c streetobj.c profile.c
- collide.c shell.c movie.c wrand.c texpack_xbox.c iso.c plat_xbox.c xbox_libc.c pad_xbox.c win_xbox.c settings.c postfx_xbox.c autoplay.c)
+ collide.c shell.c movie.c wrand.c texpack_xbox.c iso.c plat_xbox.c xbox_libc.c rounding_xbox.c pad_xbox.c win_xbox.c settings.c postfx_xbox.c autoplay.c)
 list(TRANSFORM GAME_SOURCES PREPEND "${ROOT}/src/")
 add_executable(rampage_xbox ${GAME_SOURCES})
 set_property(TARGET rampage_xbox PROPERTY C_STANDARD 99)
