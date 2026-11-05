@@ -76,7 +76,11 @@ typedef struct {
     int hp, hp_max;                                  /* BuildingHP (+0x390, +0x394; default 6 x width x storeys) */
     int floor_hp[BUILDING_STOREYS];                  /* FloorHP per storey (floor +0x14; default 8 x width) */
     BuildingCell cell[BUILDING_STOREYS][BUILDING_CELLS];   /* [o][face x depth + column], fronts from 2 x depth */
+#if defined(RAMPAGE_LOW_MEMORY) && !defined(RAMPAGE_FIXED_BUILDING_VERTS)
+    BuildingVert (*vert)[3][BUILDING_VCOLS];          /* owned storeys + 1 rows; released by building_free */
+#else
     BuildingVert vert[BUILDING_STOREYS + 1][3][BUILDING_VCOLS];   /* by live row, face (FACE_*), column: the dents */
+#endif
     int roof;                                        /* G+0x658: the roof's damage state 0 .. 3 (its TopFloorShapes model) */
     uint8_t outlined;                                /* the sheet's columns (bit by +5) with an Outline (+0xEC): set by
                                                       * the host (city.c), 0x2D0500's answer */
@@ -121,7 +125,10 @@ typedef struct {
     struct { uint8_t event, state; } score[BUILDING_SCORES]; int nscore;
 } Building;
 
-void building_init(Building *b, const float min[3], const float max[3], int width, int depth, int storeys);
+/* Initialize fresh storage. Returns 0, or -1 if its low-memory grid cannot be allocated.
+ * A successful building owns its grid: do not shallow-copy it, and free it before reinitializing. */
+int building_init(Building *b, const float min[3], const float max[3], int width, int depth, int storeys);
+void building_free(Building *b);                    /* safe after a failed init, and safe more than once */
 int building_cell_index(const Building *b, int face, int column);    /* -1 if out of range */
 /* a hit at the world point p (on or near one of its faces) with radius r (2.0 from a monster's attack); 1 if the
  * front cell hit took damage (Building::hit's answer, s0 set only at 0x2BC838: not for the dents, a side face or a

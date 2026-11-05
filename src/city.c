@@ -2614,14 +2614,14 @@ int scene_adornments_hit(Scene *s, const float centre[3], float radius)
     return n;
 }
 
-static void building(City *c, Scene *s, Group inst, float row_offset, float y0, int scenery)
+static int building(City *c, Scene *s, Group inst, float row_offset, float y0, int scenery)
 {
     SceneBuilding **list = scenery ? &s->scenery : &s->buildings;
     uint32_t *count = scenery ? &s->nscenery : &s->nbuildings;
     Group t = template_of(c, group_str(inst, "TemplateName")), where;
     if (!t.at) {
         s->missing++;
-        return;
+        return 0;
     }
     int width = (int)group_num(t, "width", 1), depth = (int)group_num(t, "depth", 2);
     /* 0x305E78 .. 0x305F08: x = LeftEdgeXPos + 2.5 x width, y = the slot's + 5 + (Row ? BackRowOffset : 0): the front
@@ -2675,12 +2675,18 @@ static void building(City *c, Scene *s, Group inst, float row_offset, float y0, 
     }
     /* its cells (the game's grid, 0x2D1A30): the box is 6 + 3 x storeys + 1.5 (the roof's band) high */
     if (nst && width > 0 && depth > 0 && 2 * depth + width <= BUILDING_CELLS) {
-        *list = realloc(*list, sizeof **list * (*count + 1));
-        SceneBuilding *sb = &(*list)[(*count)++];
+        SceneBuilding *grown = realloc(*list, sizeof **list * (*count + 1));
+        if (!grown)
+            return -1;
+        *list = grown;
+        SceneBuilding *sb = &(*list)[*count];
+        memset(sb, 0, sizeof *sb);                  /* a partial load must be safe for scene_free */
+        (*count)++;
         float cx = node.m[12], cy = node.m[13];
         float lo[3] = { cx - width * CELL / 2, cy - depth * CELL / 2, 0 };
         float hi[3] = { cx + width * CELL / 2, cy + depth * CELL / 2, GROUND_FLOOR + STOREY * (float)nst + 1.5f };
-        building_init(&sb->b, lo, hi, width, depth, nst);
+        if (building_init(&sb->b, lo, hi, width, depth, nst) != 0)
+            return -1;
         sb->hitter = -1;                             /* +0x190: no attacker yet */
         sb->b.row = (int)group_num(inst, "Row", 0);
         sb->b.hp = sb->b.hp_max = (int)group_num(t, "BuildingHP", (float)sb->b.hp_max);
@@ -2746,6 +2752,8 @@ static void building(City *c, Scene *s, Group inst, float row_offset, float y0, 
         memset(sb->skeleton, 0xFF, sizeof sb->skeleton);
         memset(sb->damaged_skeleton, 0xFF, sizeof sb->damaged_skeleton);
         sb->light = calloc((size_t)sb->b.storeys + 1, sizeof *sb->light);   /* lit at the block's end (light_buildings) */
+        if (!sb->light)
+            return -1;
         sb->shade_nb[0] = sb->shade_nb[1] = -1;
         sb->shade_top[0] = sb->shade_top[1] = -1e20f;   /* +0xCC, +0xD4: so the first look builds the shape */
         memset(&sb->shade, 0, sizeof sb->shade);
@@ -2839,6 +2847,7 @@ static void building(City *c, Scene *s, Group inst, float row_offset, float y0, 
         adornments_place(s, sb, mat_identity());
         building_flags(c, s, sb, inst, nst);         /* after last: its flags are not moved as its pieces */
     }
+    return 0;
 }
 
 static void read_lights(Scene *s, const char *text, uint32_t len)
@@ -3707,7 +3716,7 @@ int city_build(City *c, const char *block_name, int night, Scene *s)
     snprintf(key, sizeof key, "BlockDef|%s", block_name);
     Group block = group_sub(group_sub(c->world, "BlockData"), key), ld = group_sub(c->world, night ? "LightingDataNight" : "LightingData"), where;
     if (!block.at)
-        return -1;
+        goto failed;
     Mat4 root = mat_identity();
     static const float WHITE[3] = { 1, 1, 1 };       /* no LightingData: the buildings at full light */
     building_light_init(&s->building_light, WHITE, 0, NULL, NULL, 0, 0, 0);
@@ -3737,7 +3746,8 @@ int city_build(City *c, const char *block_name, int night, Scene *s)
          * Buildings would come from elsewhere; not followed] */
         Group bi = record_group(where, r[i]);
         float left = group_num(bi, "LeftEdgeXPos", 0);
-        building(c, s, bi, row_offset, 0, left < -50.0f || !(left < 50.0f));
+        if (building(c, s, bi, row_offset, 0, left < -50.0f || !(left < 50.0f)) != 0)
+            goto failed;
     }
     static const char *const objects[] = { "ObjectInstance|", "AttackObjectInstance|", "XObjectInstance|" };
     s->placing_block = 1;
@@ -3877,7 +3887,8 @@ int city_build(City *c, const char *block_name, int night, Scene *s)
         float bro = group_num(nb, "BackRowOffset", 10);
         n = group_values(nb, "BuildingInstance|", &where, r, MAX_REC);
         for (uint32_t i = 0; i < n; i++)
-            building(c, s, record_group(where, r[i]), bro, y0, 1);
+            if (building(c, s, record_group(where, r[i]), bro, y0, 1) != 0)
+                goto failed;
         for (int k = 0; k < 3; k++) {
             n = group_values(nb, objects[k], &where, r, MAX_REC);
             for (uint32_t i = 0; i < n; i++) {
@@ -3903,6 +3914,9 @@ int city_build(City *c, const char *block_name, int night, Scene *s)
     obstacle_boxes(s);
     light_buildings(s);
     return 0;
+failed:
+    scene_free(s);
+    return -1;
 }
 
 void city_build_left(City *c, const char *block_name, Scene *s)
@@ -4865,6 +4879,7 @@ void scene_free(Scene *s)
     free(s->slots);
     free(s->order);
     for (uint32_t i = 0; i < s->nbuildings; i++) {
+        building_free(&s->buildings[i].b);
         free(s->buildings[i].rest);
         free(s->buildings[i].adorn);
         free(s->buildings[i].flag);
@@ -4873,6 +4888,7 @@ void scene_free(Scene *s)
     }
     free(s->buildings);
     for (uint32_t i = 0; i < s->nscenery; i++) {
+        building_free(&s->scenery[i].b);
         free(s->scenery[i].rest);
         free(s->scenery[i].adorn);
         free(s->scenery[i].flag);

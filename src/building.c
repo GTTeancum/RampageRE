@@ -1,6 +1,7 @@
 /* building.c - a building's cells, how hits damage them and how it falls (building.h; docs/FORMAT_BDP.md "Damage",
  * "Collapse"). */
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 #include "building.h"
 
@@ -9,7 +10,7 @@
 #define STOREY_H 3.0f
 #define ROOF_H 1.5f
 
-void building_init(Building *b, const float min[3], const float max[3], int width, int depth, int storeys)
+int building_init(Building *b, const float min[3], const float max[3], int width, int depth, int storeys)
 {
     memset(b, 0, sizeof *b);
     memcpy(b->min, min, sizeof b->min);
@@ -17,6 +18,11 @@ void building_init(Building *b, const float min[3], const float max[3], int widt
     b->width = width;
     b->depth = depth;
     b->storeys = b->n = storeys < 0 ? 0 : storeys < BUILDING_STOREYS ? storeys : BUILDING_STOREYS;
+#if defined(RAMPAGE_LOW_MEMORY) && !defined(RAMPAGE_FIXED_BUILDING_VERTS)
+    b->vert = calloc((size_t)b->storeys + 1, sizeof *b->vert);
+    if (!b->vert)
+        return -1;
+#endif
     b->state = BUILDING_STANDING;
     b->hp = b->hp_max = 6 * width * b->n;            /* BuildingHP's default (0x2D2850) */
     for (int s = 0; s < b->n; s++) {
@@ -36,6 +42,17 @@ void building_init(Building *b, const float min[3], const float max[3], int widt
     memcpy(b->shake, SHAKE, sizeof b->shake);
     b->seed = 1;
     b->ground_due = 1;                               /* 0x2D2820 */
+    return 0;
+}
+
+void building_free(Building *b)
+{
+#if defined(RAMPAGE_LOW_MEMORY) && !defined(RAMPAGE_FIXED_BUILDING_VERTS)
+    free(b->vert);
+    b->vert = NULL;
+#else
+    (void)b;
+#endif
 }
 
 int building_cell_index(const Building *b, int face, int column)

@@ -1130,6 +1130,15 @@ static void build(Viewer *v)
         memset(&v->hidden, 0, sizeof v->hidden);
     }
     v->have_scene = city_build(v->city, v->blocks[v->block], v->night, &v->scene) == 0;
+#ifdef RAMPAGE_LOW_MEMORY
+    if (!v->have_scene) {                          /* a failed grid load is not a playable partial block */
+        printf("Unable to build %s %s: insufficient memory or invalid data.\n",
+               CITIES[v->city_index], v->blocks[v->block]);
+        v->play = 0;
+        v->exit_game = 1;                          /* the frame's normal exit path returns to the shell */
+        return;
+    }
+#endif
     if (v->have_scene && v->game_built && v->left_block >= 0)
         city_build_left(v->city, v->blocks[v->left_block], &v->scene);
     if (!v->game_built) {                            /* a new world: its monster to reveal comes with reveal_load */
@@ -1643,7 +1652,7 @@ static int open_city(Viewer *v, int index, uint32_t block, int game_block)
         }
     v->block = block < v->nblocks ? block : 0;
     build(v);
-    return 0;
+    return v->have_scene ? 0 : -1;
 }
 
 /* the viewer's answers to the graph's script checks (Monsters.bsf: there are no buildings, people or power-ups to
@@ -7997,7 +8006,11 @@ static void shell_start_game(Viewer *v)
     /* the start block is the BlockList's index (Profile.getStartBlock: the block after the last one won); the names'
      * list keeps the repeated first block once, so taken as their index it began one block on, the block after the
      * one to play again skipped */
-    open_city(v, city, 0, v->last_game.start_block > 0 ? v->last_game.start_block : 0);   /* (g is gone) */
+    if (open_city(v, city, 0, v->last_game.start_block > 0 ? v->last_game.start_block : 0) != 0) {
+        v->play = 0;
+        v->exit_game = 1;                          /* retry from the menus instead of entering an empty world */
+        return;
+    }                                               /* (g is gone) */
     const ShellGame *lg = &v->last_game;
     ap_event(v->ap, "what=game_start city=%s type=%d players=%d bots=%d start_block=%d night=%d monsters=%s,%s,%s,%s",
              CITIES[city], lg->play_type, lg->num_players, lg->num_bots, lg->start_block, lg->night, lg->monster_name[0],
