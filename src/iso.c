@@ -4,6 +4,9 @@
 #include <string.h>
 #include "plat.h"
 #include "iso.h"
+#ifdef RAMPAGE_XBOX
+#include <errno.h>
+#endif
 #ifdef _WIN32
 #define SEP "\\"
 #else
@@ -361,7 +364,15 @@ static int vol_in(const char *dir, char *out, size_t cap)
     if (!dir[0])
         return 0;
     join(out, cap, dir, "RAMPAGE.VOL");
+#ifdef RAMPAGE_XBOX
+    int ok = readable(out);
+    printf("xbox data probe dir='%s' candidate='%s' readable=%d errno=%d winerr=%lu\n",
+           dir, out, ok, errno, (unsigned long)GetLastError());
+    fflush(stdout);
+    return ok;
+#else
     return readable(out);
+#endif
 }
 
 static int has_vol(const char *path)

@@ -13,6 +13,8 @@ endif()
 set(ROOT "${CMAKE_CURRENT_LIST_DIR}/../..")
 set(NXDK_GLES11_WITH_GL4ES ON CACHE BOOL "" FORCE)
 add_subdirectory("${NXDK_GLES11_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/nxdk-gles11")
+# gl4es shim atof must not reach nxdk's assertion-only strtod.
+target_compile_definitions(GLESv1_CM PRIVATE strtod=plat_xbox_strtod)
 if(TARGET GL)
   target_compile_definitions(GL PRIVATE NO_INIT_CONSTRUCTOR _WINGDI_)
 endif()
@@ -28,7 +30,8 @@ set_property(TARGET rampage_xbox PROPERTY C_STANDARD 99)
 target_compile_definitions(rampage_xbox PRIVATE RAMPAGE_XBOX RAMPAGE_LOW_MEMORY XBOX _WINGDI_)
 target_compile_options(rampage_xbox PRIVATE -fsigned-char)
 target_include_directories(rampage_xbox PRIVATE "${ROOT}/src" "${NXDK_DIR}/lib/sdl/SDL2/include")
-target_link_libraries(rampage_xbox PRIVATE GL GLESv1_CM "${NXDK_DIR}/lib/libSDL2.lib" "${NXDK_DIR}/lib/libpbkit.lib")
+target_link_options(rampage_xbox PRIVATE "-include:_automount_d_drive")
+target_link_libraries(rampage_xbox PRIVATE "${NXDK_DIR}/lib/libnxdk_automount_d.lib" GL GLESv1_CM "${NXDK_DIR}/lib/libSDL2.lib" "${NXDK_DIR}/lib/libpbkit.lib")
 add_custom_command(TARGET rampage_xbox POST_BUILD
  COMMAND "${NXDK_DIR}/tools/cxbe/cxbe" "-OUT:${CMAKE_CURRENT_BINARY_DIR}/default.xbe" "-TITLE:RampageRE" "$<TARGET_FILE:rampage_xbox>"
  VERBATIM COMMENT "Converting the Xbox executable to XBE")
