@@ -65,9 +65,12 @@ int win_open(Window *w, const char *title, int width, int height, int hidden)
         fprintf(stderr, "Xbox: SDL event/timer initialization failed: %s\n", SDL_GetError());
         return -1;
     }
-    glContextInit(display_width, display_height);
+    /* This pinned nxdk-gles11 also initializes gl4es from glContextInit. Install
+     * both callbacks first; the explicit initialize below is idempotent and
+     * keeps this bootstrap compatible with a GLES-only context initializer. */
     set_getprocaddress(nxdk_gl4es_getprocaddress);
     set_getmainfbsize(framebuffer_size);
+    glContextInit(display_width, display_height);
     initialize_gl4es();
     context_live = 1;
     glSwapInterval(1);

@@ -340,6 +340,11 @@ Renderer *rnd_create(void) { return calloc(1, sizeof(Renderer)); }
 
 static void drop_textures(Renderer *r)
 {
+#ifdef RAMPAGE_XBOX
+    /* nxdk frees contiguous texture storage immediately. Flush gl4es' deferred
+     * draws and wait for NV2A before retiring resources at a scene transition. */
+    glFinish();
+#endif
     for (int k = 0; k < r->ncache; k++) {
         for (uint32_t i = 0; r->cache[k].tex && i < r->cache[k].n; i++)
             if (r->cache[k].tex[i] && r->cache[k].tex[i] != ~0u)
