@@ -223,7 +223,7 @@ double win_time(void)
  * whole texture; the texture matrix's scale for it */
 typedef struct { uint32_t name; float reg[4]; GLuint id; float scale[2]; } RegionTex;
 typedef struct {
-    const Bundle *b; GLuint *tex; uint32_t n;            /* per name index: GL texture, ~0 = none */
+    const Bundle *b; GLuint *tex, *hud_tex; uint32_t n;            /* per name index: GL texture, ~0 = none */
     RegionTex *reg; int nreg;
 } BundleTex;
 
@@ -256,6 +256,7 @@ struct Renderer {
     int tex_gen;                                     /* the texture settings the cache was made with */
     int hold;                                        /* draw_mesh holds the blended parts back (gtao_active) */
     double hud_t; int has_hud_t;                     /* the GUI's clock (rnd_hud_time), else the frame's */
+    int in_hud_quad;                              /* 2D quad texture upload, not the GUI's 3D meshes */
     int in_hud;                                      /* draw_hud: textures made now get no mips nor anisotropy */
     HeldPart *held; int nheld, cheld;
     MeshBound *bound; uint32_t nbound;               /* by Scene.meshes index, made at its first draw */
@@ -340,13 +341,17 @@ Renderer *rnd_create(void) { return calloc(1, sizeof(Renderer)); }
 static void drop_textures(Renderer *r)
 {
     for (int k = 0; k < r->ncache; k++) {
-        for (uint32_t i = 0; i < r->cache[k].n; i++)
+        for (uint32_t i = 0; r->cache[k].tex && i < r->cache[k].n; i++)
             if (r->cache[k].tex[i] && r->cache[k].tex[i] != ~0u)
                 glDeleteTextures(1, &r->cache[k].tex[i]);
+        for (uint32_t i = 0; r->cache[k].hud_tex && i < r->cache[k].n; i++)
+            if (r->cache[k].hud_tex[i] && r->cache[k].hud_tex[i] != ~0u)
+                glDeleteTextures(1, &r->cache[k].hud_tex[i]);
         for (int i = 0; i < r->cache[k].nreg; i++)
             if (r->cache[k].reg[i].id)
                 glDeleteTextures(1, &r->cache[k].reg[i].id);
         free(r->cache[k].tex);
+        free(r->cache[k].hud_tex);
         free(r->cache[k].reg);
     }
     r->ncache = 0;
@@ -533,6 +538,11 @@ static GLuint video_texture(Renderer *r)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
+#ifdef RAMPAGE_XBOX
+        /* gl4es ES1 limited NPOT requires an explicit single level before upload;
+         * otherwise a 640x480 movie gets padded to 1024x512. */
+        glTexParameteri(GL_TEXTURE_2D, 0x813D /* GL_TEXTURE_MAX_LEVEL */, 0);
+#endif
         r->video_new = 1;
     }
     glBindTexture(GL_TEXTURE_2D, r->video_tex);
@@ -573,10 +583,23 @@ static GLuint texture_at(Renderer *r, const Bundle *b, uint32_t name, int zero_o
     BundleTex *bt = bundle_tex(r, b);
     if (!bt || (!name && !zero_ok) || name >= bt->n)
         return 0;
-    if (!bt->tex[name]) {
+    GLuint *slots = bt->tex;
+#ifdef RAMPAGE_XBOX
+    if (r->in_hud_quad) {
+        /* A source image can be shared by 2D and 3D materials. Keep separate GPU
+         * objects: the clamped native-NPOT upload cannot later be made repeatable
+         * by changing its wrap flag, while the 3D upload may require POT scaling. */
+        if (!bt->hud_tex)
+            bt->hud_tex = calloc(bt->n ? bt->n : 1, sizeof *bt->hud_tex);
+        slots = bt->hud_tex;
+    }
+#endif
+    if (!slots)
+        return 0;
+    if (!slots[name]) {
         uint8_t *rgba;
         int w, h;
-        bt->tex[name] = ~0u;
+        slots[name] = ~0u;
         if (tex_decode(b, bdp_entry_of(b, name, ET_TEXTURE), &rgba, &w, &h) == 0) {
             GLuint id;
             glGenTextures(1, &id);
@@ -585,6 +608,16 @@ static GLuint texture_at(Renderer *r, const Bundle *b, uint32_t name, int zero_o
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+#ifdef RAMPAGE_XBOX
+            if (r->in_hud_quad) {
+                /* Set the 2D HUD's real sampling mode before upload so gl4es can
+                 * keep NPOT screens at their native dimensions, not POT copies.
+                 * Do not do this for GUI 3D layers, which can tile textures. */
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, 0x813D /* GL_TEXTURE_MAX_LEVEL */, 0);
+            }
+#endif
             /* port extra: a texture pack's PNG (texpack.c), named after the decoded mip 0; hashed only with a pack
              * or --dumptex */
             uint64_t hash = tp_active() ? tp_hash('T', rgba, (uint32_t)w * (uint32_t)h * 4, w, h) : 0;
@@ -600,10 +633,10 @@ static GLuint texture_at(Renderer *r, const Bundle *b, uint32_t name, int zero_o
                 tp_dump(hash, rgba, w, h);
             }
             free(rgba);
-            bt->tex[name] = id;
+            slots[name] = id;
         }
     }
-    return bt->tex[name] == ~0u ? 0 : bt->tex[name];
+    return slots[name] == ~0u ? 0 : slots[name];
 }
 static GLuint texture(Renderer *r, const Bundle *b, uint32_t name) { return texture_at(r, b, name, 0); }
 
@@ -1300,7 +1333,9 @@ static void draw_hud(Renderer *r, const Scene *s, int width, int height, double 
             layer++;
             continue;
         }
+        r->in_hud_quad = 1;
         GLuint id = q->b ? texture(r, q->b, q->tex) : q->tex == HUD_TEX_VIDEO ? video_texture(r) : 0;
+        r->in_hud_quad = 0;
         if (q->b && !id)
             continue;
         static const float black[4] = { 0, 0, 0, 1 };
@@ -1332,10 +1367,12 @@ static void draw_hud(Renderer *r, const Scene *s, int width, int height, double 
             glTexCoord2f(q->u0, q->v1); glVertex2f(q->x0, q->y1);
         }
         glEnd();
+#ifndef RAMPAGE_XBOX
         if (id) {
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
         }
+#endif
     }
     r->in_hud = 0;
     glDisable(GL_SCISSOR_TEST);

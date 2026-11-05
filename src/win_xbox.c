@@ -3,7 +3,9 @@
  * The GL target MUST be compiled with NO_INIT_CONSTRUCTOR: the GLES context and
  * loader callbacks must exist before gl4es probes capabilities. */
 #ifdef RAMPAGE_XBOX
+#ifndef _WINGDI_
 #define _WINGDI_                         /* gl4es must not import Win32 WGL */
+#endif
 #include <stdio.h>
 #include <string.h>
 #include <SDL.h>
@@ -12,6 +14,7 @@
 #include <GL/gl.h>
 #include <gl4esinit.h>
 #include "render_gl.h"
+#include "plat.h"
 
 /* Public nxdk-gles11 functions do not have the GL_APIENTRY convention. The
  * generated loader does, matching gl4esinit.h's callback. */

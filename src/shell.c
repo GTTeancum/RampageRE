@@ -1033,6 +1033,28 @@ static Layout *layout_load(Gui *g, const Bundle *b, const char *name, int extra)
         free(L);
         return NULL;
     }
+#ifdef RAMPAGE_LOW_MEMORY
+    /* The XML's property tags never become Nodes. The generous parse capacity
+     * counts them too; keep only actual objects plus the callers' clone reserve.
+     * No caller has received this layout yet, so its three tree links and root
+     * are the only Node pointers that must be relocated if realloc moves it. */
+    int cap = L->n + extra + 8;
+    if (cap < L->cap) {
+        uintptr_t old = (uintptr_t)L->nodes;
+        Node *nodes = realloc(L->nodes, (size_t)cap * sizeof *nodes);
+        if (nodes) {
+            L->nodes = nodes;
+            L->cap = cap;
+            L->root = (Node *)((uintptr_t)nodes + ((uintptr_t)L->root - old));
+            for (int i = 0; i < L->n; i++) {
+                Node *n = &nodes[i];
+                if (n->parent) n->parent = (Node *)((uintptr_t)nodes + ((uintptr_t)n->parent - old));
+                if (n->child) n->child = (Node *)((uintptr_t)nodes + ((uintptr_t)n->child - old));
+                if (n->next) n->next = (Node *)((uintptr_t)nodes + ((uintptr_t)n->next - old));
+            }
+        }
+    }
+#endif
     return L;
 }
 static void layout_free(Layout *L)
