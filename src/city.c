@@ -177,6 +177,8 @@ static void location(Group inst, float xyz[3])
 City *city_open(const Vol *vol, const char *name)
 {
     City *c = calloc(1, sizeof *c);
+    if (!c)
+        return NULL;
     c->vol = vol;
     snprintf(c->name, sizeof c->name, "%s", name);
     char file[96], props[96];
@@ -203,6 +205,10 @@ City *city_open(const Vol *vol, const char *name)
     snprintf(c->template_books[c->ntemplate_books++], 64, "%s_Props", name);
     snprintf(c->template_books[c->ntemplate_books++], 64, "%s_buildings", name);
     c->model_key = calloc(c->bundle.nentries ? c->bundle.nentries : 1, sizeof *c->model_key);
+    if (!c->model_key) {
+        city_close(c);
+        return NULL;
+    }
     for (uint32_t i = 0; i < c->bundle.nentries; i++) {
         const BdpEntry *e = &c->bundle.entries[i];
         if (e->type != ET_MESH && e->type != ET_SKINNED)
@@ -214,6 +220,11 @@ City *city_open(const Vol *vol, const char *name)
         c->model_key[i][k] = 0;
     }
     return c;
+}
+
+void city_activate(City *c)
+{
+    prb_set_resolver(c ? resolve : NULL, c);
 }
 
 void city_new_world(City *c)

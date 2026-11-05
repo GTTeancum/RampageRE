@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.18)
 project(RampageXbox LANGUAGES C)
 
+# nxdk's Generic CMake toolchain leaves Release flags empty by default.
+# Use conventional optimization without unsafe floating-point transformations.
+add_compile_options(-O2)
+
 # Configure through nxdk-cmake after building nxdk's SDL2 and pbkit libraries.
 # Keep game assets outside this source tree and out of the executable.
 if(NOT DEFINED ENV{NXDK_DIR})

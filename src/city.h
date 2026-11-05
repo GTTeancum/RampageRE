@@ -310,6 +310,8 @@ typedef struct {
 typedef struct City City;
 City *city_open(const Vol *vol, const char *name);   /* NULL if the city's bundles are not in the archive */
 void city_close(City *c);
+/* Restore a live city as the property-book resolver, or clear it with NULL. */
+void city_activate(City *c);
 uint32_t city_blocks(City *c, const char **names, uint32_t max);   /* the block list, without repeats */
 int city_build(City *c, const char *block, int night, Scene *s);    /* 0 = ok */
 /* the world starts (its scripts' onInit): the next city_build with occupants makes Traffic's two crowds and their

@@ -929,6 +929,70 @@ static void huds_close(Viewer *v)
     v->hud = NULL;
 }
 
+#ifdef RAMPAGE_LOW_MEMORY
+/* No destructor here calls back into a scene or property book. Free the old block's
+ * managers before allocating its replacement, rather than one by one afterwards. */
+static void block_managers_free(Viewer *v)
+{
+    army_free(v->army); v->army = NULL;
+    vehicle_free(v->veh); v->veh = NULL;
+    streetobj_free(v->sobj); v->sobj = NULL;
+    parade_free(v->parade); v->parade = NULL;
+    rail_free(v->rail); v->rail = NULL;
+    edible_free(v->edibles); v->edibles = NULL;
+    boss_free(v->boss); v->boss = NULL;
+}
+
+/* End the world only after its results have been copied to ShellStart. The shared
+ * GUI/FX bundles, profile, player choices and configuration outlive the world.
+ * The renderer must be detached first, while all of its bundle keys still live. */
+static void world_release(Viewer *v)
+{
+    sound_objects_clear();
+    sound_effect_stop_all();
+    if (v->fxw)
+        fx_clear(v->fxw);
+    huds_close(v);
+    for (int k = 0; k < MONSTERS; k++) {
+        Mon *mo = &v->mon[k];
+        if (mo->have_graph) {
+            moves_stop(&mo->run);
+            moves_free(&mo->graph);
+            mo->have_graph = 0;
+        }
+        if (mo->have_ag) {
+            dir_graph_free(&mo->ag);
+            mo->have_ag = 0;
+        }
+        mo->face = NULL;
+        mo->water_in = mo->water_was = NULL;
+        mo->ai.view = NULL;
+        mo->fx_used = 0;
+        mo->nfx_named = mo->rage_on = 0;
+        mo->rage_fx = -1;
+    }
+    block_managers_free(v);
+    game_free(v->game); v->game = NULL;
+    if (v->have_scene)
+        scene_free(&v->scene);
+    v->have_scene = 0;
+    city_close(v->city); v->city = NULL;
+    memset(v->blocks, 0, sizeof v->blocks);
+    v->nblocks = v->block = 0;
+    if (!v->wii_roster.n)                            /* rebind these names in open_city, without reseeding rubble */
+        memset(v->roster.name, 0, sizeof v->roster.name);
+    memset(&v->reveal, 0, sizeof v->reveal);
+    memset(&v->rwalk, 0, sizeof v->rwalk);
+    memset(&v->challenge, 0, sizeof v->challenge);
+    memset(&v->cw, 0, sizeof v->cw);
+    v->extra = v->game_block = v->left_block = -1;
+    v->game_built = v->music_state = v->ntubes = 0;
+    v->nfxa = v->nvfx = v->nsofx = v->npfx = v->nrfx = v->nefx = v->nbfx = 0;
+    v->nrsnd = v->nosnd = v->nbsnd = v->nppfx = v->narmed_people = 0;
+    v->nweather_fx = v->weather_due = 0;
+}
+#endif
+
 static int monster_index(const Viewer *v, const char *name);
 
 /* 0x2B6BE0 / 0x2B72B0: the slot after the players gets the monster to reveal (roster index rm), hidden and out of
@@ -1037,6 +1101,13 @@ static void block_left(Viewer *v);
 
 static void build(Viewer *v)
 {
+#ifdef RAMPAGE_LOW_MEMORY
+    if (v->rnd)
+        rnd_scene(v->rnd, NULL);                    /* release old GPU storage before allocating the new scene */
+    if (v->game_built)
+        vehicle_hidden_save(v->veh, &v->hidden);    /* save before the old traffic manager is freed */
+    block_managers_free(v);
+#endif
     if (v->have_scene)
         scene_free(&v->scene);
     if (!v->game_built && v->fxw)                    /* a new world (a city, a game): the last one's effects gone
@@ -1143,8 +1214,10 @@ static void build(Viewer *v)
         }
     }
     v->scene.army = v->army;
+#ifndef RAMPAGE_LOW_MEMORY
     if (v->game_built)                               /* the HiddenVehicle is Traffic's, not the block's: it drives on */
         vehicle_hidden_save(v->veh, &v->hidden);
+#endif
     vehicle_free(v->veh);                            /* the traffic of the three block slots, the roof rockets */
     v->veh = NULL;
     v->nvfx = 0;
@@ -1533,15 +1606,30 @@ static void build(Viewer *v)
  * BlockList index (the profile's saved one), its block found by name */
 static int open_city(Viewer *v, int index, uint32_t block, int game_block)
 {
+#ifdef RAMPAGE_LOW_MEMORY
+    if (v->rnd)
+        rnd_scene(v->rnd, NULL);                    /* GPU cache can be rebuilt if the load fails; CPU state stays */
+#endif
     City *c = city_open(&v->vol, CITIES[index]);
-    if (!c)
+    if (!c) {
+        city_activate(v->city);                    /* a partially opened city may have changed the book resolver */
+#ifdef RAMPAGE_LOW_MEMORY
+        if (v->rnd)
+            rnd_scene(v->rnd, v->have_scene ? &v->scene : NULL);
+#endif
         return -1;
+    }
+#ifdef RAMPAGE_LOW_MEMORY
+    world_release(v);                              /* the normal shell path already released the old world */
+#else
     if (v->have_scene) {
         scene_free(&v->scene);
         v->have_scene = 0;
     }
     city_close(v->city);
+#endif
     v->city = c;
+    city_activate(c);
     v->city_index = index;
     v->ny_generators = v->band_sound = 0;            /* the city's onLoadScript loads its scripts' bundle anew */
     if (v->roster.n && !v->wii_roster.n)             /* its names are the old city's book's: read from this one's */
@@ -7544,11 +7632,20 @@ static void gui3d_layers(Viewer *v, Shell *sh, Scene *s)
 static void popup_free(Viewer *v);
 static void shell_enter(Viewer *v, const ShellStart *st)
 {
+#ifdef RAMPAGE_LOW_MEMORY
+    if (v->rnd)
+        rnd_scene(v->rnd, NULL);
+#endif
     popup_free(v);                                   /* (before the textures are dropped: its bundle goes) */
     sound_effect_stop_all();                         /* [R] the package changes: the scripts' SoundEffects stop
                                                       * (0x28BE1C) */
     ShellProfile sp;
     shell_profile(v, &sp);
+#ifdef RAMPAGE_LOW_MEMORY
+    gui3d_free(v);
+    world_release(v);                              /* never retain an entire city underneath the menus */
+    city_activate(NULL);
+#endif
     v->shell = shell_open(&v->vol, st, &sp);
     v->card_poll = 0;
     static Scene empty;                              /* nothing but the screens, black around their 4:3 */
@@ -7887,6 +7984,10 @@ static void shell_start_game(Viewer *v)
     v->clip = -1;
     v->play = have_monster(v);
     v->last_game = *g;
+#ifdef RAMPAGE_LOW_MEMORY
+    if (v->rnd)
+        rnd_scene(v->rnd, NULL);                    /* menu textures go before their bundles, then the city's load */
+#endif
     movie_stop(v);
     gui3d_free(v);
     v->prof.profile_shown = shell_profile_shown(v->shell);
