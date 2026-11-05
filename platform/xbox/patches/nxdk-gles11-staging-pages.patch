@@ -1,0 +1,199 @@
+--- a/gles_staging.c
++++ b/gles_staging.c
+@@ -1,6 +1,14 @@
+ #include "arena.h"
+ #include "gles_private.h"
+ 
++#if GLI_STAGING_ARENA_SIZE < 4096 || (GLI_STAGING_ARENA_SIZE % 4096) != 0
++#error "GLI_STAGING_ARENA_SIZE must be a positive multiple of 4096"
++#endif
++
++/* pbkit DMA context 3 spans physical addresses 0..MAXRAM, including on
++ * upgraded consoles. Never allocate GPU DMA storage above that mapping. */
++#define GLI_STAGING_DMA_MAX 0x03FFAFFFu
++
+ // GPU staging arena for client-side vertex arrays.
+ // The NV2A GPU reads vertex data via DMA from physical addresses, so client-side
+ // arrays (from malloc/stack) must be copied into contiguous GPU-accessible memory
+@@ -22,18 +30,21 @@
+ static uint32_t frame_staged_bytes[2];
+ static uint32_t cur_staged_bytes;
+ static uint32_t frame_idx;
++static volatile uint32_t *staging_fence;
+ 
+ void gliStagingInit(void)
+ {
+     gli_context_t *context = gliGetContext();
+ 
+     void *pool =
+-        MmAllocateContiguousMemoryEx(GLI_STAGING_ARENA_SIZE, 0, 0xFFFFFFFF, 0x1000, PAGE_READWRITE | PAGE_WRITECOMBINE);
++        MmAllocateContiguousMemoryEx(GLI_STAGING_ARENA_SIZE, 0, GLI_STAGING_DMA_MAX, 0x1000, PAGE_READWRITE | PAGE_WRITECOMBINE);
+     assert(pool != NULL);
+ 
+     context->staging_arena_pool = pool;
+     context->staging_arena_phys = MmGetPhysicalAddress(pool);
+     arena_init(pool, GLI_STAGING_ARENA_SIZE, &context->staging_arena);
++    staging_fence = MmAllocateContiguousMemoryEx(4096, 0, GLI_STAGING_DMA_MAX, 0x1000, PAGE_READWRITE | PAGE_NOCACHE);
++    assert(staging_fence != NULL);
+ 
+     frame_staged_bytes[0] = frame_staged_bytes[1] = cur_staged_bytes = frame_idx = 0;
+ }
+@@ -41,6 +52,10 @@
+ void gliStagingDestroy(void)
+ {
+     gli_context_t *context = gliGetContext();
++    if (staging_fence) {
++        MmFreeContiguousMemory((PVOID)staging_fence);
++        staging_fence = NULL;
++    }
+     if (context->staging_arena_pool) {
+         MmFreeContiguousMemory(context->staging_arena_pool);
+         context->staging_arena_pool = NULL;
+@@ -118,24 +133,22 @@
+     // For interleaved buffers (stride > elem_size), allocate the full vertex_count * stride
+     // block so all interleaved attributes fit within this single staged range.
+     uint32_t alloc_bytes = (stride > (GLsizei)elem_size) ? (uint32_t)(vertex_count * stride) : (uint32_t)total_bytes;
+-    cur_staged_bytes += alloc_bytes;
+-
+-    // Round robin if we will go over capacity
+-    if (arena_available(arena) < alloc_bytes) {
+-        arena_reset(arena);
+-        *range_count = 0;
+-    }
+ 
++    /* The whole draw was reserved before opening its push-buffer packet. Never
++     * reset here: that could overwrite both pending GPU draws and this draw's
++     * attributes that were staged earlier in the same call. */
+     void *dst = arena_alloc(arena, alloc_bytes);
+     if (!dst) {
+         return NULL;
+     }
+-    gli_memcpy(dst, src_start, alloc_bytes);
++    /* The final vertex need only contain this attribute, not a full stride.
++     * Do not read trailing padding beyond the caller's valid array storage. */
++    gli_memcpy(dst, src_start, total_bytes);
+ 
+     // Record this range for interleaving detection
+     if (*range_count < MAX_STAGED_RANGES) {
+         ranges[*range_count].src_start = src_start;
+-        ranges[*range_count].src_end = src_start + alloc_bytes;
++        ranges[*range_count].src_end = src_end;
+         ranges[*range_count].dst_start = (uint8_t *)dst;
+         (*range_count)++;
+     }
+@@ -157,6 +170,78 @@
+     return p;
+ }
+ 
++/* Conservative upper bound including alignment for every active client array.
++ * Shared/interleaved ranges may use less space, but reserving them separately
++ * guarantees that no current-draw attribute can be invalidated by ring wrap. */
++static GLboolean reserve_client_array(size_t *required, GLboolean enabled,
++                                      GLuint binding, const void *ptr,
++                                      GLint components, GLenum type,
++                                      GLsizei stride, GLsizei count)
++{
++    if (!enabled || binding != 0 || !ptr)
++        return GL_TRUE;
++    size_t element = (size_t)components * gliEnumtoByteSize(type);
++    size_t step = stride ? (size_t)stride : element;
++    size_t bytes;
++    if (step > element) {
++        if ((size_t)count > GLI_STAGING_ARENA_SIZE / step)
++            return GL_FALSE;
++        bytes = (size_t)count * step;
++    } else {
++        if (element > GLI_STAGING_ARENA_SIZE ||
++            (step && (size_t)(count - 1) > (GLI_STAGING_ARENA_SIZE - element) / step))
++            return GL_FALSE;
++        bytes = (size_t)(count - 1) * step + element;
++    }
++    /* arena is compiled with ARENA_ALIGNMENT_SIZE=31 by CMakeLists.txt. */
++    bytes = (bytes + 31u) & ~(size_t)31u;
++    if (bytes > GLI_STAGING_ARENA_SIZE - *required)
++        return GL_FALSE;
++    *required += bytes;
++    return GL_TRUE;
++}
++
++static GLboolean reserve_client_draw(vertex_array_data_t *v, arena_t *arena, GLsizei count)
++{
++    size_t required = 0;
++#define RESERVE(enabled, binding, ptr, size, type, stride) \
++    if (!reserve_client_array(&required, (enabled), (binding), (ptr), (size), (type), (stride), count)) \
++        goto too_large
++    RESERVE(v->vertex_array_enabled, v->vertex_array_buffer_binding, v->vertex_array_ptr,
++            v->vertex_array_size, v->vertex_array_type, v->vertex_array_stride);
++    RESERVE(v->normal_array_enabled, v->normal_array_buffer_binding, v->normal_array_ptr,
++            3, v->normal_array_type, v->normal_array_stride);
++    RESERVE(v->color_array_enabled, v->color_array_buffer_binding, v->color_array_ptr,
++            v->color_array_size, v->color_array_type, v->color_array_stride);
++    for (GLuint i = 0; i < GLI_MAX_TEXTURE_UNITS; ++i) {
++        RESERVE(v->texcoord_array_enabled[i], v->texcoord_array_buffer_binding[i], v->texcoord_array_ptr[i],
++                v->texcoord_array_size[i], v->texcoord_array_type[i], v->texcoord_array_stride[i]);
++    }
++    RESERVE(v->point_size_array_enabled, v->point_size_array_buffer_binding, v->point_size_array_ptr,
++            1, v->point_size_array_type, v->point_size_array_stride);
++    RESERVE(v->fog_coord_array_enabled, v->fog_coord_array_buffer_binding, v->fog_coord_array_ptr,
++            1, v->fog_coord_array_type, v->fog_coord_array_stride);
++#undef RESERVE
++    if (arena_available(arena) < required) {
++        /* Previous packets may still DMA from this memory. Wait for a GPU-written
++         * completion value before reuse, outside any current draw packet. */
++        *staging_fence = 0;
++        uint32_t *pb = pb_begin();
++        /* pbkit DMA context 3 spans 0..GLI_STAGING_DMA_MAX, also used by vertex DMA. */
++        pb = pb_push1(pb, NV097_SET_CONTEXT_DMA_SEMAPHORE, 3);
++        pb = pb_push1(pb, NV097_SET_SEMAPHORE_OFFSET, MmGetPhysicalAddress((PVOID)staging_fence));
++        pb = pb_push1(pb, NV097_BACK_END_WRITE_SEMAPHORE_RELEASE, 1);
++        pb_end(pb);
++        while (*staging_fence != 1) NtYieldExecution();
++        arena_reset(arena);
++    }
++    return GL_TRUE;
++too_large:
++    gliSetError(GL_OUT_OF_MEMORY);
++    gliDebugF("[gles] Client draw exceeds staging arena (%u bytes)\n", (unsigned)GLI_STAGING_ARENA_SIZE);
++    return GL_FALSE;
++}
++
+ GLboolean gliStageClientArrays(GLint first, GLsizei vertex_count)
+ {
+     gli_context_t *context = gliGetContext();
+@@ -167,6 +252,10 @@
+         return GL_TRUE;
+     }
+ 
++    if (!reserve_client_draw(vad, arena, vertex_count))
++        return GL_FALSE;
++
++    size_t used_before = arena->used;
+     staged_range_t ranges[MAX_STAGED_RANGES];
+     int range_count = 0;
+ 
+@@ -271,6 +360,13 @@
+         vad->fog_coord_array_dirty = GL_FALSE;
+     }
+ 
++    /* Keep independent draws on separate pages. Xemu's OpenGL vertex uploader
++     * clears guest-RAM dirty bits at page granularity: later CPU stores to a
++     * shared page can otherwise be missed while the GPU consumes an earlier
++     * draw. A whole page belongs to one draw until the arena fence completes. */
++    size_t pad = ((arena->used + 4095u) & ~(size_t)4095u) - arena->used;
++    if (pad) arena_alloc(arena, pad);
++    cur_staged_bytes += arena->used - used_before;
+     if (range_count > 0) {
+         pb = pb_push1(pb, NV097_BREAK_VERTEX_BUFFER_CACHE, 0);
+     }
+--- a/gles_core.c
++++ b/gles_core.c
+@@ -16,6 +16,9 @@
+ GL_API void GL_APIENTRY glFinish(void)
+ {
+     glFlush();
++    uint32_t *pb = pb_begin();
++    pb = pb_push1(pb, NV097_WAIT_FOR_IDLE, 0);
++    pb_end(pb);
+     while (pb_busy())
+         ;
+ }
