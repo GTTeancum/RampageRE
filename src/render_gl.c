@@ -1322,6 +1322,26 @@ void rnd_hud_time(Renderer *r, double t)
     }
 }
 
+#ifdef RAMPAGE_XBOX
+/* Reject only quads wholly beyond one viewport edge. All four submitted
+ * corners matter: glyph skew and rotated cards may cross an edge even when
+ * their unmodified rectangle does not. Leave a reference-pixel safety margin. */
+static int hud_quad_visible(const HudQuad *q, float aspect)
+{
+    float left = HUD_SCREEN_W * 0.5f - HUD_SCREEN_H * 0.5f * aspect;
+    float right = HUD_SCREEN_W * 0.5f + HUD_SCREEN_H * 0.5f * aspect;
+    float xmin = INFINITY, xmax = -INFINITY, ymin = INFINITY, ymax = -INFINITY;
+    for (int k = 0; k < 4; ++k) {
+        float x = q->corners ? q->cx[k] : ((k == 0 || k == 3) ? q->x0 : q->x1) + (k < 2 ? q->skew : 0);
+        float y = q->corners ? q->cy[k] : (k < 2 ? q->y0 : q->y1);
+        if (!isfinite(x) || !isfinite(y)) return 1;
+        xmin = fminf(xmin, x); xmax = fmaxf(xmax, x);
+        ymin = fminf(ymin, y); ymax = fmaxf(ymax, y);
+    }
+    return !(xmax < left - 1 || xmin > right + 1 || ymax < -1 || ymin > HUD_SCREEN_H + 1);
+}
+#endif
+
 static void draw_hud(Renderer *r, const Scene *s, int width, int height, double t)
 {
     float aspect = height ? (float)width / height : 4.0f / 3;
@@ -1348,6 +1368,10 @@ static void draw_hud(Renderer *r, const Scene *s, int width, int height, double 
             layer++;
             continue;
         }
+#ifdef RAMPAGE_XBOX
+        /* Cull before texture lookup/upload, but never skip a 3D-layer sentinel. */
+        if (!hud_quad_visible(q, aspect)) continue;
+#endif
         r->in_hud_quad = 1;
         GLuint id = q->b ? texture(r, q->b, q->tex) : q->tex == HUD_TEX_VIDEO ? video_texture(r) : 0;
         r->in_hud_quad = 0;
