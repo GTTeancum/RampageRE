@@ -28,10 +28,14 @@ double movie_fps(const Movie *m);
 /* the picture shown t seconds in, RGBA (w x h x 4, the first row on top), NULL before the first one; *changed 1
  * when it is another picture than the last call's. Valid until the next call or movie_close. */
 const uint8_t *movie_video(Movie *m, double t, int *changed);
+/* Live playback: drop only obsolete pictures whose reference dependencies are safe. */
+const uint8_t *movie_video_realtime(Movie *m, double t, int *changed);
+/* Optional same-thread output service, called only between complete pictures. */
+void movie_set_output_pump(Movie *m, void (*pump)(void));
 /* the same picture's planes (Y, Cb, Cr: w x h and w/2 x h/2), for tests; 0 none */
 int movie_planes(const Movie *m, const uint8_t *plane[3], int stride[3]);
 int movie_done(const Movie *m, double t);           /* the last picture is shown and its time is over */
 /* the next frames of the sound, stereo at 48 kHz; the frames that had sound (the rest are silence) */
 int movie_audio(Movie *m, int16_t *out, int frames);
-int movie_pictures(const Movie *m);                 /* pictures decoded so far */
+int movie_pictures(const Movie *m);                 /* valid pictures processed, including realtime drops */
 #endif

@@ -1,0 +1,39 @@
+--- a/gles_core.c
++++ b/gles_core.c
+@@ -217,6 +217,9 @@
+             const GLuint light = cap - GL_LIGHT0;
+             if (context->lighting_state.lights[light].enabled != enable || initializing_context) {
+                 context->lighting_state.lights[light].enabled = enable;
++                /* A disabled-light flush clears its cached mask bits. Rebuild
++                 * the light type and parameters when it is enabled again. */
++                if (enable) context->lighting_state.lights[light].light_dirty = GL_TRUE;
+                 context->lighting_state.light_mask_dirty = GL_TRUE;
+             }
+             break;
+--- a/gles_lighting.c
++++ b/gles_lighting.c
+@@ -571,11 +571,11 @@
+ 
+         XguVec3 xgu_v;
+         if (light->light_dirty || materials[0]->material_dirty || materials[1]->material_dirty ||
+-            lighting->color_material_enabled) {
++            lighting->lighting_model_dirty) {
+             uint32_t *pb = pb_begin();
+             for (int j = 0; j < 2; j++) {
+                 material_t *material = materials[j];
+-                if (!light->light_dirty && !material->material_dirty) {
++                if (!light->light_dirty && !material->material_dirty && !lighting->lighting_model_dirty) {
+                     continue;
+                 }
+ 
+@@ -621,8 +621,8 @@
+                 } else {
+                     pb = xgu_set_back_light_specular_color(pb, i, xgu_v.r, xgu_v.g, xgu_v.b);
+                 }
+-                pb_end(pb);
+-            }
++            }
++            pb_end(pb);
+         }
+         light->light_dirty = GL_FALSE;
+     }

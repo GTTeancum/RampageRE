@@ -1,0 +1,12 @@
+--- a/src/gl/stack.c
++++ b/src/gl/stack.c
+@@ -157,7 +157,8 @@
+ 
+         int i;
+         int j=0;
+-        cur->lights_enabled = (GLboolean *)malloc(hardext.maxlights * sizeof(GLboolean));
++        if (!(mask & GL_ENABLE_BIT))
++            cur->lights_enabled = (GLboolean *)malloc(hardext.maxlights * sizeof(GLboolean));
+         cur->lights = (GLfloat *)malloc(hardext.maxlights * sizeof(GLfloat)*(10*4));
+         for (i = 0; i < hardext.maxlights; i++) {
+             *(cur->lights_enabled + i) = gl4es_glIsEnabled(GL_LIGHT0 + i);

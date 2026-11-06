@@ -55,6 +55,7 @@ typedef struct {
     int anim_done;                                   /* a play that does not repeat has ended (onAnimComplete sent) */
     float world[16];                                 /* column-major; always kept: pos and heading, or the hand / the flight */
     int building, storey, column;                    /* a window occupant's cell (-1 none) */
+    int window_home;                                /* original window building, -1 for non-window actors */
     int slot_empty;                                  /* its slot has no occupant any more (people_window_emptied) */
     Group inst;                                      /* the block's ActorInstance| it was made from (its SpawnsItem<n>) */
     float win_x, win_floor;                          /* its window's x and its storey's floor when it came out */
@@ -129,6 +130,10 @@ typedef float (*PeopleClipSeconds)(void *ctx, const char *anim, const char *shap
 
 People *people_new(PeopleClipSeconds clip_seconds, void *ctx);
 void people_free(People *p);
+/* Optional host permission to reuse a naturally re-entered civilian's index. Return nonzero only after all
+ * external references (held objects, effects, weapons and sounds) have gone. The module also checks its events. */
+typedef int (*PeopleWindowReuse)(void *ctx, int who);
+void people_set_window_reuse(People *p, PeopleWindowReuse ready, void *ctx);
 /* the template of a name (gWorld.createActor / OTRef): Band.bsf's members, the huts' guards */
 typedef Group (*PeopleFindTemplate)(void *ctx, const char *name);
 void people_set_templates(People *p, PeopleFindTemplate find, void *ctx);

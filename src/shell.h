@@ -158,6 +158,7 @@ float shell_popup_fade(const Shell *s);   /* the popup's interface fade (+0x5C):
 void shell_movie_hold(Shell *s);
 void shell_movie_end(Shell *s);              /* it is over (Video.status() 3): the shell goes on */
 float shell_movie_clock(const Shell *s);     /* seconds since the playing movie started, -1 none (ended, skipped) */
+void shell_movie_sync(Shell *s, float seconds); /* live output clock, game simulation dt unchanged */
 void shell_movie_picture(Shell *s, int on);  /* the Video quad shows the movie's picture (1) or black (0) */
 
 /* the pad, as GuiEvent ids: hud.h HUD_EV_* (2 right, 4 left, 8 up, 16 down, 32 back, 64 accept, 128 start, 256 a

@@ -22,6 +22,8 @@ enum { OF_DYING = 0x800, OF_PUSH_OUT = 0x4000, OF_EFF_NODES = 0x8000, OF_PICKUP 
 struct People {
     Person *v;
     int n, cap;
+    PeopleWindowReuse window_reuse;
+    void *window_reuse_ctx;
     PeopleClipSeconds clip_seconds;
     void *ctx;
     float droppable_rate;
@@ -1149,9 +1151,9 @@ static int script_kind(const char *script)
     return PK_OTHER;
 }
 
-static Person *new_person(People *p, Group tmpl, const float pos[3], float heading)
+static Person *new_person_at(People *p, Group tmpl, const float pos[3], float heading, int reuse)
 {
-    if (p->n == p->cap) {
+    if (reuse < 0 && p->n == p->cap) {
         int cap = p->cap ? 2 * p->cap : 64;
         Person *v = realloc(p->v, sizeof *v * (size_t)cap);
         if (!v)
@@ -1159,14 +1161,14 @@ static Person *new_person(People *p, Group tmpl, const float pos[3], float headi
         p->v = v;
         p->cap = cap;
     }
-    Person *q = &p->v[p->n++];
+    Person *q = &p->v[reuse >= 0 ? reuse : p->n++];
     memset(q, 0, sizeof *q);
     q->tmpl = tmpl;
     q->name = tmpl.at ? group_name(tmpl) : "";
     q->kind = script_kind(tmpl.at ? group_str(tmpl, "Script|ScriptName") : NULL);
     memcpy(q->pos, pos, sizeof q->pos);
     q->heading = heading;
-    q->building = q->storey = q->column = -1;
+    q->building = q->storey = q->column = q->window_home = -1;
     q->pulse_delay = -1;                             /* [R] the Actor's +0xF8: -1, no pulses */
     q->flags = OF_ACTOR;                             /* [R] 0x30E3E0 */
     const char *flags = tstr(q, "Flags");            /* [R] the template's Flags (0x30DA24, names at 0x3F5F70) */
@@ -1316,18 +1318,54 @@ void people_window_emptied(People *p, int who)
 
 int people_add(People *p, Group tmpl, const float pos[3], float heading_deg)
 {
-    Person *q = new_person(p, tmpl, pos, heading_deg);
+    Person *q = new_person_at(p, tmpl, pos, heading_deg, -1);
     if (!q)
         return -1;
     construct(p, q);
     return who_of(p, q);
 }
 
+void people_set_window_reuse(People *p, PeopleWindowReuse ready, void *ctx)
+{
+    if (p) {
+        p->window_reuse = ready;
+        p->window_reuse_ctx = ctx;
+    }
+}
+
+/* Only the ordinary WindowReEnter path leaves state 0. Reuse the same window and exact template: scene looks
+ * are keyed by person index + animation, so a different template must never inherit this index. No generic
+ * PP_GONE recycling: a held/eaten person, a streaker, or an actor chain can still have outside references. */
+static int window_reuse_slot(People *p, Group tmpl, int building, int storey, int column)
+{
+    if (!p->window_reuse || people_window_retired(p, building, storey, column))
+        return -1;
+    for (int i = 0; i < p->n; i++) {
+        const Person *q = &p->v[i];
+        if (q->phase != PP_GONE || q->kind != PK_WINDOW || q->state != 0 || q->window_home != building ||
+            q->storey != storey || q->column != column || q->tmpl.at != tmpl.at || q->tmpl.book != tmpl.book || q->inst.at)
+            continue;
+        int pending = 0;
+        for (int k = 0; k < p->nev && !pending; k++)
+            pending = p->ev[k].who == i;
+        for (int k = 0; k < p->ntimers && !pending; k++)
+            pending = p->timer[k].ev.who == i;
+        if (!pending && p->window_reuse(p->window_reuse_ctx, i))
+            return i;
+    }
+    return -1;
+}
+
 int people_add_window(People *p, Group tmpl, const float at[3], int building, int storey, int column)
 {
-    int who = people_add(p, tmpl, at, 0);            /* [R 0x318A44 .. 0x318B14] no facing is set: the identity */
+    int reuse = window_reuse_slot(p, tmpl, building, storey, column);
+    Person *q = new_person_at(p, tmpl, at, 0, reuse); /* [R 0x318A44 .. 0x318B14] no facing is set: the identity */
+    if (!q)
+        return -1;
+    construct(p, q);
+    int who = who_of(p, q);
     if (who >= 0) {
-        p->v[who].building = building;
+        p->v[who].building = p->v[who].window_home = building;
         p->v[who].storey = storey;
         p->v[who].column = column;
         p->v[who].win_x = at[0];
@@ -1798,7 +1836,13 @@ static void people_spawn_chain(People *p)
 }
 
 void people_set_block(People *p, Group block) { if (p) p->block = block; }
-void people_set_instance(People *p, int who, Group inst) { if (p && who >= 0 && who < p->n) p->v[who].inst = inst; }
+void people_set_instance(People *p, int who, Group inst)
+{
+    if (p && who >= 0 && who < p->n) {
+        p->v[who].inst = inst;
+        p->v[who].window_home = -1;                 /* instance chains retain their own identity */
+    }
+}
 void people_set_world_state(People *p, int state) { if (p) p->not_in_play = state != 6; }
 void people_set_drop(People *p, void (*drop)(void *ctx, const char *name, const float pos[3]), void *ctx)
 {

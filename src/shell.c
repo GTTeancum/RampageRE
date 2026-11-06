@@ -5837,6 +5837,10 @@ void shell_movie_end(Shell *s)
 }
 
 float shell_movie_clock(const Shell *s) { return s && movie_left((Shell *)s) ? s->movie_clock : -1; }
+void shell_movie_sync(Shell *s, float seconds)
+{
+    if (s && movie_left(s) && seconds >= 0) s->movie_clock = seconds;
+}
 
 void shell_movie_picture(Shell *s, int on) { if (s) s->gui.video_pic = on; }
 

@@ -1,0 +1,13 @@
+--- a/gles_core.c
++++ b/gles_core.c
+@@ -224,6 +224,10 @@
+         case GL_LIGHTING:
+             if (context->lighting_state.lighting_enabled == enable && !initializing_context) return;
+             context->lighting_state.lighting_enabled = enable;
++            /* Unlit draws may have consumed the modelview dirty flag without
++             * uploading its inverse. The normal matrix must be current before
++             * the next lit draw, even when the application reuses its matrix. */
++            if (enable) context->transformation_state.modelview_matrix_dirty = GL_TRUE;
+             {
+                 uint32_t *pb = pb_begin();
+                 pb = xgu_set_lighting_enable(pb, enable);

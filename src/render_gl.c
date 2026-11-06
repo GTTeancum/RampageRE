@@ -247,6 +247,8 @@ typedef struct { const MeshPart *parts; uint32_t nparts; PartBuf *pb; } MeshBuf;
 
 struct Renderer {
     const Scene *scene;
+    void (*output_pump)(void);
+    double output_pump_at;
     BundleTex cache[16]; int ncache;
     Ifl ifl[32]; int nifl;
     uint32_t drawn;
@@ -337,6 +339,24 @@ static void upload_mips(const uint8_t *rgba, int w, int h)
 }
 
 Renderer *rnd_create(void) { return calloc(1, sizeof(Renderer)); }
+
+/* Same-thread output service only: callback must not advance gameplay or call GL.
+ * Bound callback rate while allowing long draw/upload batches to refill audio. */
+void rnd_set_output_pump(Renderer *r, void (*pump)(void))
+{
+    if (!r) return;
+    r->output_pump = pump;
+    r->output_pump_at = 0;
+}
+static void pump_output(Renderer *r)
+{
+    if (!r->output_pump) return;
+    double now = win_time();
+    if (now >= r->output_pump_at && now - r->output_pump_at < 0.016) return;
+    r->output_pump_at = now;
+    r->output_pump();
+}
+
 
 static void drop_textures(Renderer *r)
 {
@@ -506,6 +526,9 @@ void rnd_scene(Renderer *r, const Scene *s)
 {
     drop_textures(r);
     drop_buffers(r);
+    /* A new scene can reuse the same mesh storage; keep capacity, not its bounds. */
+    if (r->bound)
+        memset(r->bound, 0, sizeof *r->bound * r->nbound);
     r->scene = s;
 }
 
@@ -593,8 +616,28 @@ static BundleTex *bundle_tex(Renderer *r, const Bundle *b)
     return bt;
 }
 
+#if defined(RAMPAGE_XBOX) && defined(RAMPAGE_XBOX_EXACT_PALETTE)
+extern GLboolean gliTextureTryPalette(void);
+/* Only immutable world-cache uploads opt in. HUD, movies and mipmapped images
+ * retain their existing storage. The driver accepts only exact dictionaries
+ * whose page-rounded allocation shrinks, preserving RGBA storage on fallback.
+ * Flush the frontend before inspecting its bound native texture; the native
+ * conversion waits for queued GPU reads before replacing storage. */
+static void try_exact_palette(Renderer *r)
+{
+    if (r->in_hud || g_mips)
+        return;
+    glFinish();
+    gliTextureTryPalette();
+    pump_output(r);
+}
+#else
+#define try_exact_palette(r) ((void)0)
+#endif
+
 static GLuint texture_at(Renderer *r, const Bundle *b, uint32_t name, int zero_ok)
 {
+    pump_output(r);
     BundleTex *bt = bundle_tex(r, b);
     if (!bt || (!name && !zero_ok) || name >= bt->n)
         return 0;
@@ -643,6 +686,7 @@ static GLuint texture_at(Renderer *r, const Bundle *b, uint32_t name, int zero_o
             }
             if (!r->in_hud)
                 tex_aniso();                         /* port extra: aniso= */
+            try_exact_palette(r);
             if (hash) {
                 tp_scope(b->scope);
                 tp_dump(hash, rgba, w, h);
@@ -692,6 +736,7 @@ static int region_rect(const float reg[4], int tw, int th, int rect[4])
  * tile is cut from it at its own size */
 static GLuint region_texture(Renderer *r, const Bundle *b, uint32_t name, const float reg[4], float scale[2])
 {
+    pump_output(r);
     BundleTex *bt = bundle_tex(r, b);
     scale[0] = scale[1] = 1;
     if (!bt || !name || name >= bt->n)
@@ -742,6 +787,7 @@ static GLuint region_texture(Renderer *r, const Bundle *b, uint32_t name, const 
                 }
                 if (!r->in_hud)
                     tex_aniso();
+                try_exact_palette(r);
                 rt->id = id;
                 rt->scale[0] = (float)w / rc[2];
                 rt->scale[1] = (float)h / rc[3];
@@ -996,6 +1042,7 @@ static void draw_held(Renderer *r, double t)
 
 static void draw_part(Renderer *r, const SceneMesh *sm, const Skin *skin, uint32_t i, uint32_t first, double t)
 {
+    pump_output(r);
     const Scene *s = r->scene;
     const MeshPart *p = &sm->mesh.parts[i];
     uint32_t tex = shown_texture(r, sm->b, material_texture(sm->b, p->material), t);
@@ -1616,6 +1663,7 @@ static void draw_fx(Renderer *r, const FxQuad *fx, int nfx, const Camera *cam, f
 
 void rnd_frame(Renderer *r, const Window *w, const Camera *cam, double t, int fog)
 {
+    pump_output(r);
     const Scene *s = r->scene;
     r->drawn = 0;
     if (r->tex_gen != g_tex_gen) {                         /* the texture settings changed: loaded anew */

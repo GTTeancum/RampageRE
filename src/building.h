@@ -69,13 +69,17 @@ enum {
 
 typedef struct {
     float min[3], max[3];                            /* in the world (the grid's +0x24 .. +0x38); max z drops as it falls */
-    int width, depth, storeys;                       /* storeys: as built */
+    int width, depth, storeys;                       /* storeys: immutable row capacity, clamped 0..48 */
     int row;                                         /* +0x10C: the block's row it stands in (0 the front row) */
     int n, live[BUILDING_STOREYS];                   /* the standing storeys, bottom up (G+0x18, G+0x48) */
     int state;                                       /* BUILDING_* */
     int hp, hp_max;                                  /* BuildingHP (+0x390, +0x394; default 6 x width x storeys) */
     int floor_hp[BUILDING_STOREYS];                  /* FloorHP per storey (floor +0x14; default 8 x width) */
+#if defined(RAMPAGE_LOW_MEMORY) && !defined(RAMPAGE_FIXED_BUILDING_ROWS)
+    BuildingCell (*cell)[BUILDING_CELLS];            /* owned immutable storeys rows, including fallen storeys */
+#else
     BuildingCell cell[BUILDING_STOREYS][BUILDING_CELLS];   /* [o][face x depth + column], fronts from 2 x depth */
+#endif
 #if defined(RAMPAGE_LOW_MEMORY) && !defined(RAMPAGE_FIXED_BUILDING_VERTS)
     BuildingVert (*vert)[3][BUILDING_VCOLS];          /* owned storeys + 1 rows; released by building_free */
 #else
@@ -125,8 +129,8 @@ typedef struct {
     struct { uint8_t event, state; } score[BUILDING_SCORES]; int nscore;
 } Building;
 
-/* Initialize fresh storage. Returns 0, or -1 if its low-memory grid cannot be allocated.
- * A successful building owns its grid: do not shallow-copy it, and free it before reinitializing. */
+/* Initialize fresh storage. Returns 0, or -1 if dimensions are invalid or its low-memory grids cannot be allocated.
+ * A successful building owns its grids: do not shallow-copy it, and free it before reinitializing. */
 int building_init(Building *b, const float min[3], const float max[3], int width, int depth, int storeys);
 void building_free(Building *b);                    /* safe after a failed init, and safe more than once */
 int building_cell_index(const Building *b, int face, int column);    /* -1 if out of range */
@@ -143,7 +147,7 @@ void building_set_one_hit(int on);
 int building_hit_roof(Building *b, const float p[3], float radius, int *col);
 void building_destroy(Building *b);                 /* the collapseBuilding binding (0x2BB8B0): it falls */
 /* setCellDamage(face, floor, column, state): the cell of template storey o (0 the first above the ground floor) on
- * that face to damage state 0 .. 3, its HP left as it was, that cell alone (a front cell above 0 drops its open
+ * that face to damage state 0 .. 3 (0 <= o < storeys, including fallen template rows), its HP left as it was, that cell alone (a front cell above 0 drops its open
  * windows first, 0x2BB580); face 5 (the roof) sets the roof's state, whatever the storey and column (0x2CFDA0) */
 void building_set_cell(Building *b, int face, int o, int col, int state);
 void building_update(Building *b, float dt);         /* collapses, destruction, the shaker (0x2BDC70) */

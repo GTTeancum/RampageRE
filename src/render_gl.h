@@ -43,6 +43,7 @@ typedef struct {
 
 typedef struct Renderer Renderer;
 Renderer *rnd_create(void);
+void rnd_set_output_pump(Renderer *r, void (*pump)(void)); /* same-thread output, no gameplay/GL calls */
 void rnd_scene(Renderer *r, const Scene *s);       /* drops the textures and buffers of the scene before */
 void rnd_frame(Renderer *r, const Window *w, const Camera *cam, double t, int fog);
 /* the clock the GUI's 3D layers go by (the frame's, running while the world is paused); without it rnd_frame's t */

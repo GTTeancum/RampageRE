@@ -1,0 +1,144 @@
+{
+  "inputs": {
+    "graphics": {
+      "host-tests/guard_test.c": "a18c7806468fde4663acfe6dbf6b2d19e3b06c0d2906ca16846680ecadf2424e",
+      "host-tests/actual_guard_host.h": "f8c7ee4cc92a827ac4758097d2d38ee068ca0125c7ed896cc7744fe5ab8ba81e",
+      "host-tests/lifecycle_gates.h": "097a89e2248456b4ff6427891514f222cbecab3d5bc6c9fc459ab4dbb034cbdc",
+      "host-tests/lifecycle_test.c": "dca882afba305fd2d804782dc7d0abf3b71b8e5dcb1bae4c7fe63272065adbd6",
+      "host-tests/shutdown-extracted.c": "43330bcd621fa1fe55f7ed42917894689dcea481dae8ae3c3859cd76d07503ac",
+      "host-tests/caller_test.c": "144ba407a7c518aeb6ce4496ad8267a1d51328a2ca09d2bb1955193743a2e1fa",
+      "host-tests/glFlipNV2A-extracted.c": "1814838fcc94b67cbe8e6bcbac327d5490bf6b5c121ba2807ea0c04923fb1a34",
+      "host-tests/caller_test_san": "a32998db2ce28097dffb40109aa862c0d8fc9d93514dbd179cfb0e366f91b21c",
+      "host-tests/platform.h": "12e553377dd9adbe4d94df984d9f18ed14086c777d50ac85e576f71687b06975",
+      "host-tests/caller_helpers.h": "5c005f2ab80be640981c8c39dc136a34e643e02730057632c1e5a8c8ac3ab17b",
+      "host-tests/pb_kill-extracted.c": "379c5a6ffbafed73c08ad724cb46163492422587795ae106812fef1cdb10590b",
+      "host-tests/pb_init-extracted.c": "afa59fcd0b15172ef2071bef4d988b86f5f1e03649095a1d5dc4e8d9504092a8",
+      "host-tests/lifecycle_test_san": "253a59a8b9a32738fb8e155f0256d16d4e9aec584431c6b751175d31127bca23",
+      "host-tests/guard_test_san": "77f2e13adb9e32244afa1dee052da637ce68da0e220a6a9e633d141091891f49",
+      "host-tests/reset-model/model_san": "1268198b7e99e7f6b36ed94682d7f64807ad16d5fcfdfd7fd4e933ef3c97bfb8",
+      "host-tests/reset-model/model.c": "00e5226b5688183d1e102a911f13822f0ea01c5eb75d470b4daf9cbc950c3c50",
+      "host-tests/reset-model/extracted.inc": "a1166b53dd84a2f4dca24c4dba36c27ddf86564a6abf888da631974fb21108f8",
+      "host-tests/startup/fixed-O2": "99686dad5e10ab40c2bade16077b4dbc2e90c6dc5da58d5d40c4cc044b014f1c",
+      "host-tests/startup/fixed.c": "9d281e8e1e68c0b149080a02ce169897c2f1a3864158b20e5304b64c4d4f5e5a",
+      "host-tests/startup/baseline-O0": "9e5dd6ed78daa35a38f9a4510e237b4b85ba7c3a9d6f9713704332521d4f8bc4",
+      "host-tests/startup/baseline.c": "cfc93074526247a214cad450233163585a9907b7697ef36624e94ef0af393e0e",
+      "host-tests/startup/fixed-O0": "ca9bfab98c4683422187fd19ec8b77c5b19f439510ef913c6bee4e0105791973",
+      "host-tests/fallback/baseline.host.inc": "b8fadc0671c1cc2cdcb50e4ba47f84d469a59844d9a3ba29f1d714194fcafe17",
+      "host-tests/fallback/regression.c": "8bd59a57ab0f64ebdf81995db648093ab5e5b4b68eac54337c76c16eb0c22e74",
+      "host-tests/fallback/baseline.extracted.inc": "78cc3947ab5bbc60f3f76f9ac77eef59aebcc821f0ec1f79847906dc574606fe",
+      "host-tests/fallback/candidate.host.inc": "98b573dd8c6e053b020fa14139d66b1eca07699702ca8fdd07fefba37acda38b",
+      "host-tests/fallback/regression_san": "49fa69a5cf2d03443243d645bdb28525253b2aff096003895ca03e337369f92c",
+      "host-tests/fallback/fixtures.inc": "78ffce8f1a72b6d62d25d4fd5bda0acbeaf7cc3c767f8575c7858608fafe4191",
+      "host-tests/fallback/candidate.extracted.inc": "c7d8092c867c4e83169ac8b26352aadabe1c753f1d6693bfbec4ed7bfe67dd74",
+      "host-tests/formatter/formatter_san": "a7cf07ba35fa34826fdacae216c198d0073eec88a23940f96136151bbd48bf0a",
+      "host-tests/formatter/formatter_test.c": "367ac64aea395e6438063bc5fb01b6121abd2b89f2f93ca5178b3717cc26079b",
+      "inputs/pbkit.baseline.c": "da9835f0d9e9da4a7e5c185b7913752aab5614bfc170ebc572cc12cc3af0da92",
+      "inputs/pbkit.startup-fallback.c": "17154f593d49156b3471fcea6637422f2adf81522cd66b07b93f9547c74f9105"
+    },
+    "audio": {
+      "host-tests/test-baseline-O2": "af012caa1571a998edc959b6930c3c597ac4b5f493e49e8ef37ba42f49f71a87",
+      "host-tests/test-baseline-O0": "e4b17905d81ce6139c51f93f9bc43bd6d7b985821164ff9af91c913e93f2239c",
+      "host-tests/hal-candidate.inc": "e7e8cf43e79c878fded53975165edae5f150cc105cb801f14fb7f53d6889a797",
+      "host-tests/hal-baseline.inc": "239a3e266326742524a1e116ee0f3f40ac011d6a5fb9533d3adeda9a3184b8c5",
+      "host-tests/test-candidate-O0": "b3ff38e5b63fe08c96a39de6a1116359bbe7e1f5907b0d80612e959f15e1b6ec",
+      "host-tests/test.c": "a17edee0c6815fac1c0f7461f4971f5be7075abb816e4f8099d3d37713333b2f",
+      "host-tests/test-candidate-O2": "a572c40c3d7959272daae5f2868ed10d50264a466dcd75a5825088623902247a",
+      "host-tests/xemu-extracted.inc": "b6e06000719675e1e37eeb9f94a7715bf7e7eb00050a96fa1421395490ccb062",
+      "host-tests/xemu-constants.inc": "a52672cbc765d5d3526a91e51d04ad53eede176a5af82bae28ff8aa387de95d0",
+      "inputs/audio_xbox_hal.plain.c": "0bea41e938c387acae42d1f30ac34009ac68dcb5bd50fdc6f4bba8a82429df47",
+      "reference/ac97.c": "bd2a95fdd9f90f0c7391fd0c83ebc7768179296a50b6a056839a22ec49ee554b",
+      "host-tests/baseline-schedule-points.json": "f014a9b08c9e5f9051d69e061ca3c6c97a5982aeca265945c7cb31ba104308c3",
+      "host-tests/candidate-schedule-points.json": "446b2ddf8d961a89816c767a79d3673164c7e56d2ed30d95cc80d8c3e448fd6f"
+    },
+    "nxdk": {
+      "lib/pdclib/functions/_PDCLIB/_PDCLIB_print.c": "572bca7e4367c95d58442422acfe25d21fe3171cc4f378a66ae92c2351f09658",
+      "lib/pdclib/functions/stdio/vsnprintf.c": "59293e40f2c6535f8e51d36050d8fb9eaaee46e212971abe4642e099ec48f670",
+      "lib/pdclib/functions/stdio/snprintf.c": "128075667de0a8a1fce965fc1a945b10f4aaa99f06a73e54616895bd67e0ce97",
+      "lib/pbkit/nv_regs.h": "a663fe08e0ac3dba0a95ef7cb2f64f6287b5efed55fd70466df988239d5a5a9d"
+    }
+  },
+  "runs": [
+    {
+      "group": "graphics",
+      "path": "host-tests/guard_test_san",
+      "name": "guard",
+      "marker": "PASS 34 "
+    },
+    {
+      "group": "graphics",
+      "path": "host-tests/caller_test_san",
+      "name": "caller",
+      "marker": "PASS 53 "
+    },
+    {
+      "group": "graphics",
+      "path": "host-tests/lifecycle_test_san",
+      "name": "lifecycle",
+      "marker": "PASS 29 "
+    },
+    {
+      "group": "graphics",
+      "path": "host-tests/fallback/regression_san",
+      "name": "fallback",
+      "marker": "PASS 140 "
+    },
+    {
+      "group": "graphics",
+      "path": "host-tests/reset-model/model_san",
+      "name": "reset-model",
+      "marker": "PASS 20 "
+    },
+    {
+      "group": "graphics",
+      "path": "host-tests/formatter/formatter_san",
+      "name": "formatter",
+      "marker": "PASS 25 "
+    },
+    {
+      "group": "graphics",
+      "path": "host-tests/startup/fixed-O0",
+      "name": "startup-O0",
+      "marker": "PASS: 5 "
+    },
+    {
+      "group": "graphics",
+      "path": "host-tests/startup/fixed-O2",
+      "name": "startup-O2",
+      "marker": "PASS: 5 "
+    },
+    {
+      "group": "graphics",
+      "path": "host-tests/startup/baseline-O0",
+      "name": "startup-negative",
+      "negative": true
+    },
+    {
+      "group": "audio",
+      "path": "host-tests/test-baseline-O0",
+      "name": "hal-baseline-O0",
+      "marker": "\"cases\":66504"
+    },
+    {
+      "group": "audio",
+      "path": "host-tests/test-baseline-O2",
+      "name": "hal-baseline-O2",
+      "marker": "\"cases\":66504"
+    },
+    {
+      "group": "audio",
+      "path": "host-tests/test-candidate-O0",
+      "name": "hal-candidate-O0",
+      "marker": "\"cases\":66504"
+    },
+    {
+      "group": "audio",
+      "path": "host-tests/test-candidate-O2",
+      "name": "hal-candidate-O2",
+      "marker": "\"cases\":66504"
+    }
+  ],
+  "source_seals": {
+    "graphics": "2c0e8c462793a648ef7c457b02edb660b5cd5f41c0faa288bec574f0b9884a10",
+    "audio": "02650fa66dcf08dac434966caa52d50d58ec51383d1707dfb97ad142ca8737be"
+  }
+}

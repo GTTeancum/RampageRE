@@ -11,6 +11,12 @@ if(NOT DEFINED ENV{NXDK_DIR})
   message(FATAL_ERROR "NXDK_DIR must name an initialized nxdk checkout")
 endif()
 set(NXDK_DIR "$ENV{NXDK_DIR}")
+# Keep the installed SDK unchanged when selecting a reviewed private driver.
+set(RAMPAGE_XBOX_PBKIT_LIBRARY "${NXDK_DIR}/lib/libpbkit.lib" CACHE FILEPATH
+    "pbkit archive to link (must match the selected GLES reset-drain ABI)")
+if(NOT EXISTS "${RAMPAGE_XBOX_PBKIT_LIBRARY}")
+  message(FATAL_ERROR "RAMPAGE_XBOX_PBKIT_LIBRARY must name an existing pbkit archive")
+endif()
 if(NOT DEFINED NXDK_GLES11_DIR OR NOT EXISTS "${NXDK_GLES11_DIR}/CMakeLists.txt")
   message(FATAL_ERROR "Set NXDK_GLES11_DIR to an nxdk-gles11 checkout")
 endif()
@@ -27,15 +33,23 @@ set(GAME_SOURCES
  main.c shot.c render_gl.c city.c vol.c bundle.c tex.c mesh.c prb.c tree.c anim.c camera.c moves.c
  building.c climb.c ik.c people.c fx.c cloth.c sound.c army.c hud.c vehicle.c water.c edible.c game.c
  boss.c look.c shadow.c director.c footstep.c challenge.c reveal.c rail.c parade.c streetobj.c profile.c
- collide.c shell.c movie.c wrand.c texpack_xbox.c iso.c plat_xbox.c xbox_libc.c rounding_xbox.c pad_xbox.c win_xbox.c settings.c postfx_xbox.c autoplay.c)
+ collide.c shell.c movie.c wrand.c texpack_xbox.c iso.c plat_xbox.c xbox_libc.c rounding_xbox.c audio_xbox_hal.c pad_xbox.c win_xbox.c settings.c postfx_xbox.c autoplay.c)
 list(TRANSFORM GAME_SOURCES PREPEND "${ROOT}/src/")
 add_executable(rampage_xbox ${GAME_SOURCES})
+# Private integration candidate: enable only with the reviewed exact-palette backend.
+option(RAMPAGE_XBOX_EXACT_PALETTE "Use exact P8 storage for eligible immutable world textures" OFF)
+if(RAMPAGE_XBOX_EXACT_PALETTE)
+  if(NOT EXISTS "${NXDK_GLES11_DIR}/gles_palette_codec.h")
+    message(FATAL_ERROR "Exact palette storage requires the separately reviewed backend patch")
+  endif()
+  target_compile_definitions(rampage_xbox PRIVATE RAMPAGE_XBOX_EXACT_PALETTE)
+endif()
 set_property(TARGET rampage_xbox PROPERTY C_STANDARD 99)
 target_compile_definitions(rampage_xbox PRIVATE RAMPAGE_XBOX RAMPAGE_LOW_MEMORY XBOX _WINGDI_)
 target_compile_options(rampage_xbox PRIVATE -fsigned-char)
 target_include_directories(rampage_xbox PRIVATE "${ROOT}/src" "${NXDK_DIR}/lib/sdl/SDL2/include")
 target_link_options(rampage_xbox PRIVATE "-include:_automount_d_drive")
-target_link_libraries(rampage_xbox PRIVATE "${NXDK_DIR}/lib/libnxdk_automount_d.lib" GL GLESv1_CM "${NXDK_DIR}/lib/libSDL2.lib" "${NXDK_DIR}/lib/libpbkit.lib")
+target_link_libraries(rampage_xbox PRIVATE "${NXDK_DIR}/lib/libnxdk_automount_d.lib" GL GLESv1_CM "${NXDK_DIR}/lib/libSDL2.lib" "${RAMPAGE_XBOX_PBKIT_LIBRARY}")
 add_custom_command(TARGET rampage_xbox POST_BUILD
  COMMAND "${NXDK_DIR}/tools/cxbe/cxbe" "-OUT:${CMAKE_CURRENT_BINARY_DIR}/default.xbe" "-TITLE:RampageRE" "$<TARGET_FILE:rampage_xbox>"
  VERBATIM COMMENT "Converting the Xbox executable to XBE")

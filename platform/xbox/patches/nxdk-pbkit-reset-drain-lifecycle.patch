@@ -1,0 +1,180 @@
+--- a/lib/pbkit/pbkit.c
++++ b/lib/pbkit/pbkit.c
+@@ -214,6 +214,9 @@
+ 
+ 
+ 
++
++/* Private trace-free reset safety, after native state declarations. */
++#include "pb_reset_guard.h"
+ 
+ //private functions
+ static void pb_vbl_handler(BOOLEAN allow_dpc_scanout_fallback)
+@@ -2056,6 +2059,7 @@
+ 
+     int         counter;
+ 
++    rg_lifecycle_kill_begin();
+     HalRegisterShutdownNotification(&pb_shutdown_registration, FALSE);
+ 
+ #ifdef DBG
+@@ -2182,6 +2186,7 @@
+     VIDEOREG(PCRTC_START)=pb_OldVideoStart;
+ 
+     NtClose(pb_VBlankEvent);
++    rg_lifecycle_kill_complete();
+ }
+ 
+ 
+@@ -2305,6 +2310,7 @@
+     DWORD           value;
+ 
+     if (pb_running) return -8;
++    if (!rg_lifecycle_init_begin()) return -8;
+ 
+     //reset global vars (except pb_Size)
+ 
+@@ -3295,10 +3301,12 @@
+     pb_shutdown_registration.Priority = 0;
+     HalRegisterShutdownNotification(&pb_shutdown_registration, TRUE);
+ 
++    if (!rg_lifecycle_init_complete()) return -8;
+     return 0;
+ }
+ 
+ static NTAPI VOID pb_shutdown_notification_routine (PHAL_SHUTDOWN_REGISTRATION ShutdownRegistration)
+ {
++    rg_lifecycle_system_shutdown();
+ 	pb_kill();
+ }
+--- /dev/null
++++ b/lib/pbkit/pb_reset_guard.h
+@@ -0,0 +1,128 @@
++/* Private trace-free reset drain. Serialized lifecycle only.
++ * No event tracing, GPU ticket, IRQ synchronization or cleanup recovery. */
++#ifndef PB_RESET_GUARD_H
++#define PB_RESET_GUARD_H
++#include <winapi/fileapi.h>
++#include <winapi/handleapi.h>
++#include <nxdk/mount.h>
++#define RESET_GUARD_POLLS 1048576u
++#define RESET_GUARD_RUN "20261106-tracefree-v1"
++enum { RG_PRE=1,RG_POST=2 };
++enum { RG_CONTEXT=1,RG_OWNER=2,RG_SHUTDOWN=3,RG_POINTER=4,RG_CLOCK=5,RG_DEADLINE=6,RG_POLLS=7,RG_PHASE=8,RG_MOVING_PUT=9,RG_EMPTY_BATCH=10 };
++enum { RL_OFF, RL_INITIALIZING, RL_READY, RL_STOPPING, RL_TERMINAL };
++static volatile uint32_t rg_lifecycle=RL_OFF,rg_system_shutdown;
++static PKTHREAD rg_owner;
++static volatile uint32_t rg_failed;
++/* Persistent on fatal paths: an unexpectedly pending I/O must never retain a
++ * pointer into the render thread's stack or a subsequently closed handle. */
++static char rg_failure_line[768];
++static IO_STATUS_BLOCK rg_write_io,rg_flush_io;
++static HANDLE rg_pending_file=INVALID_HANDLE_VALUE;
++
++/* These are process-owned safety state, not trace state. Never reset fatal
++ * data or a pending request to retry rendering. Native callers serialize
++ * init, render and kill; these stores do not make concurrent teardown safe. */
++static int rg_lifecycle_init_begin(void){
++ if(rg_lifecycle!=RL_OFF||rg_owner||rg_failed||rg_system_shutdown||rg_pending_file!=INVALID_HANDLE_VALUE)return 0;
++ rg_lifecycle=RL_INITIALIZING;
++ return 1;
++}
++static int rg_lifecycle_init_complete(void){
++ if(rg_lifecycle!=RL_INITIALIZING||rg_owner||rg_failed||rg_system_shutdown||rg_pending_file!=INVALID_HANDLE_VALUE||!pb_running||!pb_DmaUserAddr||!pb_Put)return 0;
++ rg_lifecycle=RL_READY;
++ return 1;
++}
++static void rg_lifecycle_kill_begin(void){
++ if(rg_failed||rg_system_shutdown||rg_pending_file!=INVALID_HANDLE_VALUE||rg_lifecycle==RL_TERMINAL)rg_lifecycle=RL_TERMINAL;
++ else rg_lifecycle=RL_STOPPING;
++}
++static void rg_lifecycle_kill_complete(void){
++ if(rg_lifecycle==RL_STOPPING&&!rg_failed&&!rg_system_shutdown&&rg_pending_file==INVALID_HANDLE_VALUE){
++  rg_owner=NULL;
++  rg_lifecycle=RL_OFF;
++ }
++}
++static void rg_lifecycle_system_shutdown(void){
++ rg_system_shutdown=1;
++ rg_lifecycle=RL_TERMINAL;
++}
++
++/* Direct kernel termination intentionally avoids atexit, TLS cleanup,
++ * display-backed debugPrint, pb_kill and firmware reboot. */
++static __attribute__((noreturn)) void rg_abort(unsigned reason,unsigned phase,unsigned polls,uint64_t start,uint64_t now,uint64_t budget,DWORD target_put){
++ /* A second failure must not rewrite storage an earlier pending request
++  * may still reference. Do not even reformat/reset its IOSBs. */
++ if(rg_failed||rg_pending_file!=INVALID_HANDLE_VALUE){
++  rg_lifecycle=RL_TERMINAL;
++  KeBugCheckEx(0x52474452u,rg_failed?rg_failed:reason,phase,1u,polls);
++ }
++ rg_failed=reason;rg_lifecycle=RL_TERMINAL;__asm__ __volatile__("":::"memory");
++ if(KeGetCurrentIrql()!=PASSIVE_LEVEL||!rg_owner||KeGetCurrentThread()!=rg_owner){
++  /* Disk I/O/thread termination are not safe at IRQ or on a foreign renderer.
++   * Hard-fail without yielding; no durable disk result is promised here. */
++  KeBugCheckEx(0x52474452u,reason,phase,1u,polls);
++ }
++ int n=snprintf(rg_failure_line,sizeof rg_failure_line,"XBOX_RESET_DRAIN_FAILURE_V2 build=%s reason=%u phase=%u polls=%u start=%llu now=%llu budget=%llu target_put=%08x lifecycle=%u shutdown=%u\nEND_RESET_DRAIN_FAILURE_V2\n",RESET_GUARD_RUN,reason,phase,polls,(unsigned long long)start,(unsigned long long)now,(unsigned long long)budget,(unsigned)target_put,(unsigned)rg_lifecycle,(unsigned)rg_system_shutdown);
++ rg_failure_line[sizeof rg_failure_line-1]=0;
++ unsigned durable=0,closed=0,pending=0;DWORD written=0;
++ NTSTATUS write_status=STATUS_UNSUCCESSFUL,flush_status=STATUS_UNSUCCESSFUL;
++ rg_write_io.Status=rg_flush_io.Status=STATUS_PENDING;rg_write_io.Information=rg_flush_io.Information=0;
++ if(!nxIsDriveMounted('E'))nxMountDrive('E',"\\Device\\Harddisk0\\Partition1");
++ const char*path="E:\\pb-reset-v1-fail.txt";
++ HANDLE file=CreateFileA(path,GENERIC_WRITE,0,NULL,CREATE_NEW,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_WRITE_THROUGH,NULL);
++ if(file!=INVALID_HANDLE_VALUE){
++  if(n>0&&(unsigned)n<sizeof rg_failure_line){
++   write_status=NtWriteFile(file,NULL,NULL,NULL,&rg_write_io,rg_failure_line,(DWORD)n,NULL);
++   pending=write_status==STATUS_PENDING||rg_write_io.Status==STATUS_PENDING;
++   if(!pending&&NT_SUCCESS(write_status)&&NT_SUCCESS(rg_write_io.Status)){
++    written=(DWORD)rg_write_io.Information;
++    if(written==(DWORD)n){
++     flush_status=NtFlushBuffersFile(file,&rg_flush_io);
++     pending=flush_status==STATUS_PENDING||rg_flush_io.Status==STATUS_PENDING;
++     durable=!pending&&NT_SUCCESS(flush_status)&&NT_SUCCESS(rg_flush_io.Status);
++    }
++   }
++  }
++  if(pending)rg_pending_file=file; /* Keep static data and handle live. No reuse/close. */
++  else{closed=CloseHandle(file);durable=durable&&closed;}
++ }
++ DbgPrint("%s",rg_failure_line);
++ DbgPrint("XBOX_RESET_DRAIN_FAILURE_IO_V2 build=%s durable=%u pending=%u bytes=%u write=%08x flush=%08x io=%08x closed=%u\n",RESET_GUARD_RUN,durable,pending,(unsigned)written,(unsigned)write_status,(unsigned)flush_status,(unsigned)rg_flush_io.Status,closed);
++ PsTerminateSystemThread((NTSTATUS)0xC0520001u);
++}
++static unsigned rg_context(void){
++ if(KeGetCurrentIrql()!=PASSIVE_LEVEL)return RG_CONTEXT;
++ if(rg_lifecycle!=RL_READY||rg_system_shutdown||!pb_running)return RG_SHUTDOWN;
++ if(!pb_DmaUserAddr||!pb_Put)return RG_POINTER;
++ PKTHREAD thread=KeGetCurrentThread();
++ /* New owner binding is allowed only after successful initialization and
++  * normally returned cleanup of any previous instance. */
++ if(!rg_owner)rg_owner=thread;
++ if(thread!=rg_owner)return RG_OWNER;
++ return 0;
++}
++void pb_reset_drain_guard(unsigned phase){
++ unsigned reason=rg_context();
++ if(reason||rg_failed)rg_abort(reason?reason:rg_failed,phase,0,0,0,0,0);
++ if(phase!=RG_PRE&&phase!=RG_POST)rg_abort(RG_PHASE,phase,0,0,0,0,0);
++ DWORD target_put=(DWORD)pb_Put;
++ if(phase==RG_PRE&&pb_Put==pb_Head)rg_abort(RG_EMPTY_BATCH,phase,0,0,0,0,target_put);
++ uint64_t frequency=KeQueryPerformanceFrequency();
++ if(!frequency||frequency>UINT64_MAX/5u)rg_abort(RG_CLOCK,phase,0,0,0,0,target_put);
++ uint64_t budget=frequency*5u; /* Conservative five guest seconds, checked multiplication. */
++ uint64_t start=KeQueryPerformanceCounter(),now=start;
++ unsigned polls=0;
++ for(;;){
++  reason=rg_context();
++  if(reason)rg_abort(reason,phase,polls,start,now,budget,target_put);
++  if((DWORD)pb_Put!=target_put)rg_abort(RG_MOVING_PUT,phase,polls,start,now,budget,target_put);
++  now=KeQueryPerformanceCounter();
++  /* Unsigned elapsed tolerates wrap; a rollback appears huge and fails closed.
++   * Deadline is checked when scheduled, not a hard elapsed-time guarantee. */
++  if(now-start>=budget)rg_abort(RG_DEADLINE,phase,polls,start,now,budget,target_put);
++  if(!pb_busy())return;
++  if(++polls>=RESET_GUARD_POLLS)rg_abort(RG_POLLS,phase,polls,start,now,budget,target_put);
++  NtYieldExecution();
++ }
++}
++#endif

@@ -16,6 +16,9 @@
 #include <string.h>
 #include "plat.h"
 #include "sound.h"
+#ifdef RAMPAGE_XBOX
+#include "xbox_mix_headroom.h"
+#endif
 
 #define PI 3.14159265f
 #define TWO_PI 6.2831853f
@@ -52,7 +55,11 @@ static inline double spu_step(int rate)
  * before decoding a new one. Active voices are always pinned, even if their working
  * set exceeds the target; no sound is silently omitted to satisfy a soft budget. */
 #ifndef RAMPAGE_AUDIO_CACHE_BYTES
-#ifdef RAMPAGE_LOW_MEMORY
+#ifdef RAMPAGE_XBOX
+/* Retail 64 MiB: leave room for four characters and the city's GPU textures.
+ * This changes only idle retention; all active voices remain pinned. */
+#define RAMPAGE_AUDIO_CACHE_BYTES (2u * 1024u * 1024u)
+#elif defined(RAMPAGE_LOW_MEMORY)
 #define RAMPAGE_AUDIO_CACHE_BYTES (4u * 1024u * 1024u)
 #else
 #define RAMPAGE_AUDIO_CACHE_BYTES 0u
@@ -171,6 +178,9 @@ static struct {
     float pending;                       /* seconds of audio to move on by when nothing pulls */
     int (*pull)(void *ctx, int16_t *out, int frames);   /* sound_stream */
     void *pull_ctx;
+#ifdef RAMPAGE_XBOX
+    uint64_t stream_frames, stream_played;
+#endif
     struct {                             /* [R] the scripts' SoundEffects (0x4CFB90: 16 of 0x20 bytes) */
         int h;                           /* +0x00: the 3D object, 0 = a free slot */
         float pos[3];                    /* +0x04: its place (the object follows it), +0x10 the velocity: none set */
@@ -1229,13 +1239,26 @@ static void mix_block(float *out, int frames)
     if (S.pull) {                        /* a movie's sound */
         static int16_t st[2 * 1024];
         S.pull(S.pull_ctx, st, frames);
+#ifdef RAMPAGE_XBOX
+        S.stream_frames += frames;
+#endif
         for (int i = 0; i < 2 * frames; i++)
             out[i] += st[i];                         /* full scale (0x1AF5C0: MVOL 0x3FFF, BVOL 0x7FFF) [R] */
     }
 }
 
+#ifdef RAMPAGE_XBOX
+static void out_stream_reset(void);
+#endif
+
 void sound_stream(int (*pull)(void *ctx, int16_t *out, int frames), void *ctx)
 {
+#ifdef RAMPAGE_XBOX
+    /* Drop queued sound from a skipped/finished film. At most the active hardware
+     * buffer remains, rather than a half-second tail over the next film/menu. */
+    out_stream_reset();
+    S.stream_frames = S.stream_played = 0;
+#endif
     S.pull = pull;
     S.pull_ctx = ctx;
 }
@@ -1247,6 +1270,12 @@ int sound_mix(int16_t *out, int frames)
     while (done < frames) {
         int n = frames - done > 1024 ? 1024 : frames - done;
         mix_block(mixbuf, n);
+#ifdef RAMPAGE_XBOX
+        /* Port output protection, not an emulation of SPU2 DSP. Movie PCM is
+         * authored full scale and must not pass through the gameplay limiter. */
+        if (!S.pull)
+            xbox_mix_headroom(mixbuf, n);
+#endif
         if (out)
             for (int i = 0; i < 2 * n; i++) {
                 float v = mixbuf[i];
@@ -1354,16 +1383,56 @@ static int out_open(void) { return W.wo != NULL; }
 /* SDL2's audio queue, pushed from the main thread as waveOut is (no callback, no thread): the same 5 x 1024 frames
  * ahead */
 #include <SDL.h>
+#ifdef RAMPAGE_XBOX
+#include "xbox_audio_codec.h"
+#endif
 #define BUF_FRAMES 1024
 #define AHEAD 5
 static SDL_AudioDeviceID g_dev;
 static int16_t g_pcm[BUF_FRAMES * 2];
+#ifdef RAMPAGE_XBOX
+static int g_emulated_audio, g_stream_priming;
+extern unsigned rampage_audio_pending_frames(void);
+
+static void out_stream_reset(void)
+{
+    if (g_dev) {
+        /* SDL keeps the DMA thread alive with silence while paused. Prime the
+         * complete software queue before it can consume the new film's first
+         * block; initial demux can take longer than a 21 ms audio block. */
+        SDL_PauseAudioDevice(g_dev, 1);
+        SDL_ClearQueuedAudio(g_dev);
+        g_stream_priming = 1;
+    }
+}
+
+double sound_stream_clock(void)
+{
+    if (!g_dev || !S.pull) return -1;
+    /* The SDL queue excludes the hardware DMA buffers. Include those so the
+     * video follows heard samples, not samples merely decoded ahead. Queue/DMA
+     * snapshots can straddle one 1024-frame transfer, so enforce monotonicity.
+     * Clock granularity is bounded by the 21.33 ms hardware buffer duration. */
+    uint64_t pending = SDL_GetQueuedAudioSize(g_dev) / 4;
+    pending += rampage_audio_pending_frames();
+    uint64_t played = S.stream_frames > pending ? S.stream_frames - pending : 0;
+    if (played > S.stream_played) S.stream_played = played;
+    return (double)S.stream_played / SOUND_RATE;
+}
+#endif
 
 static void out_feed(void)
 {
     if (!g_dev)
         return;
-    while (SDL_GetQueuedAudioSize(g_dev) < AHEAD * sizeof g_pcm) {
+    /* Slow software-emulated frames need a longer queue. Keep the real Xbox's
+     * 107 ms default. Films use 512 ms on the identified emulated codec, games
+     * 171 ms; this is bounded (96/32 KiB), not an unbounded catch-up queue. */
+    unsigned ahead = AHEAD;
+#ifdef RAMPAGE_XBOX
+    if (g_emulated_audio) ahead = S.pull ? 24 : 8;
+#endif
+    while (SDL_GetQueuedAudioSize(g_dev) < ahead * sizeof g_pcm) {
         int manual = S.manual_mix;
         sound_mix(g_pcm, BUF_FRAMES);
         S.manual_mix = manual;
@@ -1374,6 +1443,12 @@ static void out_feed(void)
             break;
         }
     }
+#ifdef RAMPAGE_XBOX
+    if (g_stream_priming) {
+        g_stream_priming = 0;
+        SDL_PauseAudioDevice(g_dev, 0);
+    }
+#endif
 }
 
 int sound_start(void)
@@ -1400,6 +1475,16 @@ int sound_start(void)
         SDL_QuitSubSystem(SDL_INIT_AUDIO);
         return -1;
     }
+#ifdef RAMPAGE_XBOX
+    volatile uint16_t *codec = (volatile uint16_t *)0xfec00000;
+    unsigned master_before = codec[0x02 / 2], pcm_before = codec[0x18 / 2];
+    int codec_fixed = xbox_audio_unmute_emulated_codec(codec);
+    g_emulated_audio = codec[0x7c / 2] == 0x8384 && codec[0x7e / 2] == 0x7600;
+    printf("Xbox audio codec: id=%04x:%04x compatible=%d master=%04x->%04x pcm=%04x->%04x\n",
+           (unsigned)codec[0x7c / 2], (unsigned)codec[0x7e / 2], codec_fixed,
+           master_before, (unsigned)codec[0x02 / 2], pcm_before, (unsigned)codec[0x18 / 2]);
+    fflush(stdout);
+#endif
     out_feed();
     SDL_PauseAudioDevice(g_dev, 0);
 #ifdef RAMPAGE_XBOX
@@ -1422,6 +1507,13 @@ void sound_end(void)
 
 static int out_open(void) { return g_dev != 0; }
 #endif
+
+/* Service only the output queue while a long decoder batch runs. Event scripts,
+ * listener state and game time are still advanced once by sound_update. */
+void sound_pump(void)
+{
+    if (S.ready && out_open()) out_feed();
+}
 
 /* ---- the frame */
 void sound_update(float dt)
@@ -1453,6 +1545,13 @@ void sound_update(float dt)
             done += n;
         }
     }
+#if RAMPAGE_AUDIO_CACHE_BYTES > 0
+    /* A pinned burst may exceed the soft budget. Reclaim newly idle samples
+     * after voices advance, even when no later sound causes another decode. */
+    if (S.sample_bytes > (size_t)RAMPAGE_AUDIO_CACHE_BYTES)
+        sample_make_room(0);
+#endif
+
 }
 
 /* ---- the interface */

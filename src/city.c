@@ -9,6 +9,7 @@
  * What moves: models whose own RawAnim moves (rotors, the fountain), the people's state clips, traffic and a monster
  * (its skeleton's clips; its skinned mesh and cloth posed on the CPU every frame). */
 #include <math.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -311,11 +312,33 @@ static uint32_t scene_mesh_of(Scene *s, uint32_t entry)
     return (uint32_t)s->mesh_of_entry[entry];
 }
 
+/* The constructors below require every requested entry. Preserve the old vector and its
+ * capacity until growth succeeds; failing fast is safer than returning a partial model. */
+static void *scene_vector_grow(void *old, uint32_t *capacity, uint32_t step, size_t size, const char *name)
+{
+    if (!step || step > INT_MAX || *capacity > (uint32_t)INT_MAX - step ||
+        (size_t)(*capacity + step) > SIZE_MAX / size) {
+        fprintf(stderr, "scene: %s capacity overflow\n", name);
+        abort();
+    }
+    uint32_t next = *capacity + step;
+    void *grown = realloc(old, (size_t)next * size);
+    if (!grown) {
+        fprintf(stderr, "scene: cannot grow %s to %u entries\n", name, (unsigned)next);
+        abort();
+    }
+    *capacity = next;
+    return grown;
+}
+
 static int new_instance(Scene *s, Mat4 base, int vehicle)
 {
     if (s->ninstances == s->instances_cap) {
-        s->instances_cap = s->instances_cap ? 2 * s->instances_cap : 256;
-        s->instances = realloc(s->instances, s->instances_cap * sizeof *s->instances);
+        uint32_t step = 128;
+#ifndef RAMPAGE_LOW_MEMORY
+        step = s->instances_cap ? s->instances_cap : 256;
+#endif
+        s->instances = scene_vector_grow(s->instances, &s->instances_cap, step, sizeof *s->instances, "instances");
     }
     Instance *in = &s->instances[s->ninstances];
     memset(in, 0, sizeof *in);
@@ -327,8 +350,11 @@ static int new_instance(Scene *s, Mat4 base, int vehicle)
 static void push_item(Scene *s, uint32_t mesh, int instance, int node, Skin *skin)
 {
     if (s->nitems == s->items_cap) {
-        s->items_cap = s->items_cap ? 2 * s->items_cap : 1024;
-        s->items = realloc(s->items, s->items_cap * sizeof *s->items);
+        uint32_t step = 256;
+#ifndef RAMPAGE_LOW_MEMORY
+        step = s->items_cap ? s->items_cap : 1024;
+#endif
+        s->items = scene_vector_grow(s->items, &s->items_cap, step, sizeof *s->items, "draw items");
     }
     DrawItem *it = &s->items[s->nitems++];
     it->mesh = mesh;
@@ -2354,7 +2380,8 @@ static void adornments_place(Scene *s, SceneBuilding *sb, Mat4 sway)
              * (faces 4 and up: by the face alone, 0x2CFC38 ..) by the roof's state: the AC units (CellDetachDamage
              * 2) go at the second stomp's TopDmg, or the sink's [R] */
             int ci = a->side == 5 ? -1 : building_cell_index(b, a->side, a->cell);
-            int st = a->side == 5 ? b->roof : ci >= 0 && a->record < b->storeys ? b->cell[a->record][ci].state : 0;
+            int st = a->side == 5 ? b->roof :
+                     ci >= 0 && a->record >= 0 && a->record < b->storeys ? b->cell[a->record][ci].state : 0;
             if (st > 0 && st >= a->detach && (!(a->flags & 4) || b->hp <= 0))
                 a->gone = 1;
         }
@@ -2674,7 +2701,7 @@ static int building(City *c, Scene *s, Group inst, float row_offset, float y0, i
         push_item(s, (uint32_t)mesh, facade_inst, -1, NULL);
     }
     /* its cells (the game's grid, 0x2D1A30): the box is 6 + 3 x storeys + 1.5 (the roof's band) high */
-    if (nst && width > 0 && depth > 0 && 2 * depth + width <= BUILDING_CELLS) {
+    if (nst && width > 0 && width <= BUILDING_CELLS && depth > 0 && depth <= (BUILDING_CELLS - width) / 2) {
         SceneBuilding *grown = realloc(*list, sizeof **list * (*count + 1));
         if (!grown)
             return -1;
@@ -2687,6 +2714,15 @@ static int building(City *c, Scene *s, Group inst, float row_offset, float y0, i
         float hi[3] = { cx + width * CELL / 2, cy + depth * CELL / 2, GROUND_FLOOR + STOREY * (float)nst + 1.5f };
         if (building_init(&sb->b, lo, hi, width, depth, nst) != 0)
             return -1;
+#if defined(RAMPAGE_LOW_MEMORY) && !defined(RAMPAGE_FIXED_BUILDING_ROWS)
+        /* Template rows survive floor removal: b.n shrinks, b.storeys never does. */
+        if (sb->b.storeys) {
+            sb->quad = calloc((size_t)sb->b.storeys, sizeof *sb->quad);
+            sb->broke = calloc((size_t)sb->b.storeys, sizeof *sb->broke);
+            if (!sb->quad || !sb->broke)
+                return -1;                          /* the partial Scene owns every successful allocation */
+        }
+#endif
         sb->hitter = -1;                             /* +0x190: no attacker yet */
         sb->b.row = (int)group_num(inst, "Row", 0);
         sb->b.hp = sb->b.hp_max = (int)group_num(t, "BuildingHP", (float)sb->b.hp_max);
@@ -2735,7 +2771,12 @@ static int building(City *c, Scene *s, Group inst, float row_offset, float y0, i
         sb->fx_wall_small = group_str(t, "Wall_Small");
         sb->fx_wall_large = group_str(t, "Wall_Large");
         sb->fx_floor = group_str(t, "Floor_Large");
+#if defined(RAMPAGE_LOW_MEMORY) && !defined(RAMPAGE_FIXED_BUILDING_ROWS)
+        if (sb->b.storeys)
+            memset(sb->broke, 0, (size_t)sb->b.storeys * sizeof *sb->broke);
+#else
         memset(sb->broke, 0, sizeof sb->broke);
+#endif
         sb->fronts_told = 0;
         sb->nspawn = 0;
         sb->b.collapse_time = group_num(t, "CollapseTime", sb->b.collapse_time);
@@ -2748,7 +2789,12 @@ static int building(City *c, Scene *s, Group inst, float row_offset, float y0, i
             if (sb->outline[k][0] >= 0)
                 sb->b.outlined |= (uint8_t)(1u << k);
         sb->open_part = mesh >= 0 && s->meshes[mesh].mesh.nparts >= 5 ? 4 : 0;
+#if defined(RAMPAGE_LOW_MEMORY) && !defined(RAMPAGE_FIXED_BUILDING_ROWS)
+        if (sb->b.storeys)
+            memset(sb->quad, 0xFF, (size_t)sb->b.storeys * sizeof *sb->quad);
+#else
         memset(sb->quad, 0xFF, sizeof sb->quad);
+#endif
         memset(sb->skeleton, 0xFF, sizeof sb->skeleton);
         memset(sb->damaged_skeleton, 0xFF, sizeof sb->damaged_skeleton);
         sb->light = calloc((size_t)sb->b.storeys + 1, sizeof *sb->light);   /* lit at the block's end (light_buildings) */
@@ -2763,7 +2809,7 @@ static int building(City *c, Scene *s, Group inst, float row_offset, float y0, i
         sb->gf_ntris = sb->gf_queued = 0;
         sb->gf_vert = NULL;
         int32_t v = 0;
-        for (int st = 0; st < nst && st < BUILDING_STOREYS; st++) {
+        for (int st = 0; st < sb->b.storeys; st++) {
             sb->floor_tint[st][0] = group_num(floors[st], "FloorTintR", 1);   /* the cells' tint (0x2CBC78) */
             sb->floor_tint[st][1] = group_num(floors[st], "FloorTintG", 1);
             sb->floor_tint[st][2] = group_num(floors[st], "FloorTintB", 1);
@@ -2867,9 +2913,16 @@ static void read_lights(Scene *s, const char *text, uint32_t len)
             *comment = 0;
         float val = 0;
 #ifdef RAMPAGE_XBOX
-        int consumed = 0;
-        if (sscanf(line, "%63s%n", key, &consumed) < 1) continue;
-        val = strtof(line + consumed, NULL); /* nxdk scanf has no floating conversions */
+        /* nxdk's scanf %s does not skip leading whitespace, and it has no
+         * floating conversions. Light-file values are tab-indented. */
+        const char *value = line;
+        while (isspace((unsigned char)*value)) ++value;
+        size_t k = 0;
+        while (*value && !isspace((unsigned char)*value) && k < sizeof key - 1)
+            key[k++] = *value++;
+        key[k] = 0;
+        if (!k) continue;
+        val = strtof(value, NULL);
 #else
         if (sscanf(line, "%63s %f", key, &val) < 1)
             continue;
@@ -4576,7 +4629,9 @@ void scene_buildings_update(Scene *s, float dt)
         for (int ls = 0; (s->folk || s->edibles) && ls < sb->b.n; ls++)   /* 0x317DC0: a front cell set to 2 or more */
             for (int col = 0; col < sb->b.width; col++) {
                 int ci = building_cell_index(&sb->b, FACE_FRONT, col), o = sb->b.live[ls];
-                int st = ci < 0 ? 0 : sb->b.cell[o][ci].state, first = !sb->broke[o][ci];
+                if (ci < 0)
+                    continue;
+                int st = sb->b.cell[o][ci].state, first = !sb->broke[o][ci];
                 if (st < 2 || st <= sb->broke[o][ci])
                     continue;
                 sb->broke[o][ci] = (uint8_t)st;
@@ -4880,6 +4935,10 @@ void scene_free(Scene *s)
     free(s->order);
     for (uint32_t i = 0; i < s->nbuildings; i++) {
         building_free(&s->buildings[i].b);
+#if defined(RAMPAGE_LOW_MEMORY) && !defined(RAMPAGE_FIXED_BUILDING_ROWS)
+        free(s->buildings[i].quad);
+        free(s->buildings[i].broke);
+#endif
         free(s->buildings[i].rest);
         free(s->buildings[i].adorn);
         free(s->buildings[i].flag);
@@ -4889,6 +4948,10 @@ void scene_free(Scene *s)
     free(s->buildings);
     for (uint32_t i = 0; i < s->nscenery; i++) {
         building_free(&s->scenery[i].b);
+#if defined(RAMPAGE_LOW_MEMORY) && !defined(RAMPAGE_FIXED_BUILDING_ROWS)
+        free(s->scenery[i].quad);
+        free(s->scenery[i].broke);
+#endif
         free(s->scenery[i].rest);
         free(s->scenery[i].adorn);
         free(s->scenery[i].flag);

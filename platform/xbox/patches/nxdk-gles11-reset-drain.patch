@@ -1,0 +1,29 @@
+--- a/nv2a_helper.c
++++ b/nv2a_helper.c
+@@ -1,5 +1,7 @@
+ #include "gles_private.h"
+ #include <stb_sprintf.h>
++/* Private pbkit helper; no presentation tracing. */
++extern void pb_reset_drain_guard(unsigned phase);
+ 
+ static int gl_swap_interval = 1;
+ static GLboolean gl_show_fps = GL_FALSE;
+@@ -82,14 +84,12 @@
+     pb = pb_push1(pb, NV097_SET_STENCIL_TEST_ENABLE, context->pixel_ops_state.stencil_test_enabled);
+     pb_end(pb);
+ 
++    pb_reset_drain_guard(1);
+     pb_reset();
+ 
+-    /* Ensure the GPU has finished rendering and executed PB_FINISHED (marking
+-     * the completed backbuffer ready in pb_BackBufferbReady) before waiting
+-     * for VBlank to flip it to PCRTC_START. */
+-    while (pb_busy()) {
+-        NtYieldExecution();
+-    }
++    /* Preserve the post-reset GET/PUT and PGRAPH busy check. This is not
++     * an immutable completion ticket for CPU-dispatched GPU callbacks. */
++    pb_reset_drain_guard(2);
+ 
+     if (gl_swap_interval > 0) {
+         for (int i = 0; i < gl_swap_interval; i++) {

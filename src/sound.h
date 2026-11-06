@@ -32,6 +32,7 @@ void sound_free(void);
 int  sound_start(void);                  /* open the audio output (waveOut from winmm.dll loaded at run
                                           * time; SDL2 outside Windows); 0 = ok */
 void sound_end(void);                    /* close it */
+void sound_pump(void);                 /* same-thread queue refill; does not tick game sound events */
 void sound_update(float dt);             /* a game frame: the 3D list, the event programs, fades, the output */
 int  sound_mix(int16_t *out, int frames);/* render frames (stereo) by hand instead of the output (tests, capture);
                                           * once called, sound_update stops moving the voices on by itself */
@@ -80,6 +81,10 @@ void sound_volume(float sfx, float music);   /* the viewer's own gains on top (n
 /* a stream the mixer pulls (a movie's sound, movie.c): pull(ctx, out, frames) fills stereo 48 kHz frames, mixed at
  * full scale (MOVIE_NOTES.md). NULL stops it. */
 void sound_stream(int (*pull)(void *ctx, int16_t *out, int frames), void *ctx);
+#ifdef RAMPAGE_XBOX
+/* Consumed stream time, excluding queued software/DMA frames; -1 without output. */
+double sound_stream_clock(void);
+#endif
 /* [R] op 0D multiplies the instance's volume byte (group 0's 0x6A to start) by op[1] / 128 and keeps the low 8 bits;
  * a byte of 128 or more is an SPU volume of 0x4000 or more, which the SPU2 plays phase-inverted and quieter. On (the
  * default) does as the game; off (the viewer's option) keeps such volumes at 127, to compare by ear. */

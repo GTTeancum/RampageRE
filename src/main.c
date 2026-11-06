@@ -304,6 +304,10 @@ typedef struct Viewer {
     float gui_side;                                  /* the window past each side of the 640 x 480 screen, its pixels */
     char data_path[512];                             /* RAMPAGE.VOL or the disc image (fx_open: the ELF beside / in it) */
     Movie *movie;                                    /* the movie the shell plays (movie.c), NULL none */
+#ifdef RAMPAGE_XBOX
+    double movie_sample_at, movie_present_at, movie_to_present, movie_interval;
+    unsigned movie_present_count;
+#endif
     int shell_mode, shell_go;                        /* --shell: a game's Quit goes back to it; a game to start */
     int lang;                                        /* --lang: the .loc column (hud.h: 0 English .. 8 Portuguese) */
     int region;                                      /* the disc's (iso.c data_region): 0 USA, 1 Europe, 2 another */
@@ -723,6 +727,10 @@ static int monster_female(Mon *mo)
 
 /* gWorld.isSphereVisible (0x16C0A0, the camera's six planes) for people.c, army.c and boss.c: the sphere inside the
  * game camera's view (its fov across the 640 x 480 GUI screen's height, 4:3 across) */
+#ifdef RAMPAGE_LOW_MEMORY
+static int people_window_reuse_ready(void *ctx, int who);
+#endif
+
 static int people_visible(void *ctx, const float p[3], float radius)
 {
     const Viewer *v = ctx;
@@ -1535,6 +1543,9 @@ static void build(Viewer *v)
     }
     if (v->have_scene && v->scene.folk) {
         people_set_visible(v->scene.folk, people_visible, v);
+#ifdef RAMPAGE_LOW_MEMORY
+        people_set_window_reuse(v->scene.folk, people_window_reuse_ready, v);
+#endif
         people_set_band_sound(v->scene.folk, &v->band_sound);
     }
     if (!v->game_built || !v->hud) {                 /* the game's next block keeps the HUDs (their results going) */
@@ -1887,6 +1898,31 @@ static int set_reaction(Mon *mo, int slot)
  * follows it; remove3DSfx stops them; a deleted object (0x290480 -> 0x288050 -> 0x274710) kills those without keep
  * and leaves the others where they are */
 enum { OS_ARMY, OS_PEOPLE, OS_VEHICLE, OS_STREET, OS_PARADE, OS_EDIBLE, OS_MONSTER, OS_PEOPLE_OBJECT };
+
+#ifdef RAMPAGE_LOW_MEMORY
+/* The people module checks its queued events/timers before asking. Keep an old index until every host-owned
+ * handle has observed the disappearance too. world_build runs before scene_people_spawn, so a PP_GONE candidate
+ * has no collision object in the current frame. Reuse is limited to the same naturally re-entered window. */
+static int people_window_reuse_ready(void *ctx, int who)
+{
+    const Viewer *v = ctx;
+    for (int k = 0; k < v->nmon; k++)
+        if (v->mon[k].held == who || v->mon[k].streaker == who)
+            return 0;
+    for (int k = 0; k < v->narmed_people; k++)
+        if (v->armed_people[k] == who)
+            return 0;
+    for (int k = 0; k < v->nppfx; k++)
+        if (v->ppfx[k].who == who)
+            return 0;
+    for (int k = 0; k < v->nosnd; k++)
+        if (v->osnd[k].src == OS_PEOPLE && v->osnd[k].obj == who)
+            return 0;
+    return 1;
+}
+
+
+#endif
 
 /* where the object is now; 0 once it is gone (deleted, or its slot made over to another: serial) */
 static int obj_where(const Viewer *v, int src, int obj, int serial, float pos[3])
@@ -7694,6 +7730,12 @@ static void movie_start(Viewer *v, const char *name)
         return;
     }
     shell_movie_hold(v->shell);
+#ifdef RAMPAGE_XBOX
+    v->movie_sample_at = v->movie_present_at = 0;
+    v->movie_to_present = v->movie_interval = 0;
+    v->movie_present_count = 0;
+    movie_set_output_pump(v->movie, sound_pump);
+#endif
     sound_stream(movie_pull, v->movie);
     if (getenv("RAMPAGE_TRACE"))
         printf("  movie %s (%s)\n", name, picked);
@@ -7710,7 +7752,24 @@ static void movie_step(Viewer *v)
         return;
     }
     int w, h, changed;
+#ifdef RAMPAGE_XBOX
+    v->movie_sample_at = win_time();
+    double heard = sound_stream_clock();
+    if (heard >= 0) {
+        t = (float)heard;
+        shell_movie_sync(v->shell, t);
+    }
+    /* Decode for the middle of the expected presentation interval, not for the
+     * instant before expensive decoding/rendering begins. The estimate comes
+     * from completed swaps and naturally shrinks on faster hardware. Limit it
+     * to half a second; a long loading stall is not a useful prediction. */
+    double lead = v->movie_to_present + 0.5 * v->movie_interval;
+    if (lead > 0.5) lead = 0.5;
+    if (heard < 0) lead = 0;
+    const uint8_t *pic = movie_video_realtime(v->movie, t + lead, &changed);
+#else
     const uint8_t *pic = movie_video(v->movie, t, &changed);
+#endif
     movie_size(v->movie, &w, &h);
     if (pic) {
         if (changed)
@@ -7723,6 +7782,27 @@ static void movie_step(Viewer *v)
         shell_movie_end(v->shell);
     }
 }
+
+#ifdef RAMPAGE_XBOX
+static void movie_presented(Viewer *v)
+{
+    if (!v->movie || v->movie_sample_at <= 0) return;
+    double now = win_time(), latency = now - v->movie_sample_at;
+    double interval = v->movie_present_at > 0 ? now - v->movie_present_at : latency;
+    if (latency >= 0 && latency < 1 && interval > 0 && interval < 1) {
+        if (!v->movie_present_count) {
+            v->movie_to_present = latency;
+            v->movie_interval = interval;
+        } else {
+            v->movie_to_present = 0.75 * v->movie_to_present + 0.25 * latency;
+            v->movie_interval = 0.75 * v->movie_interval + 0.25 * interval;
+        }
+        v->movie_present_count++;
+    }
+    v->movie_present_at = now;
+    v->movie_sample_at = 0;
+}
+#endif
 
 /* the SaveGame popup's card jobs on the profile's file (shell.h SHELL_CARD_*): the read of the list's profile (a
  * missing file NOT_FOUND, a bad one CORRUPT; the profile is kept unless it was read), the write of a new one (the
@@ -8836,6 +8916,9 @@ static int viewer_main(int argc, char **argv)
     }
     v.fog = v.fog < 0 ? 0 : 1;                       /* the game's fog (LightingData FogStart / FogEnd), F toggles it */
     v.rnd = rnd_create();
+#ifdef RAMPAGE_XBOX
+    rnd_set_output_pump(v.rnd, sound_pump);
+#endif
     /* the game's sound (sound.c: Rampage.uber / .samp, the .mic music); the output only for a window of one's own,
      * never for a --shot run, nor with --mute */
     if (sound_init(&v.vol) > 0 && !shot && !mute && sound_start() != 0)
@@ -9165,6 +9248,9 @@ static int viewer_main(int argc, char **argv)
                 break;
             }
             win_swap(&w);
+#ifdef RAMPAGE_XBOX
+            movie_presented(&v);
+#endif
             continue;
         }
         sound_follow_pause(&v);
@@ -9398,11 +9484,19 @@ static int viewer_main(int argc, char **argv)
             v.scene.nhud = nq;
             gui3d_layers(&v, shell_popup_shown(v.popup) ? v.popup : NULL, &v.scene);
         }
+#ifdef RAMPAGE_XBOX
+        /* Scene preparation and the GPU wait can each be expensive under
+         * emulation. Refill between them without ticking events/game time. */
+        sound_pump();
+#endif
         if (have_view) {
             Camera fixed = { { view[0], view[1], view[2] }, view[3] / 57.2957795f, view[4] / 57.2957795f, 60 };
             rnd_frame(v.rnd, &w, &fixed, t, v.fog);
         } else
             rnd_frame(v.rnd, &w, &cam, t, v.fog);
+#ifdef RAMPAGE_XBOX
+        sound_pump();
+#endif
         if (cap_draw) {
             shot_raw(cap_v, w.width, w.height);
             if (!(apf & (AP_SHOT | AP_STOP)))
@@ -9430,6 +9524,9 @@ static int viewer_main(int argc, char **argv)
                 printf("wrote %s\n", name);
         }
         win_swap(&w);
+#ifdef RAMPAGE_XBOX
+        sound_pump();
+#endif
         frames++;
 #if defined RAMPAGE_GUI && defined _WIN32 && !defined RAMPAGE_XBOX
         if (now - title_at > 0.5)

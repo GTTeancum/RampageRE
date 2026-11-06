@@ -99,10 +99,15 @@ typedef struct {
     int gone;                                         /* deleted, sunk below the ground (0x3473B0) */
 } BuildingFlag;
 
+/* Owns b's grids and the low-memory quad/broke rows: move by list realloc only, never shallow-copy. */
 typedef struct {                                      /* a building's cells and its facade quads */
     Building b;
     int mesh;                                         /* the facade's scene mesh, -1 none */
+#if defined(RAMPAGE_LOW_MEMORY) && !defined(RAMPAGE_FIXED_BUILDING_ROWS)
+    int32_t (*quad)[BUILDING_CELLS];                  /* owned b.storeys template rows; scene_free releases */
+#else
     int32_t quad[BUILDING_STOREYS][BUILDING_CELLS];   /* per cell (building.h order) its quad's first vertex, -1 */
+#endif
     /* per storey its interior models (instances, -1 none): Skeleton once a cell is damaged, DamagedSkeleton once
      * FloorHP is down to DamagedSkeletonHP (half of FloorHP unless set; drawn around 0x2CD898) */
     int skeleton[BUILDING_STOREYS], damaged_skeleton[BUILDING_STOREYS], skeleton_hp[BUILDING_STOREYS];
@@ -123,7 +128,11 @@ typedef struct {                                      /* a building's cells and 
     int open_part;                                    /* its facade mesh's part of open windows (part 4), 0 none */
     Adornment *adorn; int nadorn;
     BuildingFlag *flag; int nflag;
+#if defined(RAMPAGE_LOW_MEMORY) && !defined(RAMPAGE_FIXED_BUILDING_ROWS)
+    uint8_t (*broke)[BUILDING_CELLS];                 /* owned b.storeys template rows; scene_free releases */
+#else
     uint8_t broke[BUILDING_STOREYS][BUILDING_CELLS];  /* a front cell's state (2 or more) its slots were told of */
+#endif
     int fronts_told;                                 /* its first update's 0x2BE300 made (a back-row building's) */
     int seen_falls, seen_state;
     Group props;                                      /* its template (DefBuildingProps' Scoring, ...) */

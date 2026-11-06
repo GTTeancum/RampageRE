@@ -1,0 +1,123 @@
+{
+  "schema": 1,
+  "nxdk_commit": "004fefbfe8fd93a5ea8ee9a95ff187b0f58ec8ed",
+  "gles_commit": "5a726e61f1af5c3e9682af2c833c9703cab5022e",
+  "gl4es_commit": "81547d986798e876de8b434193920b606a72363f",
+  "compiler": "LLVM 18.1.8; original virtual source identities, -pipe and pinned headers/flags retained",
+  "baseline_sources": {
+    "lib/pbkit/pbkit.c": "da9835f0d9e9da4a7e5c185b7913752aab5614bfc170ebc572cc12cc3af0da92",
+    "nv2a_helper.c": "8fc22e2024761454e0777fd783932b8e0d654195bf834501751472e10d1fc626"
+  },
+  "patches": {
+    "platform/xbox/patches/nxdk-pbkit-startup-ready-bounds.patch": "54e145fca1ad8962fb56a09711d86e2147b0b2a92ace8e46bc5059bd8816cc26",
+    "platform/xbox/patches/nxdk-pbkit-dpc-scanout-fallback.patch": "dbe55789b34a0b8d300619a6efa500dab2b4565fe9c9693eac3b6bed9d99890d",
+    "platform/xbox/patches/nxdk-pbkit-reset-drain-lifecycle.patch": "f5e7574c0e55bc45a6ba921ad1cc7128e44befee4a33859339f55e392151a8c4",
+    "platform/xbox/patches/nxdk-gles11-reset-drain.patch": "841f887a6ea50b3aad44a84538dfa55c08805671e8f6b930baab20432294abc5"
+  },
+  "final_sources": {
+    "lib/pbkit/pbkit.c": "bb9d343f183930a77ed8b14aab5b5203e652fcfca5f3c9cb134cb4a39c2b521a",
+    "lib/pbkit/pb_reset_guard.h": "a3b742621099813ca3c380c5550ed7da812482cc52da788f1fd8e0236375ca32",
+    "nv2a_helper.c": "4162970f9c560e889b2098f34025b448470d4123437eb7030af50493d84fdce1"
+  },
+  "audio_hal_sha256": "ed25a4cb604b1b85a9457b5101144bdde3a9a30f8665a7825f038da25e0b6867",
+  "archives": {
+    "pbkit": {
+      "sha256": "40ee911f38721745cd5ed79b2e20389e6b9f09d0f590d094cd95a23415e0c46b",
+      "members": [
+        {
+          "name": "/workspace/scratch/780c66634d06/rampage-xbox-toolchain/nxdk/lib/pbkit/pbkit_pushbuffer.obj",
+          "sha256": "1e2091451dfc0371c9ae9eb77c71617640a659779df6a66d2748a08f4ac1655d"
+        },
+        {
+          "name": "/workspace/scratch/780c66634d06/rampage-xbox-toolchain/nxdk/lib/pbkit/pbkit_print.obj",
+          "sha256": "b2c24c76fae08c435b27e8206a5cc47706e099c0ee6cf5791a3565dbcfc01b4c"
+        },
+        {
+          "name": "/workspace/scratch/780c66634d06/rampage-xbox-toolchain/nxdk/lib/pbkit/pbkit_draw.obj",
+          "sha256": "ef96cb5563dc79dce19c8d71315fbc1c315bbd1ed7c130e76aea4b0ace7d4621"
+        },
+        {
+          "name": "/workspace/scratch/780c66634d06/rampage-xbox-toolchain/nxdk/lib/pbkit/pbkit_dma.obj",
+          "sha256": "b768f381827186b155be0a559b11d68ac79d8440c58fe0cd4da59eb37603f517"
+        },
+        {
+          "name": "/workspace/scratch/780c66634d06/rampage-xbox-toolchain/nxdk/lib/pbkit/pbkit_gamma.obj",
+          "sha256": "d106a710e6469eb47efaea420c77d50986679ad964bbae158cd5985306dbc93d"
+        },
+        {
+          "name": "/workspace/scratch/780c66634d06/rampage-validated-build/pbkit-trace-free-target-20261106/build-v1/archives/pbkit.obj",
+          "sha256": "5b42ce9f8e1c61eeff2d4085a912455dbf9cad0e354e9ffabe257583bff0e55e"
+        }
+      ]
+    },
+    "gles": {
+      "sha256": "a176431d9698db88efea4acf59ca2ff5ab8b697aaf0af2cdd26bab1fb6e26be2",
+      "members": [
+        {
+          "name": "gles_arrays_draw.c.obj",
+          "sha256": "1d4d6d404ab17ee49bf72500df59e610adc0af1b9d5a74b5913731a461554990"
+        },
+        {
+          "name": "gles_buffers.c.obj",
+          "sha256": "8e79c1e3e71a9a0391e3516ea4c02a977b823b79efe4a2c748c63c4c0f9c15c2"
+        },
+        {
+          "name": "gles_core.c.obj",
+          "sha256": "cf138fab4af9993c1cc33d1af3f3f4940a081c846d0cdda2b37a1b82be988a36"
+        },
+        {
+          "name": "gles_fbo.c.obj",
+          "sha256": "40202ef247aa7788acd6537bcfc93cedf1662981d5e94830b261244bfe67b093"
+        },
+        {
+          "name": "gles_fog.c.obj",
+          "sha256": "866e543f94c13a34c36735604ff1042dfe8bb8d9a4a455b30a488d8ebff40d3c"
+        },
+        {
+          "name": "gles_get.c.obj",
+          "sha256": "1f5505bb1221a202a9408cb80de804fdaa32f5f41ba4b10e8efd862d8a93ff39"
+        },
+        {
+          "name": "gles_lighting.c.obj",
+          "sha256": "999369828cd6ef794bed03fa045e23706222d28e70b365d99aff5aef11336055"
+        },
+        {
+          "name": "gles_math.c.obj",
+          "sha256": "2ff9ee8106d5f536592b804529f7f52f513015f08224385a2bfdc349af970f35"
+        },
+        {
+          "name": "gles_mipmap.c.obj",
+          "sha256": "16e8540a77468cc72d937a1e971619f99a5e2ce29fafc3c6373c042a4c452858"
+        },
+        {
+          "name": "gles_pixelops.c.obj",
+          "sha256": "70fad54aabb6a1eaf18417f26d8f475906a5f4381cca3a3d3865c64d471d84e7"
+        },
+        {
+          "name": "gles_rasterisation.c.obj",
+          "sha256": "7a1a8e986e5dcf2318ea0810dd5e9be146ce777b0e47d427f6e9d0f787653f30"
+        },
+        {
+          "name": "gles_staging.c.obj",
+          "sha256": "b49cd365a5f467ae2694dc65bf3a01a6dccf53142b334d108d9254536a73b483"
+        },
+        {
+          "name": "gles_texture.c.obj",
+          "sha256": "f799c92696f0b75cb3f51078cb7953d095c9887508ce38e96710409d9f5f78f7"
+        },
+        {
+          "name": "gles_transform.c.obj",
+          "sha256": "00c44625fb87db86ae5ee56a2ef74ef8f79cbf1f6fdf96820730a173ff82f3ce"
+        },
+        {
+          "name": "nv2a_helper.c.obj",
+          "sha256": "651655d277a8e29ebbb5b3c69ed2da401ac54d0e55fde7b4f5c36b999d78d423"
+        },
+        {
+          "name": "gl4es_shim.c.obj",
+          "sha256": "443fb4c0120b3c8ee28451027f3a681a5f4e5a3166852840677176dbe4a17f25"
+        }
+      ]
+    }
+  }
+}

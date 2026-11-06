@@ -287,6 +287,7 @@ struct Movie {
     /* the sound: ADPCM, its blocks of ch x inter bytes */
     uint8_t *au; size_t au_n, au_cap, au_pos;
     int au_head, au_ch, au_rate, au_inter;
+    int au_no_loop, au_ended[2];             /* per-movie, zeroed by movie_open */
     int16_t au_pcm[2][28 * 64]; int au_have, au_at, au_hist[2][2];
     double au_phase;
     /* the sequence */
@@ -301,6 +302,8 @@ struct Movie {
     int last_flags, last_mtype, last_mv[2][2][2], last_fsel[2][2];
     /* shown */
     int pictures, shown, disp, flushed, conv;
+    int es_hold, skip_pic, dropped;
+    void (*pump)(void);
     uint8_t *rgba;
 };
 
@@ -365,6 +368,11 @@ static void audio_data(Movie *m, const uint8_t *p, int n)
                 m->au_ch = (int)rd32(p + 16);
                 m->au_inter = (int)rd32(p + 20);
             }
+            /* Only the explicit non-looping SPU movie format is established.
+             * Leave short/unknown headers and looping streams as before. */
+            if (sz >= 24 && rd32(p + 8) == 0x10 &&
+                rd32(p + 24) == 0xFFFFFFFFu && rd32(p + 28) == 0xFFFFFFFFu)
+                m->au_no_loop = 1;
             p += 8 + sz;
             n -= 8 + sz;
         }
@@ -447,7 +455,7 @@ static int demux(Movie *m)
     if (k >= len)
         return 1;
     if (id == 0xE0) {
-        if (m->es_pos > STREAM_COMPACT) {
+        if (!m->es_hold && m->es_pos > STREAM_COMPACT) {
             memmove(m->es, m->es + m->es_pos, m->es_n - m->es_pos);
             m->es_n -= m->es_pos;
             m->es_pos = 0;
@@ -494,6 +502,99 @@ static int next_unit(Movie *m, size_t *at, size_t *s, size_t *e)
     *s = *at + 4;
     *e = k;
     return m->es[*at + 3];
+}
+
+/* Dropping an I picture is safe only if the next two coded pictures are also
+ * I pictures (or the sequence ends). Looking only at the next I is insufficient:
+ * B pictures coded after it could still reference the picture being discarded.
+ * Pin offsets during bounded lookahead; allocation failure remains fatal. */
+static int intra_can_drop(Movie *m)
+{
+    size_t pos = m->es_pos, begin = pos;
+    int following = 0, safe = 0;
+    m->es_hold = 1;
+    for (;;) {
+        size_t at = find_code(m->es, pos, m->es_n);
+        if (at < m->es_n) {
+            if (m->es[at + 3] == 0xB7) { safe = following > 0; break; }
+            if (m->es[at + 3] == 0x00) {
+                if (at + 6 > m->es_n) {
+                    pos = at;
+                } else {
+                    int type = (m->es[at + 5] >> 3) & 7;
+                    if (type != 1) break;
+                    if (++following == 2) { safe = 1; break; }
+                    pos = at + 6;
+                    continue;
+                }
+            } else {
+                pos = at + 4;
+                continue;
+            }
+        } else {
+            pos = m->es_n > 3 ? m->es_n - 3 : 0;
+            if (pos < begin) pos = begin;
+        }
+        /* Two frames normally use far less than this. An unusual or damaged
+         * stream falls back to full decode instead of unbounded lookahead. */
+        if (m->es_n - begin > 512 * 1024) break;
+        if (!demux(m)) { safe = following > 0 && !m->failed; break; }
+    }
+    m->es_hold = 0;
+    return safe;
+}
+
+/* A later I picture replaces all older references once its leading B pictures
+ * (coded after it but presented before it) are also obsolete. Count those B
+ * headers through the following reference before discarding this picture.
+ * This bounds catch-up work in inter-coded logos without assuming closed GOPs.
+ * Only supported frame pictures in the same sequence are eligible. */
+static int obsolete_before_intra(Movie *m, int want)
+{
+    if (want <= m->pictures + 2) return 0;
+    size_t pos = m->es_pos, begin = pos;
+    int count = 0, candidate = -1, leading = 0, safe = 0;
+    m->es_hold = 1;
+    for (;;) {
+        size_t at = find_code(m->es, pos, m->es_n);
+        if (at < m->es_n) {
+            int code = m->es[at + 3];
+            if (code == 0xB7) break;
+            if (code == 0 || code == 0xB5 || code == 0xB3) {
+                if (at + (code == 0xB3 ? 8 : 7) > m->es_n) { pos = at; }
+                else {
+                    if (code == 0xB3) {
+                        const uint8_t *q = m->es + at + 4;
+                        if (((q[0] << 4) | (q[1] >> 4)) != m->w ||
+                            (((q[1] & 15) << 8) | q[2]) != m->h ||
+                            (q[3] & 15) != m->fps_code) break;
+                    }
+                    if (code == 0xB5 && (m->es[at + 4] >> 4) == 8 &&
+                        (m->es[at + 6] & 3) != 3) break;
+                    if (code == 0) {
+                        int type = (m->es[at + 5] >> 3) & 7;
+                        if (type < 1 || type > 3) break;
+                        count++;
+                        if (candidate >= 0) {
+                            if (type == 3) leading++;
+                            else { safe = candidate + leading < want; break; }
+                        } else if (type == 1) {
+                            candidate = m->pictures + count;
+                        }
+                        if (m->pictures + count >= want) break;
+                    }
+                    pos = at + 4;
+                    continue;
+                }
+            } else { pos = at + 4; continue; }
+        } else {
+            pos = m->es_n > 3 ? m->es_n - 3 : 0;
+            if (pos < begin) pos = begin;
+        }
+        if (m->es_n - begin > 512 * 1024 || !demux(m)) break;
+    }
+    m->es_hold = 0;
+    return safe;
 }
 
 /* ---------------------------------------------------------------- the IDCT (separable, float) */
@@ -944,15 +1045,28 @@ static void picture_end(Movie *m)
     if (m->pic_ok != 1)                                  /* not decodable, or no slices */
         return;
     m->pictures++;
+    if (m->skip_pic) {
+        m->dropped++;
+        if (m->ptype == 3) {
+            m->shown++;
+        } else {
+            int before = m->ref_new;
+            m->ref_old = before;
+            m->ref_new = -2; /* known obsolete, deliberately not reconstructed */
+            if (before != -1) m->shown++;
+            if (before >= 0) { m->disp = before; m->conv = 0; }
+        }
+        return;
+    }
     if (m->ptype == 3) {
         m->disp = m->cur;
     } else {
         int before = m->ref_new;
         m->ref_old = m->ref_new;
         m->ref_new = m->cur;
-        if (before < 0)
+        if (before == -1)
             return;
-        m->disp = before;
+        if (before >= 0) m->disp = before;
     }
     m->shown++;
     m->conv = 0;
@@ -971,7 +1085,7 @@ static void picture_start(Movie *m, Bits *b)
 static void picture_begin(Movie *m)
 {
     m->pic_ok = m->have_seq && m->pstruct == 3 && m->ptype >= 1 && m->ptype <= 3 &&
-                (m->ptype < 2 || m->ref_new >= 0) && (m->ptype < 3 || m->ref_old >= 0);
+                (m->skip_pic || ((m->ptype < 2 || m->ref_new >= 0) && (m->ptype < 3 || m->ref_old >= 0)));
     if (!m->pic_ok)
         return;
     for (int i = 0; i < 3; i++)
@@ -982,7 +1096,7 @@ static void picture_begin(Movie *m)
 }
 
 /* the next picture decoded (shown or not); 0 at the end of the stream */
-static int decode_picture(Movie *m)
+static int decode_picture(Movie *m, int want, int realtime)
 {
     for (;;) {
         if (m->failed) return 0;
@@ -1011,12 +1125,17 @@ static int decode_picture(Movie *m)
             sequence_header(m, &b);
         else if (code == 0xB5)
             extension(m, &b);
-        else if (code == 0x00)
+        else if (code == 0x00) {
             picture_start(m, &b);
+            m->skip_pic = realtime &&
+                ((m->ptype == 3 && m->shown + 1 < want) ||
+                 (m->ptype == 1 && m->pictures + 1 < want && intra_can_drop(m)) ||
+                 obsolete_before_intra(m, want));
+        }
         else if (is_slice && m->in_pic) {
             if (m->pic_ok < 0)
                 picture_begin(m);
-            if (m->pic_ok && code - 1 < m->mbh)
+            if (m->pic_ok && !m->skip_pic && code - 1 < m->mbh)
                 slice(m, m->es + s, m->es + e, code - 1);
         }
     }
@@ -1136,7 +1255,7 @@ static void convert(Movie *m)
     m->conv = 1;
 }
 
-const uint8_t *movie_video(Movie *m, double t, int *changed)
+static const uint8_t *movie_video_at(Movie *m, double t, int *changed, int realtime)
 {
     if (changed) *changed = 0;
     if (!m)
@@ -1144,14 +1263,18 @@ const uint8_t *movie_video(Movie *m, double t, int *changed)
     int want = (int)floor(t * movie_fps(m)) + 1;         /* pictures shown by t */
     int before = m->shown;
     while (m->shown < want && !m->flushed) {
-        if (!decode_picture(m)) {                        /* the end: the last reference is shown */
-            if (m->ref_new >= 0 && m->disp != m->ref_new) {
+        if (!decode_picture(m, want, realtime)) {                        /* the end: the last reference is shown */
+            if (m->ref_new >= 0 && m->shown < m->pictures) {
                 m->disp = m->ref_new;
                 m->shown++;
                 m->conv = 0;
             }
             m->flushed = 1;
         }
+        /* Decoder has released all slice/bit-reader pointers here. Feeding the
+         * same movie's audio may demux/compact/reallocate ES buffers safely.
+         * Never call this from inside a slice or from a second thread. */
+        if (realtime && m->pump) m->pump();
     }
     if (m->disp < 0 || m->failed)
         return NULL;
@@ -1159,6 +1282,23 @@ const uint8_t *movie_video(Movie *m, double t, int *changed)
         convert(m);
     if (changed) *changed = m->shown != before;
     return m->rgba;
+}
+
+/* Offline/reference callers reconstruct every frame exactly as before. */
+const uint8_t *movie_video(Movie *m, double t, int *changed)
+{
+    return movie_video_at(m, t, changed, 0);
+}
+
+void movie_set_output_pump(Movie *m, void (*pump)(void))
+{
+    if (m) m->pump = pump;
+}
+
+/* Live output may omit obsolete independent pictures, never required references. */
+const uint8_t *movie_video_realtime(Movie *m, double t, int *changed)
+{
+    return movie_video_at(m, t, changed, 1);
 }
 
 int movie_planes(const Movie *m, const uint8_t *plane[3], int stride[3])
@@ -1202,9 +1342,19 @@ static int audio_block(Movie *m)
         if (!demux(m))
             return 0;
     for (int c = 0; c < m->au_ch; c++)
-        for (int k = 0; k < m->au_inter / 16; k++)
-            adpcm_frame(m->au + m->au_pos + (size_t)c * m->au_inter + 16 * k, m->au_pcm[c] + 28 * k,
-                        &m->au_hist[c][0], &m->au_hist[c][1]);
+        for (int k = 0; k < m->au_inter / 16; k++) {
+            const uint8_t *f = m->au + m->au_pos + (size_t)c * m->au_inter + 16 * k;
+            int16_t *out = m->au_pcm[c] + 28 * k;
+            if (m->au_ended[c]) {
+                /* Consume padding silently without changing block cadence. */
+                memset(out, 0, 28 * sizeof *out);
+            } else {
+                adpcm_frame(f, out, &m->au_hist[c][0], &m->au_hist[c][1]);
+                /* The end frame itself has 28 valid samples. Do not interpret
+                 * repeat/loop or reserved flag combinations as a stop. */
+                if (m->au_no_loop && f[1] == 1) m->au_ended[c] = 1;
+            }
+        }
     m->au_pos += blk;
     m->au_have = m->au_inter / 16 * 28;
     m->au_at = 0;

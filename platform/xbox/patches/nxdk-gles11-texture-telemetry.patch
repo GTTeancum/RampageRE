@@ -1,0 +1,36 @@
+--- a/gles_texture.c
++++ b/gles_texture.c
+@@ -1596,3 +1596,33 @@
+         context->texture_environment.texture_units[i].texture_unit_dirty = GL_FALSE;
+     }
+ }
++
++#ifdef RAMPAGE_XBOX_TEXTURE_TELEMETRY
++/* Read-only snapshot, called on the rendering thread. Sizes come from live
++ * driver objects and the kernel allocator, including pitch/mipmap/page padding.
++ * Peaks are sampled peaks, not an allocation-event or transient-overlap peak.
++ * out: object count, image count, requested bytes, resident bytes,
++ *      sampled peak image count, requested bytes, resident bytes, metadata bytes.
++ */
++void gliTextureMemoryStats(uint32_t out[8])
++{
++    static uint32_t peak_images, peak_requested, peak_resident;
++    uint32_t objects = 0, images = 0, requested = 0, resident = 0;
++    if (!out) return;
++    gli_context_t *context = gliGetContext();
++    for (texture_object_t *object = context->texture_environment.texture_objects; object; object = object->next) {
++        ++objects;
++        xgu_texture_t *texture = (xgu_texture_t *)object->texture_2d;
++        if (!texture || !texture->data) continue;
++        ++images;
++        requested += texture->data_size;
++        resident += (uint32_t)MmQueryAllocationSize(texture->data);
++    }
++    if (images > peak_images) peak_images = images;
++    if (requested > peak_requested) peak_requested = requested;
++    if (resident > peak_resident) peak_resident = resident;
++    out[0] = objects; out[1] = images; out[2] = requested; out[3] = resident;
++    out[4] = peak_images; out[5] = peak_requested; out[6] = peak_resident;
++    out[7] = objects * sizeof(texture_object_t) + images * sizeof(xgu_texture_t);
++}
++#endif

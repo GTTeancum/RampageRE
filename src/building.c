@@ -13,6 +13,9 @@
 int building_init(Building *b, const float min[3], const float max[3], int width, int depth, int storeys)
 {
     memset(b, 0, sizeof *b);
+    /* Bound every face and its combined cell index without overflowing 2 * depth. */
+    if (width <= 0 || width > BUILDING_CELLS || depth <= 0 || depth > (BUILDING_CELLS - width) / 2)
+        return -1;
     memcpy(b->min, min, sizeof b->min);
     memcpy(b->max, max, sizeof b->max);
     b->width = width;
@@ -22,6 +25,16 @@ int building_init(Building *b, const float min[3], const float max[3], int width
     b->vert = calloc((size_t)b->storeys + 1, sizeof *b->vert);
     if (!b->vert)
         return -1;
+#endif
+#if defined(RAMPAGE_LOW_MEMORY) && !defined(RAMPAGE_FIXED_BUILDING_ROWS)
+    /* Zero storeys has no cells. Do not depend on implementation-defined calloc(0). */
+    if (b->storeys) {
+        b->cell = calloc((size_t)b->storeys, sizeof *b->cell);
+        if (!b->cell) {
+            building_free(b);
+            return -1;
+        }
+    }
 #endif
     b->state = BUILDING_STANDING;
     b->hp = b->hp_max = 6 * width * b->n;            /* BuildingHP's default (0x2D2850) */
@@ -47,6 +60,10 @@ int building_init(Building *b, const float min[3], const float max[3], int width
 
 void building_free(Building *b)
 {
+#if defined(RAMPAGE_LOW_MEMORY) && !defined(RAMPAGE_FIXED_BUILDING_ROWS)
+    free(b->cell);
+    b->cell = NULL;
+#endif
 #if defined(RAMPAGE_LOW_MEMORY) && !defined(RAMPAGE_FIXED_BUILDING_VERTS)
     free(b->vert);
     b->vert = NULL;
@@ -593,7 +610,7 @@ void building_set_cell(Building *b, int face, int o, int col, int state)
         b->dirty = 1;
         return;
     }
-    if (o < 0 || o >= BUILDING_STOREYS)
+    if (o < 0 || o >= b->storeys)
         return;
     int i = building_cell_index(b, face, col);
     if (i < 0)
@@ -671,7 +688,7 @@ void building_update(Building *b, float dt)
             }
         } else if (w->open <= 0) {                   /* shut: out of the list, its flag cleared (0x2CF890) */
             int i = building_cell_index(b, FACE_FRONT, w->column);
-            if (i >= 0 && w->o >= 0 && w->o < BUILDING_STOREYS)
+            if (i >= 0 && w->o >= 0 && w->o < b->storeys)
                 b->cell[w->o][i].flags &= (uint16_t)~(CELL_WINDOW_OPEN << w->lr);
             window_drop(b, k--);
         }
@@ -681,7 +698,7 @@ void building_update(Building *b, float dt)
 int building_window_open(Building *b, int o, int column, int lr, int open, float seconds, const float rect[4], int opens_h)
 {
     int i = building_cell_index(b, FACE_FRONT, column);
-    if (o < 0 || o >= BUILDING_STOREYS || i < 0 || lr < 0 || lr > 1 || building_live_of(b, o) < 0)
+    if (o < 0 || o >= b->storeys || i < 0 || lr < 0 || lr > 1 || building_live_of(b, o) < 0)
         return 0;
     int k = window_find(b, o, column, lr);
     if (k >= 0) {                                    /* already there: on its way open or shut */

@@ -1,0 +1,199 @@
+--- a/nv2a_helper.h
++++ b/nv2a_helper.h
+@@ -51,6 +51,7 @@
+     GLubyte *data;
+     GLubyte *data_physical_address;
+     GLuint data_size;
++    GLuint palette_offset; /* zero for ordinary storage; exact P8 palette inside data */
+     uint8_t mipmap_levels;
+     struct xgu_texture *mipmap_head;
+ } xgu_texture_t;
+--- a/gles_private.h
++++ b/gles_private.h
+@@ -513,6 +513,8 @@
+ void gliFlushStateChange(void);
+ texture_object_t *gliFindTextureObject(GLuint name, texture_object_t **prev);
+ GLboolean gliTextureObjectIsComplete(const texture_object_t *texture_object);
++GLboolean gliTextureUnpackPalette(texture_object_t *texture_object);
++GLboolean gliTextureTryPalette(void);
+ framebuffer_object_t *gliFindFramebufferObject(GLuint name, framebuffer_object_t **prev);
+ renderbuffer_object_t *gliFindRenderbufferObject(GLuint name, renderbuffer_object_t **prev);
+ buffer_object_t *gliFindBufferObject(GLuint name, buffer_object_t **prev);
+--- a/gles_texture.c
++++ b/gles_texture.c
+@@ -1,6 +1,7 @@
+ #define GL_GLEXT_PROTOTYPES
+ #include "gles_private.h"
+ #include <swizzle.h>
++#include "gles_palette_codec.h"
+ 
+ // GL_APPLE_texture_2D_limited_npot: a texture with a non power of two size is only complete when it is sampled with
+ // GL_CLAMP_TO_EDGE and a non mipmapped minification filter. Incomplete textures act as if texturing was disabled.
+@@ -904,6 +905,7 @@
+             return;
+         }
+ 
++        if (!gliTextureUnpackPalette(texture_object)) return;
+         xgu_texture_t *xgu_texture = (xgu_texture_t *)texture_object->texture_2d;
+         if (!xgu_texture->swizzled) {
+             gliSetError(GL_INVALID_OPERATION); // Mipmaps require POT swizzled textures
+@@ -1209,6 +1211,7 @@
+         return;
+     }
+ 
++    if (!gliTextureUnpackPalette(texture_object)) return;
+     xgu_texture_t *xgu_texture = (xgu_texture_t *)texture_object->texture_2d;
+     if (level >= xgu_texture->mipmap_levels || (level > 0 && !xgu_texture->swizzled)) {
+         gliSetError(GL_INVALID_OPERATION);
+@@ -1552,6 +1555,14 @@
+             pb = pb_begin();
+         }
+         pb = xgu_set_texture_offset(pb, i, xgu_texture->data_physical_address);
++        if (xgu_texture->palette_offset) {
++            /* The register takes the byte address with six low bits masked;
++             * xgu's palette helper shifts its pointer and is unsuitable here.
++             * Context DMA A is pbkit's global context3; palette length256 is0. */
++            uint32_t address = (uint32_t)xgu_texture->data_physical_address + xgu_texture->palette_offset;
++            pb = push_command_parameter(pb, NV097_SET_TEXTURE_PALETTE + i * 64,
++                                        address & NV097_SET_TEXTURE_PALETTE_OFFSET);
++        }
+         pb = xgu_set_texture_format(pb,
+                                     i,
+                                     2,
+@@ -1597,6 +1608,81 @@
+     }
+ }
+ 
++/* Experimental opt-in storage conversion. Caller flushes its frontend before
++ * invoking this native driver function; ordinary GL uploads do not opt in. */
++GLboolean gliTextureTryPalette(void)
++{
++    gli_context_t *context = gliGetContext();
++    GLuint unit = context->texture_environment.server_active_texture - GL_TEXTURE0;
++    texture_object_t *object = context->texture_environment.texture_units[unit].bound_texture_object;
++    xgu_texture_t *texture = object ? (xgu_texture_t *)object->texture_2d : NULL;
++    if (!texture || !texture->data || texture->palette_offset || !texture->swizzled ||
++        texture->mipmap_levels != 1 || object->generate_mipmap ||
++        texture->format != XGU_TEXTURE_FORMAT_A8R8G8B8_SWIZZLED || texture->bytes_per_pixel != 4 ||
++        texture->tex_width < 8 || texture->tex_height < 8 ||
++        texture->tex_width != texture->data_width || texture->tex_height != texture->data_height ||
++        texture->data_width > 4096 || texture->data_height > 4096) return GL_FALSE;
++    size_t count = (size_t)texture->data_width * texture->data_height;
++    if (count > texture->data_size / 4u) return GL_FALSE;
++    size_t palette_offset = (count + 63u) & ~(size_t)63u;
++    size_t size = palette_offset + 1024;
++    if (((size + 4095u) & ~(size_t)4095u) >= MmQueryAllocationSize(texture->data)) return GL_FALSE;
++    glFinish();
++    gli_palette_map_t map;
++    if (!gli_palette_build(&map, (const uint32_t *)texture->data, count)) return GL_FALSE;
++    GLubyte *data = MmAllocateContiguousMemoryEx(size, 0, 0x03FFAFFF, 0x1000, PAGE_READWRITE | PAGE_WRITECOMBINE);
++    if (!data) return GL_FALSE; /* Optimization failure preserves the original texture. */
++    gli_palette_indices(&map, (const uint32_t *)texture->data, count, data);
++    uint32_t *palette = (uint32_t *)(data + palette_offset);
++    for (unsigned i = 0; i < 256; ++i) palette[i] = i < map.count ? map.colors[i] : 0;
++    __asm__ volatile("sfence" ::: "memory");
++    MmFreeContiguousMemory(texture->data);
++    texture->data = data;
++    texture->data_physical_address = (GLubyte *)MmGetPhysicalAddress(data);
++    texture->data_size = size;
++    texture->bytes_per_pixel = 1;
++    texture->pitch = texture->data_width;
++    texture->palette_offset = palette_offset;
++    texture->format = (XguTexFormatColor)NV097_SET_TEXTURE_FORMAT_COLOR_SZ_I8_A8R8G8B8;
++    object->texture_object_dirty = GL_TRUE;
++    return GL_TRUE;
++}
++
++/* Preserve ordinary GL semantics if a paletted image later becomes mutable,
++ * gains mipmaps, or is attached as a render target. Failure leaves it intact. */
++GLboolean gliTextureUnpackPalette(texture_object_t *object)
++{
++    xgu_texture_t *texture = object ? (xgu_texture_t *)object->texture_2d : NULL;
++    if (!texture || !texture->palette_offset) return GL_TRUE;
++    size_t count = (size_t)texture->data_width * texture->data_height;
++    GLubyte *data = MmAllocateContiguousMemoryEx(count * 4, 0, 0x03FFAFFF, 0x1000, PAGE_READWRITE | PAGE_WRITECOMBINE);
++    if (!data) { gliSetError(GL_OUT_OF_MEMORY); return GL_FALSE; }
++    glFinish();
++    const uint32_t *palette = (const uint32_t *)(texture->data + texture->palette_offset);
++    for (size_t i = 0; i < count; ++i) ((uint32_t *)data)[i] = palette[texture->data[i]];
++    __asm__ volatile("sfence" ::: "memory");
++    MmFreeContiguousMemory(texture->data);
++    texture->data = data;
++    texture->data_physical_address = (GLubyte *)MmGetPhysicalAddress(data);
++    texture->data_size = count * 4;
++    texture->bytes_per_pixel = 4;
++    texture->pitch = texture->data_width * 4;
++    texture->palette_offset = 0;
++    texture->format = XGU_TEXTURE_FORMAT_A8R8G8B8_SWIZZLED;
++    object->texture_object_dirty = GL_TRUE;
++    return GL_TRUE;
++}
++
++/* Prototype measurement only, not a public GL extension. */
++size_t gliTextureBoundResidentBytes(void)
++{
++    gli_context_t *context = gliGetContext();
++    GLuint unit = context->texture_environment.server_active_texture - GL_TEXTURE0;
++    texture_object_t *object = context->texture_environment.texture_units[unit].bound_texture_object;
++    xgu_texture_t *texture = object ? (xgu_texture_t *)object->texture_2d : NULL;
++    return texture && texture->data ? MmQueryAllocationSize(texture->data) : 0;
++}
++
+ #ifdef RAMPAGE_XBOX_TEXTURE_TELEMETRY
+ /* Read-only snapshot, called on the rendering thread. Sizes come from live
+  * driver objects and the kernel allocator, including pitch/mipmap/page padding.
+--- a/gles_mipmap.c
++++ b/gles_mipmap.c
+@@ -137,6 +137,7 @@
+         return;
+     }
+ 
++    if (!gliTextureUnpackPalette(texture_object)) return;
+     xgu_texture_t *xgu_texture = (xgu_texture_t *)texture_object->texture_2d;
+ 
+     // Mipmaps require swizzled textures (which in turn requires power-of-two)
+--- a/gles_fbo.c
++++ b/gles_fbo.c
+@@ -484,6 +484,7 @@
+             return;
+         }
+ 
++        if (!gliTextureUnpackPalette(texture_object)) return;
+         xgu_texture_t *xgu_texture = (xgu_texture_t *)texture_object->texture_2d;
+ 
+         // Convert swizzled textures to linear when attached to an FBO.
+--- /dev/null
++++ b/gles_palette_codec.h
+@@ -0,0 +1,32 @@
++/* Exact BGRA dictionary; no color quantization or transparent-pixel omission. */
++#ifndef GLI_PALETTE_CODEC_H
++#define GLI_PALETTE_CODEC_H
++#include <stddef.h>
++#include <stdint.h>
++typedef struct { uint32_t keys[512], colors[256]; uint16_t slots[512], count; } gli_palette_map_t;
++static unsigned gli_palette_hash(uint32_t color) { return (color * 2654435761u) >> 23; }
++static int gli_palette_build(gli_palette_map_t *map, const uint32_t *pixels, size_t count)
++{
++    for (unsigned i = 0; i < 512; ++i) map->slots[i] = 0;
++    map->count = 0;
++    if (!count) return 0;
++    for (size_t i = 0; i < count; ++i) {
++        uint32_t color = pixels[i]; unsigned at = gli_palette_hash(color);
++        while (map->slots[at] && map->keys[at] != color) at = (at + 1) & 511;
++        if (!map->slots[at]) {
++            if (map->count == 256) return 0;
++            map->keys[at] = color; map->colors[map->count] = color;
++            map->slots[at] = ++map->count;
++        }
++    }
++    return 1;
++}
++static void gli_palette_indices(const gli_palette_map_t *map, const uint32_t *pixels, size_t count, uint8_t *indices)
++{
++    for (size_t i = 0; i < count; ++i) {
++        uint32_t color = pixels[i]; unsigned at = gli_palette_hash(color);
++        while (map->keys[at] != color || !map->slots[at]) at = (at + 1) & 511;
++        indices[i] = (uint8_t)(map->slots[at] - 1);
++    }
++}
++#endif

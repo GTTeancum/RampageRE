@@ -1,0 +1,76 @@
+--- a/lib/pbkit/pbkit.c
++++ b/lib/pbkit/pbkit.c
+@@ -216,7 +216,7 @@
+ 
+ 
+ //private functions
+-static void pb_vbl_handler(void)
++static void pb_vbl_handler(BOOLEAN allow_dpc_scanout_fallback)
+ {
+     BYTE        old_color_addr; //important index to preserve if we are called from Dpc or Isr
+ 
+@@ -233,7 +233,18 @@
+     //Is the next back buffer to show up is ready?
+     if (pb_BackBufferbReady[next]==1)
+     {
+-        //screen swapping has been done already, theoretically, in ISR
++        //Keep ISR selection early; cover a new VBlank handled with GPU IRQ masked.
++        //Only the direct DPC caller authorizes this serialized fallback.
++        if (allow_dpc_scanout_fallback && pb_running && pb_debug_screen_active==0)
++        {
++            int buffer_index=pb_BackBufferIndex[next];
++            if ((unsigned int)buffer_index<3)
++            {
++                DWORD address=pb_FBAddr[buffer_index]&0x03FFFFFF;
++                if (VIDEOREG(PCRTC_START)!=address) VIDEOREG(PCRTC_START)=address;
++            }
++        }
++
+         pb_BackBufferbReady[next]=0;
+ 
+         VIDEOREG(NV_PGRAPH_INCREMENT)|=NV_PGRAPH_INCREMENT_READ_3D_TRIGGER;
+@@ -491,7 +502,7 @@
+     {
+         status=VIDEOREG(NV_PMC_INTR_0);
+         if (status&NV_PMC_INTR_0_PGRAPH_PENDING) pb_gr_handler();
+-        if (status&NV_PMC_INTR_0_PCRTC_PENDING) pb_vbl_handler();
++        if (status&NV_PMC_INTR_0_PCRTC_PENDING) pb_vbl_handler(FALSE);
+     }
+ }
+ 
+@@ -644,7 +655,7 @@
+             {
+                 if (VIDEOREG(NV_PGRAPH_INTR)) pb_fifo_handler();
+ 
+-                if (VIDEOREG(NV_PMC_INTR_0)&NV_PMC_INTR_0_PCRTC_PENDING) pb_vbl_handler();
++                if (VIDEOREG(NV_PMC_INTR_0)&NV_PMC_INTR_0_PCRTC_PENDING) pb_vbl_handler(FALSE);
+ 
+                 if ((VIDEOREG8(NV_PFIFO_CACHE1_STATUS)&NV_PFIFO_CACHE1_STATUS_LOW_MARK_EMPTY)==0)
+                     continue; //jump to loop start
+@@ -778,7 +789,7 @@
+             more=VIDEOREG(NV_PTIMER_INTR_0);
+         }
+ 
+-        if (status&NV_PMC_INTR_0_PCRTC_PENDING) pb_vbl_handler();
++        if (status&NV_PMC_INTR_0_PCRTC_PENDING) pb_vbl_handler(TRUE);
+ 
+         if (status&NV_PMC_INTR_0_PGRAPH_PENDING) more|=pb_gr_handler();
+ 
+@@ -862,7 +873,7 @@
+     {
+         pb_fifo_handler();
+         if (VIDEOREG(NV_PGRAPH_INTR)!=NV_PGRAPH_INTR_NOT_PENDING) pb_gr_handler();
+-        if (VIDEOREG(NV_PMC_INTR_0)&NV_PMC_INTR_0_PCRTC_PENDING) pb_vbl_handler();
++        if (VIDEOREG(NV_PMC_INTR_0)&NV_PMC_INTR_0_PCRTC_PENDING) pb_vbl_handler(FALSE);
+     }
+ 
+     old_dma_push=VIDEOREG(NV_PFIFO_CACHE1_DMA_PUSH);
+@@ -2119,7 +2130,7 @@
+     {
+         pb_fifo_handler();
+         if (VIDEOREG(NV_PGRAPH_INTR)!=NV_PGRAPH_INTR_NOT_PENDING) pb_gr_handler();
+-        if (VIDEOREG(NV_PMC_INTR_0)&NV_PMC_INTR_0_PCRTC_PENDING) pb_vbl_handler();
++        if (VIDEOREG(NV_PMC_INTR_0)&NV_PMC_INTR_0_PCRTC_PENDING) pb_vbl_handler(FALSE);
+     }
+ 
+     VIDEOREG(NV_PFIFO_CACHE1_DMA_PUSH)=NV_PFIFO_CACHE1_DMA_PUSH_ACCESS_DISABLE;
