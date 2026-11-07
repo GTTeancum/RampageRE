@@ -2,7 +2,7 @@ name: Xbox hardware-test package
 on:
   workflow_dispatch:
   push:
-    branches: ['xbox-hardware/**']
+    branches: [main]
 permissions:
   contents: read
 jobs:
