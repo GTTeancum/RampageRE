@@ -1,0 +1,35 @@
+nod 1.4.4 pinned notice provenance
+==================================
+
+Official repository: https://github.com/encounter/nod
+Release tag: v1.4.4
+Resolved release commit: df8ab228c8a8e8f906048daddc3ea07f43f18a5c
+
+The release's root Cargo.toml declares workspace version 1.4.4 and
+license "MIT OR Apache-2.0":
+https://github.com/encounter/nod/blob/df8ab228c8a8e8f906048daddc3ea07f43f18a5c/Cargo.toml
+
+Both bundled files were read from the exact release and compared with
+the copies already present in this project. They are byte-identical.
+
+MIT:
+Upstream path: LICENSE-MIT
+Bundled path: nod-LICENSE-MIT.txt
+Git blob SHA-1: 5bf95a47dafb026f72cd84d8cf0ac3a48ea96f75
+SHA-256 (LF): 544ffe9befaefa6b59ab1fdde58789069ba7c1b65432bdea273a16b2117909b7
+URL: https://github.com/encounter/nod/blob/df8ab228c8a8e8f906048daddc3ea07f43f18a5c/LICENSE-MIT
+
+Apache:
+Upstream path: LICENSE-APACHE
+Bundled path: nod-LICENSE-APACHE.txt
+Git blob SHA-1: e9d54374a1004eca87d2da95bb63973324a8e3df
+SHA-256 (LF): fd363f1eb5135402a2e66f4a6173e6eff06daabe79d150acd7c669d33b985b4e
+URL: https://github.com/encounter/nod/blob/df8ab228c8a8e8f906048daddc3ea07f43f18a5c/LICENSE-APACHE
+
+The collector may use these copies only when Cargo identifies crates.io
+package nod exactly version 1.4.4, with the matching license expression,
+and its package contains no notice. Both bundled files must pass pinned
+SHA-256 checks, allowing only CRLF-to-LF normalization. Explicit invalid
+license paths, other packages/versions/registries, absent files and
+changed contents remain errors. No crate or license download is performed
+by this fallback.
