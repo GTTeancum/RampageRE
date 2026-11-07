@@ -504,6 +504,10 @@ def _prepare(package, ps2, wii=None, *, allow_replace=False, cancel=None, progre
         raise PrepError('A previous preparation/recovery folder exists beside the tool. Use Recover, or keep it outside this folder after checking it, then retry.')
     current = folder_entries(target, recursive=True)
     roots = {p.name.casefold(): p.name for p in target.iterdir()}
+    if 'rampage.vol' in roots:
+        raise PrepError('Legacy root RAMPAGE.VOL would override the newly prepared data folder. '
+                        'Extract the whole ZIP into a new folder, or move/back up the old root assets '
+                        'outside Rampage Xbox before retrying. No existing files were changed.')
     if ('data' in roots or (wii and 'wii' in roots)) and not allow_replace:
         raise PrepError('Existing assets need explicit replacement confirmation.')
     check_cancel(cancel)

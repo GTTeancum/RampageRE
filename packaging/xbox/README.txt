@@ -1,7 +1,8 @@
 Rampage Xbox hardware-test package
 =================================
 
-1. Extract the entire download ZIP to a writable folder on your Windows PC.
+1. Extract the entire download ZIP to a new, empty writable folder on your
+   Windows PC. Do not merge it over an older Xbox installation.
 2. Run Prepare Rampage Xbox.exe from the ZIP's root folder.
 3. Select your own supported PS2 disc image. The current port needs PS2 data
    even when Wii extras are enabled. Supported PS2 releases are Europe
