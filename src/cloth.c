@@ -897,7 +897,7 @@ int cloth_mesh_part(const Cloth *c, int part, const uint8_t *d, uint32_t size, c
     out->particle = malloc(count * sizeof *out->particle);
     out->tris = malloc(3 * count * sizeof *out->tris);
     if (!out->particle || !out->tris)
-        goto fail;
+        goto oom;
     for (uint32_t v = 0; v < count; v++) {
         uint16_t q = rd16(d2 + moff + 2 * v);
         if (q >= (uint32_t)cp->n)
@@ -913,7 +913,7 @@ int cloth_mesh_part(const Cloth *c, int part, const uint8_t *d, uint32_t size, c
             goto fail;
         out->uv = malloc(2 * count * sizeof *out->uv);
         if (!out->uv)
-            goto fail;
+            goto oom;
         for (uint32_t v = 0; v < count; v++) {
             out->uv[2 * v] = (int16_t)rd16(s + at + 4 * v) / 4096.0f;
             out->uv[2 * v + 1] = (int16_t)rd16(s + at + 4 * v + 2) / 4096.0f;
@@ -928,6 +928,9 @@ int cloth_mesh_part(const Cloth *c, int part, const uint8_t *d, uint32_t size, c
         t[2] = v;
     }
     return 0;
+oom:
+    cloth_mesh_part_free(out);
+    return -2;
 fail:
     cloth_mesh_part_free(out);
     return -1;

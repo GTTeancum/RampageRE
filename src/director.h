@@ -53,7 +53,9 @@ typedef struct {
     uint8_t *pred, *mark;    /* +0xC the state before it (0xFF none); bit 0 queued (+0x1C), bit 1 done (+0x3C) */
     uint8_t *queue; int nq;  /* +0x14 / +0x18: the list, in the order they were queued */
 } DirGraph;
-int dir_graph_read(const Bundle *monster, DirGraph *ag);   /* 0 = ok */
+/* Free a live graph before replacement. 0 = ready; -1 = absent/invalid data or allocation
+ * failure, leaving an empty graph safe to free. The caller must not run AI on failure. */
+int dir_graph_read(const Bundle *monster, DirGraph *ag);
 void dir_graph_free(DirGraph *ag);
 /* 0x2F2B90: the target can be reached from the state through usable transitions (or clip ends) */
 int dir_graph_reachable(const DirGraph *ag, const MoveGraph *g, int from, int to, MoveCall call, void *ctx);

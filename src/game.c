@@ -9,6 +9,41 @@
 #include "game.h"
 #include "wrand.h"
 
+/* Callback arguments are evaluated before this boundary, including inherited reads. */
+static int host_stopped(const GameHost *h)
+{
+    return h && h->failed && h->failed(h->ctx);
+}
+static Group host_find(const GameHost *h, const char *book, const char *name)
+{
+    if (host_stopped(h) || !h->find) return (Group){ 0 };
+    Group result = h->find(h->ctx, book, name);
+    return host_stopped(h) ? (Group){ 0 } : result;
+}
+static float host_script(const GameHost *h, const char *function, float last_freq)
+{
+    if (host_stopped(h) || !h->script) return 0;
+    float result = h->script(h->ctx, function, last_freq);
+    return host_stopped(h) ? 0 : result;
+}
+static int host_all_revealed(const GameHost *h)
+{
+    if (host_stopped(h) || !h->all_revealed) return 0;
+    int result = h->all_revealed(h->ctx);
+    return host_stopped(h) ? 0 : result;
+}
+static void host_block_rubble(const GameHost *h, const char *name)
+{
+    if (!host_stopped(h) && h->block_rubble)
+        h->block_rubble(h->ctx, name);
+}
+static int host_rubble_point(const GameHost *h, const float pos[3], float radius, float out[3])
+{
+    if (host_stopped(h) || !h->rubble_point) return 0;
+    int result = h->rubble_point(h->ctx, pos, radius, out);
+    return host_stopped(h) ? 0 : result;
+}
+
 #define PI 3.14159265f
 #define MAX_EVENTS 256
 #define MAX_BLOCKS 64
@@ -102,7 +137,7 @@ static float frand(Game *g)
 static GameEvent *emit(Game *g, int type, int slot)
 {
     static GameEvent spare;
-    GameEvent *e = g->nev < MAX_EVENTS ? &g->ev[g->nev++] : &spare;
+    GameEvent *e = !host_stopped(&g->host) && g->nev < MAX_EVENTS ? &g->ev[g->nev++] : &spare;
     memset(e, 0, sizeof *e);
     e->type = type;
     e->slot = slot;
@@ -147,7 +182,7 @@ static Group parent_of(const Game *g, Group grp)     /* ParentPropertySet = "Gro
     size_t len = (size_t)(colon - ref) < sizeof name - 1 ? (size_t)(colon - ref) : sizeof name - 1;
     memcpy(name, ref, len);
     name[len] = 0;
-    return g->host.find(g->host.ctx, colon + 1, name);
+    return host_find(&g->host, colon + 1, name);
 }
 
 /* ---------------------------------------------------------------- the clock (0x4D5190) */
@@ -366,7 +401,7 @@ static void activate_next_block(Game *g, int in_game)
     e->b = in_game;                                  /* a1: 1 in the game (the old block torn down), 0 the reset */
     e->name = g->cur >= 0 && g->cur < g->nblocks ? g->blocks[g->cur] : NULL;
     if (g->host.block_rubble)                        /* now: the results' NI may look in it this step */
-        g->host.block_rubble(g->host.ctx, e->name);
+        host_block_rubble(&g->host, e->name);
 }
 
 /* ---------------------------------------------------------------- Levels.bsf [R Levels.scr] */
@@ -507,7 +542,7 @@ static float results_ni(Game *g, float last)         /* ResultsNI: the winners p
                                                       * and, once a point is found, (int)(2 frand), all before the
                                                       * poses' draws below (Levels.scr 353 .. 376) [R] */
             float c[3] = { 0, 20.0f - 41.0f, 0 }, loc[3];
-            if (!g->host.rubble_point || !g->host.rubble_point(g->host.ctx, c, 8, loc))
+            if (!g->host.rubble_point || !host_rubble_point(&g->host, c, 8, loc))
                 continue;
             int fx = (int)(2.0f * frand(g));
             GameEvent *e = emit(g, GE_RUBBLE_FX, -1);
@@ -678,7 +713,7 @@ static int is_finished(Game *g, int fn)
 static float call_ni(Game *g, int fn, int fallback, const char *name, float last)
 {
     if (fn == FN_HOST) {
-        float r = g->host.script ? g->host.script(g->host.ctx, name, last) : -1;
+        float r = g->host.script ? host_script(&g->host, name, last) : -1;
         if (r >= 0)
             return r;
         fn = fallback;
@@ -828,7 +863,7 @@ static void block_won(Game *g)
         g->city_flags |= 2;
     /* isAtCheckpoint is always 1 (0x3030B0); 0x323240: every monster of the city revealed, flag 8 (Boosy's unlock
      * after it, 0x3259E4, needs every city's saved flags: the host's profile, profile_block_won) */
-    if (g->host.all_revealed && g->host.all_revealed(g->host.ctx))
+    if (g->host.all_revealed && host_all_revealed(&g->host))
         g->city_flags |= 8;
     g->city_destroyed = g->level_done;
     if (g->level_done)
@@ -1028,7 +1063,7 @@ static void step(Game *g)
     if (g->state == GS_PLAY) {
         int finished;                                /* IsBlockFinished, every frame */
         if (g->fin == FN_HOST) {
-            float r = g->host.script ? g->host.script(g->host.ctx, g->fin_name, 0) : -1;
+            float r = g->host.script ? host_script(&g->host, g->fin_name, 0) : -1;
             finished = r >= 0 ? r > 0 : is_finished(g, g->fin_fallback);
         } else
             finished = g->fin != FN_NONE && is_finished(g, g->fin);
@@ -1115,12 +1150,13 @@ void game_free(Game *g) { free(g); }
 
 int game_load_city(Game *g, const char *city)
 {
+    if (g && host_stopped(&g->host)) return -1;
     if (!g || !city)
         return -1;
     char book[48];
     snprintf(g->city, sizeof g->city, "%s", city);
     snprintf(book, sizeof book, "%s_Props", city);
-    g->world = g->host.find ? g->host.find(g->host.ctx, book, "WorldData") : (Group){ NULL, 0 };
+    g->world = g->host.find ? host_find(&g->host, book, "WorldData") : (Group){ NULL, 0 };
     g->nblocks = 0;
     Group list = g->world.at ? group_sub(group_sub(g->world, "BlockData"), "BlockList") : g->world;
     if (list.at) {
@@ -1147,6 +1183,7 @@ int game_load_city(Game *g, const char *city)
 
 void game_start(Game *g)
 {
+    if (g && host_stopped(&g->host)) return;
     if (!g)
         return;
     int keep = g->start_block;
@@ -1165,6 +1202,7 @@ void game_start(Game *g)
 
 void game_update(Game *g, float dt, const GameInput *in)
 {
+    if (g && host_stopped(&g->host)) return;
     if (!g)
         return;
     g->dt = dt;
@@ -1185,6 +1223,7 @@ void game_update(Game *g, float dt, const GameInput *in)
 
 int game_events(Game *g, GameEvent *out, int max)
 {
+    if (g && host_stopped(&g->host)) return 0;
     if (!g)
         return 0;
     int n = g->nev < max ? g->nev : max;
@@ -1202,7 +1241,8 @@ void game_move_done(Game *g, int slot)
 
 void game_set_result(Game *g, int result) { if (g) g->result = result; }
 void game_auto_results(Game *g, float seconds) { if (g) g->auto_results = seconds; }
-void game_restart_shell(Game *g) { if (g) set_state(g, GS_EXIT); }
+void game_restart_shell(Game *g) {
+    if (g && host_stopped(&g->host)) return; if (g) set_state(g, GS_EXIT); }
 void game_attract_button(Game *g) { if (g) g->button = 1; }
 void game_add_points(Game *g, int slot, int cat, int amount) { if (g) add_points(g, slot, cat, amount); }
 
@@ -1330,6 +1370,7 @@ int game_par_score(const Game *g) { return g ? g->par_score : 0; }
 
 const char *game_block_str(const Game *g, const char *key)
 {
+    if (g && host_stopped(&g->host)) return NULL;
     if (!g)
         return NULL;
     Group blk = block_def(g, g->cur), par = parent_of(g, blk);

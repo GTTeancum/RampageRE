@@ -32,13 +32,19 @@ struct City {
     const Vol *vol;
     char name[64];
     Bundle bundle;
+    /* Stable slots: name empty = unused; name set/ok 0 = true absence; ok 1 = owned Book.
+     * Successful slots never move or get evicted. nbooks is a high-water bound, not an owner count. */
     LoadedBook books[MAX_BOOKS]; int nbooks;
+    unsigned absent_next;                           /* rotating victim among negative slots only */
+    int load_failed;                                /* sticky present-data failure, owned by this City */
     Group world;
     char template_books[4][64]; int ntemplate_books;
     char (*model_key)[64];                           /* per city entry: model name of a mesh entry ("model|object") */
     int create_crowd;                                /* Traffic.bsf's bCreateCrowd (city_new_world) */
     Group runners[16]; int nrunners;                 /* Traffic.bsf's runners: the first activated block's, the world's */
 };
+
+static City *active_city;                           /* the sole City resolver selection, never Scene-owned */
 
 /* ---------------------------------------------------------------- matrices */
 
@@ -83,28 +89,93 @@ Mat4 mat_tq(const float t[3], const float q[4])
 
 /* ---------------------------------------------------------------- books */
 
+int city_load_failed(const City *c) { return c && c->load_failed; }
+
+void city_reset_load_failure(City *c)
+{
+    /* Caller has destroyed the failed Scene and all managers borrowing its Groups.
+     * Successful Books remain stable and owned by City across explicit attempts. */
+    if (c) {
+        c->load_failed = 0;
+        for (int i = 0; i < c->nbooks; i++)
+            if (!c->books[i].ok) memset(&c->books[i], 0, sizeof c->books[i]);
+        /* Do not compact the holes: successful Book.b and all borrowed Groups stay stable. */
+        c->absent_next = 0;
+    }
+}
+
+/* Empty and negative slots publish no Book borrowers and can be reused in place. */
+static LoadedBook *book_slot(City *c)
+{
+    for (int i = 0; i < c->nbooks; i++)
+        if (!c->books[i].name[0]) return &c->books[i];
+    if (c->nbooks < MAX_BOOKS) return &c->books[c->nbooks];
+    for (unsigned n = 0; n < MAX_BOOKS; n++) {
+        unsigned i = (c->absent_next + n) % MAX_BOOKS;
+        if (!c->books[i].ok) {
+            c->absent_next = (i + 1) % MAX_BOOKS;
+            return &c->books[i];
+        }
+    }
+    return NULL;
+}
+
+static void book_slot_used(City *c, const LoadedBook *lb)
+{
+    int high = (int)(lb - c->books) + 1;
+    if (high > c->nbooks) c->nbooks = high;
+}
+
 static LoadedBook *load_book(City *c, const char *name)
 {
+    if (!c || c->load_failed) return NULL;
+    if (!name || !*name || strlen(name) >= sizeof c->books[0].name) {
+        c->load_failed = 1;
+        return NULL;
+    }
     for (int i = 0; i < c->nbooks; i++)
         if (_stricmp(c->books[i].name, name) == 0)
             return c->books[i].ok ? &c->books[i] : NULL;
-    if (c->nbooks == MAX_BOOKS)
-        return NULL;
-    LoadedBook *lb = &c->books[c->nbooks++];
-    memset(lb, 0, sizeof *lb);
-    snprintf(lb->name, sizeof lb->name, "%s", name);
     char file[96];
     size_t len = strlen(name);
     snprintf(file, sizeof file, "%s%s", name, len > 4 && !_stricmp(name + len - 4, ".bdg") ? "" : ".bdp");
+    const VolFile *present = vol_find(c->vol, file);
+    LoadedBook *lb = book_slot(c);
+    if (!present) {                                /* absence stays optional even with 32 successes */
+        if (lb) {
+            memset(lb, 0, sizeof *lb);
+            snprintf(lb->name, sizeof lb->name, "%s", name);
+            book_slot_used(c, lb);                 /* negative metadata only, no Bundle/Book owner */
+        }
+        return NULL;
+    }
+    if (!lb) {
+        c->load_failed = 1;                        /* only a present 33rd successful owner can overflow */
+        return NULL;
+    }
+    /* Populate an unused/negative stable slot in place: Book.b points into it.
+     * Never move a successful slot, and publish ok only after both readers succeed. */
+    memset(lb, 0, sizeof *lb);
     uint32_t size;
     uint8_t *data = vol_read(c->vol, file, &size);
-    if (data && bdp_load(&lb->b, data, size) == 0 && book_open(&lb->book, &lb->b) == 0) {
-        lb->ok = 1;
-        lb->b.scope = c->name;                           /* texture packs: dumped under the city (texpack.c) */
+    if (!data) goto failed;
+    if (bdp_load(&lb->b, data, size) != 0) {
+        free(data);                                /* failed reader leaves input caller-owned */
+        goto failed;
     }
-    else if (data && !lb->b.file)
-        free(data);
-    return lb->ok ? lb : NULL;
+    if (book_open(&lb->book, &lb->b) != 0) {
+        bdp_free(&lb->b);
+        goto failed;
+    }
+    snprintf(lb->name, sizeof lb->name, "%s", name);
+    lb->b.scope = c->name;
+    lb->ok = 1;
+    book_slot_used(c, lb);
+    return lb;
+failed:
+    memset(lb, 0, sizeof *lb);
+    c->load_failed = 1;
+    return NULL;
 }
 
 /* the Wii's own copy of a book the PS2 has too (Objects1_props: its cows, oil towers, Dallas's people, ...), for
@@ -112,6 +183,7 @@ static LoadedBook *load_book(City *c, const char *name)
  * or when the PS2 has no such book (load_book then reads the Wii's already) */
 static LoadedBook *wii_twin(City *c, const char *name)
 {
+    if (!c || c->load_failed || !name) return NULL;
     char ps2[80], wii[80];
     snprintf(ps2, sizeof ps2, "%s.bdp", name);
     snprintf(wii, sizeof wii, "%s.bdg", name);
@@ -125,7 +197,7 @@ static Group book_or_twin(City *c, const char *book, const char *group)
     Group g = { NULL, 0 };
     if (lb)
         g = book_group(&lb->book, group);
-    if (!g.at && (twin = wii_twin(c, book)) != NULL)
+    if (!city_load_failed(c) && !g.at && (twin = wii_twin(c, book)) != NULL)
         g = book_group(&twin->book, group);
     return g;
 }
@@ -138,10 +210,11 @@ static Group resolve(void *ctx, const char *book, const char *group)
 static Group template_of(City *c, const char *name)
 {
     Group none = { NULL, 0 };
-    if (!name)
+    if (!c || c->load_failed || !name)
         return none;
     for (int i = 0; i < c->ntemplate_books; i++) {
         LoadedBook *lb = load_book(c, c->template_books[i]);
+        if (c->load_failed) return none;
         if (lb) {
             Group g = book_group(&lb->book, name);
             if (g.at)
@@ -150,6 +223,7 @@ static Group template_of(City *c, const char *name)
     }
     for (int i = 0; i < c->ntemplate_books && c->vol->nwii; i++) {   /* then the Wii's copies, for what they add */
         LoadedBook *twin = wii_twin(c, c->template_books[i]);
+        if (c->load_failed) return none;
         Group g = twin ? book_group(&twin->book, name) : none;
         if (g.at)
             return g;
@@ -175,40 +249,50 @@ static void location(Group inst, float xyz[3])
 
 /* ---------------------------------------------------------------- the city */
 
-City *city_open(const Vol *vol, const char *name)
+City *city_open_checked(const Vol *vol, const char *name, int *load_failed_out)
 {
-    City *c = calloc(1, sizeof *c);
-    if (!c)
+    if (load_failed_out) *load_failed_out = 0;
+    if (!vol || !name || !*name || strlen(name) + sizeof "_buildings" > 64) {
+        if (load_failed_out) *load_failed_out = 1;
         return NULL;
-    c->vol = vol;
-    snprintf(c->name, sizeof c->name, "%s", name);
+    }
     char file[96], props[96];
     snprintf(file, sizeof file, "%s.bdp", name);
+    if (!vol_find(vol, file)) return NULL;           /* genuinely absent required media */
+    City *c = calloc(1, sizeof *c);
+    if (!c) {
+        if (load_failed_out) *load_failed_out = 1;
+        return NULL;
+    }
+    City *previous = active_city;
+    c->vol = vol;
+    snprintf(c->name, sizeof c->name, "%s", name);
     uint32_t size;
     uint8_t *data = vol_read(vol, file, &size);
     if (!data || bdp_load(&c->bundle, data, size) != 0) {
         free(data);
-        free(c);
-        return NULL;
+        c->load_failed = 1;
+        goto failed;
     }
     c->bundle.scope = c->name;
-    prb_set_resolver(resolve, c);
+    city_activate(c);
     snprintf(props, sizeof props, "%s_Props", name);
     LoadedBook *lb = load_book(c, props);
-    if (!lb) {
-        city_close(c);
-        return NULL;
-    }
+    if (!lb) goto failed;
     c->world = book_group(&lb->book, "WorldData");
     const char *otb = group_str(c->world, "ObjectTemplateBook"), *wtb = group_str(c->world, "WeaponsTemplateBook");
+    if (c->load_failed || (otb && strlen(otb) >= 64) || (wtb && strlen(wtb) >= 64)) {
+        c->load_failed = 1;
+        goto failed;
+    }
     if (otb) snprintf(c->template_books[c->ntemplate_books++], 64, "%s", otb);
     if (wtb) snprintf(c->template_books[c->ntemplate_books++], 64, "%s", wtb);
     snprintf(c->template_books[c->ntemplate_books++], 64, "%s_Props", name);
     snprintf(c->template_books[c->ntemplate_books++], 64, "%s_buildings", name);
     c->model_key = calloc(c->bundle.nentries ? c->bundle.nentries : 1, sizeof *c->model_key);
     if (!c->model_key) {
-        city_close(c);
-        return NULL;
+        c->load_failed = 1;
+        goto failed;
     }
     for (uint32_t i = 0; i < c->bundle.nentries; i++) {
         const BdpEntry *e = &c->bundle.entries[i];
@@ -221,10 +305,21 @@ City *city_open(const Vol *vol, const char *name)
         c->model_key[i][k] = 0;
     }
     return c;
+failed:
+    if (load_failed_out) *load_failed_out = c->load_failed;
+    city_close(c);
+    city_activate(previous);
+    return NULL;
+}
+
+City *city_open(const Vol *vol, const char *name)
+{
+    return city_open_checked(vol, name, NULL);
 }
 
 void city_activate(City *c)
 {
+    active_city = c;
     prb_set_resolver(c ? resolve : NULL, c);
 }
 
@@ -240,6 +335,7 @@ void city_close(City *c)
 {
     if (!c)
         return;
+    if (active_city == c) city_activate(NULL);
     for (int i = 0; i < c->nbooks; i++)
         if (c->books[i].b.file)
             bdp_free(&c->books[i].b);
@@ -250,10 +346,13 @@ void city_close(City *c)
 
 int city_block_index(City *c, const char *name)
 {
+    if (!c || city_load_failed(c)) return -1;
     Group list = group_sub(group_sub(c->world, "BlockData"), "BlockList");
+    if (city_load_failed(c)) return -1;
     Record r[MAX_REC];
     uint32_t n = group_items(list, r, MAX_REC);
     int start = (int)group_num(c->world, "BlockStart", 0), first = -1;
+    if (city_load_failed(c)) return -1;
     for (uint32_t i = 0; i < n && name; i++)
         if (_stricmp(record_str(list, r[i]), name) == 0) {
             if ((int)i >= start)
@@ -266,16 +365,21 @@ int city_block_index(City *c, const char *name)
 
 const char *city_game_block(City *c, int start_block)
 {
+    if (!c || city_load_failed(c)) return NULL;
     Group list = group_sub(group_sub(c->world, "BlockData"), "BlockList");
+    if (city_load_failed(c)) return NULL;
     Record r[MAX_REC];
     uint32_t n = group_items(list, r, MAX_REC);
     int start = (int)group_num(c->world, "BlockStart", 0), i = start_block > start ? start_block : start;
+    if (city_load_failed(c)) return NULL;
     return i >= 0 && (uint32_t)i < n ? record_str(list, r[i]) : NULL;
 }
 
 uint32_t city_blocks(City *c, const char **names, uint32_t max)
 {
+    if (!c || city_load_failed(c)) return 0;
     Group list = group_sub(group_sub(c->world, "BlockData"), "BlockList");
+    if (city_load_failed(c)) return 0;
     Record r[MAX_REC];
     uint32_t n = group_items(list, r, MAX_REC), k = 0;
     for (uint32_t i = 0; i < n && k < max; i++) {
@@ -291,41 +395,73 @@ uint32_t city_blocks(City *c, const char **names, uint32_t max)
 
 /* ---------------------------------------------------------------- the scene */
 
-static uint32_t scene_add_mesh(Scene *s, Mesh m, const Bundle *b)
+/* Never free under a callback. The existing owner outlives Scene, not vice versa.
+ * Query at property-read and callback continuations; main tears down at world exit. */
+int scene_failed(Scene *s)
 {
+    if (!s) return 1;
+    if (city_load_failed(s->owner)) s->construction_failed = 1;
+    return s->construction_failed;
+}
+
+/* Once set, only teardown is permitted: partial constructors remain scene-owned. */
+static int scene_fail(Scene *s)
+{
+    s->construction_failed = 1;
+    return -2;
+}
+
+static void skin_free(Skin *sk)
+{
+    if (!sk) return;
+    if (sk->cloth) cloth_free(sk->cloth);
+    free(sk->particle);
+    free(sk->bones); free(sk->weights); free(sk->pos); free(sk->nrm); free(sk);
+}
+
+static void *scene_vector_grow(void *old, uint32_t *capacity, uint32_t step, size_t size, const char *name);
+
+static int scene_add_mesh(Scene *s, Mesh m, const Bundle *b)
+{
+    if (scene_failed(s)) return -2;
     if (s->nmeshes == s->meshes_cap) {
-        s->meshes_cap = s->meshes_cap ? 2 * s->meshes_cap : 256;
-        s->meshes = realloc(s->meshes, s->meshes_cap * sizeof *s->meshes);
+        uint32_t step = s->meshes_cap ? s->meshes_cap : 256;
+        void *grown = scene_vector_grow(s->meshes, &s->meshes_cap, step, sizeof *s->meshes, "meshes");
+        if (!grown) return scene_fail(s);
+        s->meshes = grown;
     }
     s->meshes[s->nmeshes].mesh = m;
     s->meshes[s->nmeshes].b = b;
     return s->nmeshes++;
 }
 
-static uint32_t scene_mesh_of(Scene *s, uint32_t entry)
+static int scene_mesh_of(Scene *s, uint32_t entry)
 {
+    if (scene_failed(s)) return -2;
     if (s->mesh_of_entry[entry] < 0) {
-        Mesh m;
-        mesh_read(&s->city->entries[entry], &m);
-        s->mesh_of_entry[entry] = (int32_t)scene_add_mesh(s, m, s->city);
+        Mesh m = { 0 };
+        if (mesh_read(&s->city->entries[entry], &m) != 0)
+            return scene_fail(s);
+        int mi = scene_add_mesh(s, m, s->city);
+        if (mi < 0) { mesh_free(&m); return mi; }
+        s->mesh_of_entry[entry] = mi;
     }
-    return (uint32_t)s->mesh_of_entry[entry];
+    return s->mesh_of_entry[entry];
 }
 
-/* The constructors below require every requested entry. Preserve the old vector and its
- * capacity until growth succeeds; failing fast is safer than returning a partial model. */
+/* Growth never consumes the old owner on failure. Callers latch failure before returning. */
 static void *scene_vector_grow(void *old, uint32_t *capacity, uint32_t step, size_t size, const char *name)
 {
     if (!step || step > INT_MAX || *capacity > (uint32_t)INT_MAX - step ||
         (size_t)(*capacity + step) > SIZE_MAX / size) {
         fprintf(stderr, "scene: %s capacity overflow\n", name);
-        abort();
+        return NULL;
     }
     uint32_t next = *capacity + step;
     void *grown = realloc(old, (size_t)next * size);
     if (!grown) {
         fprintf(stderr, "scene: cannot grow %s to %u entries\n", name, (unsigned)next);
-        abort();
+        return NULL;
     }
     *capacity = next;
     return grown;
@@ -333,12 +469,15 @@ static void *scene_vector_grow(void *old, uint32_t *capacity, uint32_t step, siz
 
 static int new_instance(Scene *s, Mat4 base, int vehicle)
 {
+    if (scene_failed(s)) return -2;
     if (s->ninstances == s->instances_cap) {
         uint32_t step = 128;
 #ifndef RAMPAGE_LOW_MEMORY
         step = s->instances_cap ? s->instances_cap : 256;
 #endif
-        s->instances = scene_vector_grow(s->instances, &s->instances_cap, step, sizeof *s->instances, "instances");
+        void *grown = scene_vector_grow(s->instances, &s->instances_cap, step, sizeof *s->instances, "instances");
+        if (!grown) return scene_fail(s);
+        s->instances = grown;
     }
     Instance *in = &s->instances[s->ninstances];
     memset(in, 0, sizeof *in);
@@ -347,21 +486,26 @@ static int new_instance(Scene *s, Mat4 base, int vehicle)
     return (int)s->ninstances++;
 }
 
-static void push_item(Scene *s, uint32_t mesh, int instance, int node, Skin *skin)
+static int push_item(Scene *s, uint32_t mesh, int instance, int node, Skin *skin)
 {
+    if (scene_failed(s)) return -2;
     if (s->nitems == s->items_cap) {
         uint32_t step = 256;
 #ifndef RAMPAGE_LOW_MEMORY
         step = s->items_cap ? s->items_cap : 1024;
 #endif
-        s->items = scene_vector_grow(s->items, &s->items_cap, step, sizeof *s->items, "draw items");
+        void *grown = scene_vector_grow(s->items, &s->items_cap, step, sizeof *s->items, "draw items");
+        if (!grown) return scene_fail(s);
+        s->items = grown;
     }
+    if (mesh >= s->nmeshes || instance < 0 || (uint32_t)instance >= s->ninstances) return scene_fail(s);
     DrawItem *it = &s->items[s->nitems++];
     it->mesh = mesh;
     it->instance = instance;
     it->node = node;
     it->world = s->instances[instance].base;
     it->skin = skin;
+    return 0;
 }
 
 static const BdpEntry *find_entry(const Bundle *b, int type, const char *name)
@@ -389,6 +533,7 @@ static const BdpEntry *find_anim(const Bundle *b, uint32_t kind, const char *nam
  * whose own RawAnim moves (rotors, the fountain) plays it on a loop. Returns the instance, -1 if it has no meshes. */
 static int place_model(City *c, Scene *s, const char *name, Mat4 base, int vehicle)
 {
+    if (scene_failed(s)) return -2;
     char key[64];
     size_t n = 0;
     for (; name && name[n] && n < 63; n++)
@@ -404,18 +549,21 @@ static int place_model(City *c, Scene *s, const char *name, Mat4 base, int vehic
         return -1;
     }
     int id = new_instance(s, base, vehicle);
+    if (id < 0) return id;
     Instance *in = &s->instances[id];
     const BdpEntry *te = find_entry(&c->bundle, ET_TREE, key);
     if (te) {
         const BdpEntry *raw = find_anim(&c->bundle, 1, key);
-        tree_read(&c->bundle, te, raw, &in->tree);
-        if (raw && clip_read(raw, &in->clip) == 0) {
+        if (tree_read(&c->bundle, te, raw, &in->tree) != 0) return scene_fail(s);
+        if (raw) {
+            if (clip_read(raw, &in->clip) != 0) return scene_fail(s);
             if (clip_moves(&in->clip))
                 in->has_clip = 1;
             else
                 clip_free(&in->clip);
         }
         in->node = calloc(in->tree.n ? in->tree.n : 1, sizeof *in->node);
+        if (!in->node) return scene_fail(s);
     }
     for (uint32_t i = 0; i < c->bundle.nentries; i++) {
         if (!c->model_key[i][0] || strcmp(c->model_key[i], key) != 0)
@@ -427,7 +575,8 @@ static int place_model(City *c, Scene *s, const char *name, Mat4 base, int vehic
                 node = (int)k;
                 break;
             }
-        push_item(s, scene_mesh_of(s, i), id, node, NULL);
+        int mi = scene_mesh_of(s, i);
+        if (mi < 0 || push_item(s, (uint32_t)mi, id, node, NULL) != 0) return -2;
     }
     return id;
 }
@@ -465,31 +614,39 @@ static int wii_cloth_parts(const Cloth *cl, const BdpEntry *me, ClothMeshPart **
         return -1;
     int np = (int)wm.nparts;
     ClothMeshPart *cp = calloc((size_t)(np > 0 ? np : 1), sizeof *cp);
-    for (int k = 0; cp && k < np; k++) {
+    if (!cp) { mesh_free(&wm); return -2; }
+    for (int k = 0; k < np; k++) {
         const MeshPart *p = &wm.parts[k];
         cp[k].material = (uint16_t)p->material;
         cp[k].nverts = (int)p->nverts;
         cp[k].particle = malloc(sizeof *cp[k].particle * (p->nverts ? p->nverts : 1));
-        for (uint32_t v = 0; cp[k].particle && v < p->nverts; v++)
+        if (!cp[k].particle) goto failed;
+        for (uint32_t v = 0; v < p->nverts; v++)
             cp[k].particle[v] = cloth_nearest(cl, p->pos + 3 * v);
         if (p->uv) {
             cp[k].uv = malloc(sizeof(float) * 2 * p->nverts + 1);
-            if (cp[k].uv)
-                memcpy(cp[k].uv, p->uv, sizeof(float) * 2 * p->nverts);
+            if (!cp[k].uv) goto failed;
+            memcpy(cp[k].uv, p->uv, sizeof(float) * 2 * p->nverts);
         }
         cp[k].ntris = (int)p->ntris;
         cp[k].tris = malloc(sizeof(uint32_t) * 3 * p->ntris + 4);
-        if (cp[k].tris)
-            memcpy(cp[k].tris, p->tris, sizeof(uint32_t) * 3 * p->ntris);
+        if (!cp[k].tris) goto failed;
+        memcpy(cp[k].tris, p->tris, sizeof(uint32_t) * 3 * p->ntris);
     }
     mesh_free(&wm);
     *out = cp;
-    return cp ? np : -1;
+    return np;
+failed:
+    for (int k = 0; k < np; k++) cloth_mesh_part_free(&cp[k]);
+    free(cp);
+    mesh_free(&wm);
+    return -2;
 }
 
 /* a flag of the model at `place`, in the wind of cb's keys: its instance (its skin in *skin), -1 none */
 static int flag_new(City *c, Scene *s, const char *model, Group cb, Mat4 place, Skin **skin)
 {
+    if (scene_failed(s)) return -2;
     char key[96];
     snprintf(key, sizeof key, "%s|cloth", model);
     const BdpEntry *ce = find_entry(&c->bundle, ET_CLOTH, key), *me = NULL;
@@ -499,45 +656,57 @@ static int flag_new(City *c, Scene *s, const char *model, Group cb, Mat4 place, 
         if (c->bundle.entries[k].type == ET_MESH && !_strnicmp(en, model, ml) && en[ml] == '|')
             me = &c->bundle.entries[k];
     }
-    Cloth *cl = ce ? cloth_new(ce->data, ce->size) : NULL;
-    if (!cl || !me) {
-        if (cl) cloth_free(cl);
-        return -1;
-    }
+    if (!ce || !me) return -1;
+    Cloth *cl = cloth_new(ce->data, ce->size);
+    if (!cl) return scene_fail(s);
     Mesh m = { 0 };
+    Skin *sk = NULL;
     ClothMeshPart *cp = NULL;
     int np = me->wii ? wii_cloth_parts(cl, me, &cp) : cloth_mesh_parts(me->data, me->size), nv = 0;
+    if (me->wii && np < 0) goto failed;
     m.parts = calloc((size_t)(np > 0 ? np : 1), sizeof *m.parts);
     if (!cp)
         cp = calloc((size_t)(np > 0 ? np : 1), sizeof *cp);
+    if (!m.parts || !cp) goto failed;
     for (int k = 0; k < np; k++) {
-        if (me->wii ? !cp[k].nverts : cloth_mesh_part(cl, k, me->data, me->size, me->data2, me->size2, &cp[k]) != 0)
-            continue;
+        int status = me->wii ? (cp[k].nverts ? 0 : -1) :
+            cloth_mesh_part(cl, k, me->data, me->size, me->data2, me->size2, &cp[k]);
+        if (status == -2) goto failed;
+        if (status != 0) continue;
         MeshPart *p = &m.parts[m.nparts++];
         p->material = cp[k].material;
         p->nverts = (uint32_t)cp[k].nverts;
         p->pos = calloc((size_t)cp[k].nverts * 3 + 1, sizeof(float));
         p->nrm = calloc((size_t)cp[k].nverts * 3 + 1, sizeof(float));
+        if (!p->pos || !p->nrm) goto failed;
         if (cp[k].uv) {
             p->uv = malloc(sizeof(float) * 2 * (size_t)cp[k].nverts + 1);
+            if (!p->uv) goto failed;
             memcpy(p->uv, cp[k].uv, sizeof(float) * 2 * (size_t)cp[k].nverts);
         }
         p->ntris = (uint32_t)cp[k].ntris;
         p->tris = malloc(sizeof(uint32_t) * 3 * (size_t)cp[k].ntris + 4);
+        if (!p->tris) goto failed;
         memcpy(p->tris, cp[k].tris, sizeof(uint32_t) * 3 * (size_t)cp[k].ntris);
+        if (cp[k].nverts > INT_MAX - nv) goto failed;
         nv += cp[k].nverts;
     }
     if (!m.nparts) {
         free(m.parts);
+        for (int k = 0; k < np; k++) cloth_mesh_part_free(&cp[k]);
         free(cp);
         cloth_free(cl);
         return -1;
     }
     int id = new_instance(s, place, -1);
+    if (id < 0) goto failed;
     s->instances[id].dynamic = 1;
-    Skin *sk = new_skin(&m);
+    sk = new_skin(&m);
+    if (!sk) goto failed;
     sk->cloth = cl;
+    cl = NULL;
     sk->particle = malloc(sizeof *sk->particle * (size_t)(nv ? nv : 1));
+    if (!sk->particle) goto failed;
     int at = 0;
     for (int k = 0; k < np; k++)
         for (int v = 0; v < cp[k].nverts; v++)
@@ -545,6 +714,7 @@ static int flag_new(City *c, Scene *s, const char *model, Group cb, Mat4 place, 
     for (int k = 0; k < np; k++)
         cloth_mesh_part_free(&cp[k]);
     free(cp);
+    cp = NULL;
     sk->has_wind = 1;
     sk->wind.dir_freq = group_num(cb, "HorizontalWindDirFreq", 1);
     sk->wind.force = group_num(cb, "HorizontalWindForce", 10);
@@ -554,25 +724,40 @@ static int flag_new(City *c, Scene *s, const char *model, Group cb, Mat4 place, 
     sk->wind.vert_freq = group_num(cb, "VerticalWindFreq", 2);
     sk->wind.vert_force = group_num(cb, "VerticalWindForce", 10);
     sk->wind.time_offset = group_num(cb, "TimeOffset", 0);
-    push_item(s, scene_add_mesh(s, m, s->city), id, -1, sk);
+    if (scene_failed(s)) goto failed;
+    int mi = scene_add_mesh(s, m, s->city);
+    if (mi < 0) goto failed;
+    memset(&m, 0, sizeof m);                         /* Scene owns the published mesh. */
+    if (push_item(s, (uint32_t)mi, id, -1, sk) != 0) goto failed;
     if (getenv("RAMPAGE_TRACE"))
         printf("flag %s at %.1f %.1f %.1f\n", model, s->instances[id].base.m[12], s->instances[id].base.m[13],
                s->instances[id].base.m[14]);
     if (skin)
         *skin = sk;
     return id;
+failed:
+    if (cp) for (int k = 0; k < np; k++) cloth_mesh_part_free(&cp[k]);
+    free(cp);
+    if (cl) cloth_free(cl);
+    skin_free(sk);
+    mesh_free(&m);
+    return scene_fail(s);
 }
 
 static void place_flags(City *c, Scene *s, Group t, Mat4 base)
 {
+    if (scene_failed(s)) return;
     Group where;
     Record r[8];
     uint32_t n = group_values(t, "ClothBit|", &where, r, 8);
+    if (scene_failed(s)) return;
     for (uint32_t i = 0; i < n; i++) {
         Group cb = record_group(where, r[i]), ref = template_of(c, group_str(cb, "ClothRef|Name"));
         const char *model = ref.at ? group_str(ref, "Shape|Shape") : NULL;
+        if (scene_failed(s)) return;
         if (model)
             flag_new(c, s, model, cb, mat_mul(base, cloth_offset(cb)), NULL);
+        if (scene_failed(s)) return;
     }
 }
 
@@ -597,18 +782,22 @@ static int rest_node(const Instance *in, int k, float out[3])
  * here with its billboard (streetobj.c is told by parent), so it sways and sinks with the building until it moves */
 static void place_attachments(City *c, Scene *s, Group inst, Group t, int id, int parent, int george)
 {
+    if (scene_failed(s)) return;
     for (int n = 1; n <= (george ? 2 : 5) && s->nstreet < SCENE_STREET_MAX; n++) {
         char key[32];
         float p[3];
         snprintf(key, sizeof key, "OTRef|Attachment%d", n);
         const char *name = group_str(inst, key) ? group_str(inst, key) : group_str(t, key);
+        if (scene_failed(s)) return;
         if (!name || rest_node(&s->instances[id], n, p) != 0)
             break;
         p[1] -= george && n == 2 ? 0.25f : 0.5f;
         Group at = template_of(c, name);
         const char *shape = at.at ? group_str(at, "Shape|Shape") : NULL;
+        if (scene_failed(s)) return;
         Mat4 m = mat_trs_z(p[0], p[1], p[2], 0);
         int a = shape ? place_model(c, s, shape, m, -1) : -1;
+        if (scene_failed(s)) return;
         if (a < 0)
             continue;
         struct SceneStreetObj *so = &s->street[s->nstreet++];
@@ -629,7 +818,9 @@ static void place_attachments(City *c, Scene *s, Group inst, Group t, int id, in
  * `parent` */
 static void place_made(City *c, Scene *s, Group t, int id, int parent, const char *key, float turn, int need_node)
 {
+    if (scene_failed(s)) return;
     const char *name = group_str(t, key);
+    if (scene_failed(s)) return;
     float p[3];
     if (!name || s->nstreet >= SCENE_STREET_MAX)
         return;
@@ -643,6 +834,7 @@ static void place_made(City *c, Scene *s, Group t, int id, int parent, const cha
     const char *shape = at.at ? group_str(at, "Shape|Shape") : NULL;
     Mat4 m = mat_trs_z(p[0], p[1], p[2], turn);
     int a = shape ? place_model(c, s, shape, m, -1) : -1;
+    if (scene_failed(s)) return;
     if (a < 0)
         return;
     struct SceneStreetObj *so = &s->street[s->nstreet++];
@@ -658,11 +850,13 @@ static void place_made(City *c, Scene *s, Group t, int id, int parent, const cha
 
 static void place_object(City *c, Scene *s, Group inst, Mat4 parent)
 {
+    if (scene_failed(s)) return;
     Group t = template_of(c, group_str(inst, "Name"));
     const char *shape = t.at ? group_str(t, "Shape|Shape") : NULL, *script = t.at ? group_str(t, "Script|ScriptName") : NULL;
     float xyz[3];
     location(inst, xyz);
     Mat4 at = mat_mul(parent, mat_trs_z(xyz[0], xyz[1], xyz[2], group_num(inst, "ZRotation", 0)));
+    if (scene_failed(s)) return;
     if ((s->placing_building >= 0 || s->placing_block) && script && !_strnicmp(script, "Rocket.", 7)) {
         if (s->nrockets < 16) {                      /* a roof rocket: vehicle.c makes it, its Base and BasePipe */
             int on = s->placing_building;            /* one of the block's own (HK01's two): the building it stands
@@ -677,6 +871,7 @@ static void place_object(City *c, Scene *s, Group inst, Mat4 parent)
             for (int k = 0; k < 3; k++)
                 s->rockets[s->nrockets].pos[k] = at.m[12 + k];
             s->rockets[s->nrockets].facing = group_num(inst, "ZRotation", 0) / 57.2957795f;
+            if (scene_failed(s)) return;
             s->rockets[s->nrockets++].building = on;
         }
         return;
@@ -686,11 +881,14 @@ static void place_object(City *c, Scene *s, Group inst, Mat4 parent)
         const char *fx = group_str(inst, "Effect|Effect");   /* getStringProp("Effect"): the instance's */
         if (!fx && t.at)
             fx = group_str(t, "Effect|Effect");
+        if (scene_failed(s)) return;
         if (fx && s->nweather < 4)
             s->weather[s->nweather++] = fx;
         return;
     }
-    if (t.at && boss_is_boss_template(t))           /* a boss's part (the NY generators): boss.c's */
+    int is_boss = t.at && boss_is_boss_template(t);
+    if (scene_failed(s)) return;
+    if (is_boss)           /* a boss's part (the NY generators): boss.c's */
         return;
     if (s->placing_block && parade_script_ours(script))   /* a balloon or a food cart: parade.c's (main) */
         return;
@@ -715,14 +913,17 @@ static void place_object(City *c, Scene *s, Group inst, Mat4 parent)
                     !_stricmp(shape, "InvisShape");
     int missing = s->missing;
     int id = place_model(c, s, shape, at, -1);
+    if (scene_failed(s)) return;
     if (invisible)
         s->missing = missing;
     if (id >= 0 && t.at)
         s->instances[id].shadow = group_sub(t, "ShadowData");
+    if (scene_failed(s)) return;
     if (scripted >= 0)
         s->scripted[scripted].instance = id;
     if (id >= 0)
         place_flags(c, s, t, at);
+    if (scene_failed(s)) return;
     if (id >= 0 && s->placing_block && s->placing_attack && script && !_stricmp(script, "StationaryAttackObject.bsf") &&
         s->narmy_obj < 4) {                          /* army.c's unit (0x304450 -> 0x315330): drawn by army_sync */
         int k = s->narmy_obj++;
@@ -756,6 +957,7 @@ static void place_object(City *c, Scene *s, Group inst, Mat4 parent)
         memcpy(so->world, at.m, sizeof so->world);
         if (billboard)
             place_attachments(c, s, inst, t, id, s->nstreet - 1, !_stricmp(script, "Billboard_George.bsf"));
+        if (scene_failed(s)) return;
         if (crane && id >= 0) {                      /* its nodes 1 and 2 in its own frame: the cargo's track */
             for (int n = 1; n <= 2 && rest_node(&s->instances[id], n, so->node[n - 1]) == 0; n++) {
                 float d[3] = { so->node[n - 1][0] - at.m[12], so->node[n - 1][1] - at.m[13], so->node[n - 1][2] - at.m[14] };
@@ -766,12 +968,17 @@ static void place_object(City *c, Scene *s, Group inst, Mat4 parent)
         }
         if (tower && id >= 0)
             place_made(c, s, t, id, s->nstreet - 1, "OTRef|Attachment", 0, 0);
+        if (scene_failed(s)) return;
         if (crane && id >= 0)
             place_made(c, s, t, id, s->nstreet - 1, "OTRef|Attatchment", 180 * group_num(t, "CargoZRotOffset", 0), 1);
+        if (scene_failed(s)) return;
     }
     const char *flags = group_str(t, "Flags");
+    if (scene_failed(s)) return;
     if (id >= 0 && flags && strstr(flags, "IsObstacle")) {   /* 0x335ED0: IsObstacle sets object flag 0x40000 */
-        s->obstacle_of = realloc(s->obstacle_of, sizeof *s->obstacle_of * (s->nobstacles + 1));
+        int *grown = realloc(s->obstacle_of, sizeof *s->obstacle_of * ((size_t)s->nobstacles + 1));
+        if (!grown) { scene_fail(s); return; }
+        s->obstacle_of = grown;
         s->obstacle_of[s->nobstacles++] = id;
     }
 }
@@ -779,8 +986,11 @@ static void place_object(City *c, Scene *s, Group inst, Mat4 parent)
 /* the obstacles' boxes: their models' bounds, placed (once the scene is posed) */
 static void obstacle_boxes(Scene *s)
 {
+    if (scene_failed(s)) return;
+    float (*boxes)[6] = calloc(s->nobstacles ? s->nobstacles : 1, sizeof *s->obstacles);
+    if (!boxes) { scene_fail(s); return; }
     free(s->obstacles);
-    s->obstacles = calloc(s->nobstacles ? s->nobstacles : 1, sizeof *s->obstacles);
+    s->obstacles = boxes;
     for (uint32_t o = 0; o < s->nobstacles; o++) {
         float *box = s->obstacles[o];
         box[0] = box[1] = box[2] = 1e30f;
@@ -852,6 +1062,7 @@ void scene_street_place(Scene *s, int k, const float world[16], int hidden)
 
 int scene_street_shape(Scene *s, int k, const char *shape)
 {
+    if (scene_failed(s)) return -2;
     if (k < 0 || k >= s->nstreet || !s->owner || !shape)
         return -1;
     struct SceneStreetObj *so = &s->street[k];
@@ -860,6 +1071,7 @@ int scene_street_shape(Scene *s, int k, const char *shape)
     Mat4 at = s->instances[so->model].base;
     int missing = s->missing;
     int id = place_model(s->owner, s, shape, at, -1);
+    if (scene_failed(s)) return -2;
     s->missing = missing;
     if (id < 0)
         return -1;
@@ -980,6 +1192,7 @@ int city_shape_sphere(City *c, const char *shape, float centre[3], float *radius
     return 0;
 }
 
+static int people_city_failed(void *ctx) { return city_load_failed(ctx); }
 static Group people_template(void *ctx, const char *name) { return template_of(ctx, name); }
 Group city_template(City *c, const char *name) { return template_of(c, name); }
 static float people_clip_seconds(void *ctx, const char *anim, const char *shape);
@@ -987,6 +1200,7 @@ float city_clip_seconds(City *c, const char *anim, const char *shape) { return p
 
 int scene_huts_hit(Scene *s, const float centre[3], float radius, Group *hit, int max)
 {
+    if (scene_failed(s)) return 0;
     int n = 0;
     for (int k = 0; k < s->nscripted && s->folk; k++) {
         if (!s->scripted[k].hut || s->scripted[k].hut_id < 0 || people_hut_state(s->folk, s->scripted[k].hut_id) != 0)
@@ -995,6 +1209,7 @@ int scene_huts_hit(Scene *s, const float centre[3], float radius, Group *hit, in
         /* [R 0x2E22B0 -> 0x280470] the monster's sphere against the hut's shape (0x28FD70: no CollisionBox,
          * CollisionRadius or AutoCollisionBox, so the guardshack's own sphere, 0x184CB0) where it stands */
         const char *shape = s->scripted[k].t.at ? group_str(s->scripted[k].t, "Shape|Shape") : NULL;
+        if (scene_failed(s)) return 0;
         float c[3] = { 0, 0, 2 }, r = 2;
         if (!shape || !s->owner || city_shape_sphere(s->owner, shape, c, &r) != 0)
             c[2] = 2, r = 2;
@@ -1016,6 +1231,7 @@ int scene_huts_hit(Scene *s, const float centre[3], float radius, Group *hit, in
         if (depth * depth < 1e-6f)
             dir[0] = 1, dir[1] = dir[2] = 0;
         PeopleEaten e = people_hut_hit(s->folk, s->scripted[k].hut_id, dir, s->scripted[k].vel);
+        if (scene_failed(s)) return 0;
         if (getenv("RAMPAGE_TRACE"))
             printf("  a guard's hut hit: %.0f points, flying at %.1f %.1f\n", e.points, s->scripted[k].vel[0],
                    s->scripted[k].vel[1]);
@@ -1027,6 +1243,7 @@ int scene_huts_hit(Scene *s, const float centre[3], float radius, Group *hit, in
 
 void scene_huts_update(Scene *s, float dt)
 {
+    if (scene_failed(s)) return;
     for (int k = 0; k < s->nscripted && s->folk; k++) {
         int id = s->scripted[k].instance, st;
         if (!s->scripted[k].hut || id < 0 || s->scripted[k].hut_id < 0)
@@ -1041,12 +1258,15 @@ void scene_huts_update(Scene *s, float dt)
             Group t = s->scripted[k].t;
             if (!s->scripted[k].cm_on) {
                 const char *shape = t.at ? group_str(t, "Shape|Shape") : NULL;
+                if (scene_failed(s)) return;
                 float c[3], r = 1;
                 if (!shape || !s->owner || city_shape_sphere(s->owner, shape, c, &r) != 0 || r < 0.05f)
                     r = 1;
-                collide_mover_init(&s->scripted[k].cm, r, group_num(t, "Gravity", 9.81f), group_num(t, "Mass", 1),
-                                   group_num(t, "Restitution", 0.8f), group_num(t, "SlidingFriction", 0.4f),
-                                   group_num(t, "InertiaSolidity", 1));
+                float gravity = group_num(t, "Gravity", 9.81f), mass = group_num(t, "Mass", 1);
+                float restitution = group_num(t, "Restitution", 0.8f), friction = group_num(t, "SlidingFriction", 0.4f);
+                float inertia = group_num(t, "InertiaSolidity", 1);
+                if (scene_failed(s)) return;
+                collide_mover_init(&s->scripted[k].cm, r, gravity, mass, restitution, friction, inertia);
                 memcpy(s->scripted[k].cm.vel, s->scripted[k].vel, sizeof s->scripted[k].vel);
                 collide_matrix_from16(s->scripted[k].cm_m, s->instances[id].base.m);
                 s->scripted[k].cm_on = 1;
@@ -1072,6 +1292,7 @@ void scene_huts_update(Scene *s, float dt)
 
 void scene_huts_collide_add(Scene *s, CollideWorld *w)
 {
+    if (scene_failed(s)) return;
     s->hut_cw = w;
     for (int k = 0; k < s->nscripted; k++) {
         int id = s->scripted[k].instance;
@@ -1079,6 +1300,7 @@ void scene_huts_collide_add(Scene *s, CollideWorld *w)
         if (!w || !s->scripted[k].hut || id < 0 || s->instances[id].hidden || !s->owner)
             continue;
         const char *shape = s->scripted[k].t.at ? group_str(s->scripted[k].t, "Shape|Shape") : NULL;
+        if (scene_failed(s)) return;
         float c[3], r;
         if (!shape || city_shape_sphere(s->owner, shape, c, &r) != 0)
             continue;
@@ -1095,6 +1317,7 @@ void scene_huts_collide_add(Scene *s, CollideWorld *w)
 static float people_clip_seconds(void *ctx, const char *anim, const char *shape)
 {
     City *c = ctx;
+    if (city_load_failed(c)) return 0;
     const BdpEntry *ce = anim ? find_anim(&c->bundle, 2, anim) : NULL;
     if (!ce && shape)
         ce = find_anim(&c->bundle, 1, shape);        /* the shape's own RawAnim */
@@ -1110,6 +1333,7 @@ static float people_clip_seconds(void *ctx, const char *anim, const char *shape)
  * its clip, as place_actor did; -1 none */
 static int person_look(City *c, Scene *s, int who, const Person *p)
 {
+    if (scene_failed(s)) return -2;
     for (int i = 0; i < s->nlooks; i++)
         if (s->looks[i].who == who && strcmp(s->looks[i].anim, p->anim) == 0)
             return s->looks[i].inst;
@@ -1121,17 +1345,21 @@ static int person_look(City *c, Scene *s, int who, const Person *p)
     const char *shape = look.at ? group_str(look, "Shape|ShapeName") : NULL;
     if (!shape) shape = group_str(p->tmpl, "Shape|ShapeName");
     if (!shape) shape = group_str(p->tmpl, "Shape|Shape");
+    if (scene_failed(s)) return -2;
     if (!shape && ce)
         shape = bdp_name(&c->bundle, rd16(ce->data + 0x28));
     int missing = s->missing;
     int id = shape ? place_model(c, s, shape, mat_identity(), -1) : -1;
+    if (scene_failed(s)) return -2;
     s->missing = missing;
     if (id >= 0) {
         Instance *in = &s->instances[id];
         in->dynamic = 1;
-        in->shadow = group_sub(p->tmpl, "ShadowData");   /* DefActorProps': shadow_blob */
+        in->shadow = group_sub(p->tmpl, "ShadowData");
+        if (scene_failed(s)) return -2;   /* DefActorProps': shadow_blob */
         Clip clip;
-        if (ce && clip_read(ce, &clip) == 0) {
+        if (ce) {
+            if (clip_read(ce, &clip) != 0) return scene_fail(s);
             if (clip.bones == in->tree.n) {
                 if (in->has_clip)
                     clip_free(&in->clip);
@@ -1142,7 +1370,10 @@ static int person_look(City *c, Scene *s, int who, const Person *p)
             }
         }
     }
-    s->looks = realloc(s->looks, sizeof *s->looks * (size_t)(s->nlooks + 1));
+    if (s->nlooks == INT_MAX || (size_t)s->nlooks + 1 > SIZE_MAX / sizeof *s->looks) return scene_fail(s);
+    void *grown = realloc(s->looks, sizeof *s->looks * ((size_t)s->nlooks + 1));
+    if (!grown) return scene_fail(s);
+    s->looks = grown;
     struct PersonLook *l = &s->looks[s->nlooks++];
     l->who = who;
     snprintf(l->anim, sizeof l->anim, "%s", p->anim);
@@ -1153,6 +1384,7 @@ static int person_look(City *c, Scene *s, int who, const Person *p)
 /* an army unit's look: its shape, its clip (NULL: the shape's own RawAnim, which place_model takes), keyed by both */
 static int unit_look(City *c, Scene *s, int who, const ArmyUnit *u)
 {
+    if (scene_failed(s)) return -2;
     char key[96];                                    /* in full: cut short, Police_US_Window_Emerge with its Look
                                                       * clip and Police_US_Window_Firing_D with Firing_DL were one */
     snprintf(key, sizeof key, "%.47s|%.47s", u->shape ? u->shape : "-", u->clip ? u->clip : "");
@@ -1161,15 +1393,18 @@ static int unit_look(City *c, Scene *s, int who, const ArmyUnit *u)
             return s->looks[i].inst;
     int missing = s->missing;
     int id = u->shape ? place_model(c, s, u->shape, mat_identity(), -1) : -1;
+    if (scene_failed(s)) return -2;
     s->missing = missing;
     if (id >= 0) {
         Instance *in = &s->instances[id];
         in->dynamic = 1;
         if (u->tmpl.at)
             in->shadow = group_sub(u->tmpl, "ShadowData");
+        if (scene_failed(s)) return -2;
         const BdpEntry *ce = u->clip ? find_anim(&c->bundle, 2, u->clip) : NULL;
         Clip clip;
-        if (ce && clip_read(ce, &clip) == 0) {
+        if (ce) {
+            if (clip_read(ce, &clip) != 0) return scene_fail(s);
             if (clip.bones == in->tree.n) {
                 if (in->has_clip)
                     clip_free(&in->clip);
@@ -1180,7 +1415,10 @@ static int unit_look(City *c, Scene *s, int who, const ArmyUnit *u)
             }
         }
     }
-    s->looks = realloc(s->looks, sizeof *s->looks * (size_t)(s->nlooks + 1));
+    if (s->nlooks == INT_MAX || (size_t)s->nlooks + 1 > SIZE_MAX / sizeof *s->looks) return scene_fail(s);
+    void *grown = realloc(s->looks, sizeof *s->looks * ((size_t)s->nlooks + 1));
+    if (!grown) return scene_fail(s);
+    s->looks = grown;
     struct PersonLook *l = &s->looks[s->nlooks++];
     l->who = who;
     snprintf(l->anim, sizeof l->anim, "%s", key);
@@ -1255,15 +1493,20 @@ static void instance_turns(Instance *in, const ArmyWeapon *w, int nw)
 /* a vehicle's look (vehicle.c): its shape now (the DamageShape once hit), keyed by the object and the shape */
 static int vehicle_look(City *c, Scene *s, int who, const char *shape)
 {
+    if (scene_failed(s)) return -2;
     for (int i = 0; i < s->nlooks; i++)
         if (s->looks[i].who == who && strcmp(s->looks[i].anim, shape) == 0)
             return s->looks[i].inst;
     int missing = s->missing;
     int id = place_model(c, s, shape, mat_identity(), -1);
+    if (scene_failed(s)) return -2;
     s->missing = missing;
     if (id >= 0)
         s->instances[id].dynamic = 1;
-    s->looks = realloc(s->looks, sizeof *s->looks * (size_t)(s->nlooks + 1));
+    if (s->nlooks == INT_MAX || (size_t)s->nlooks + 1 > SIZE_MAX / sizeof *s->looks) return scene_fail(s);
+    void *grown = realloc(s->looks, sizeof *s->looks * ((size_t)s->nlooks + 1));
+    if (!grown) return scene_fail(s);
+    s->looks = grown;
     struct PersonLook *l = &s->looks[s->nlooks++];
     l->who = who;
     snprintf(l->anim, sizeof l->anim, "%s", shape);
@@ -1274,12 +1517,14 @@ static int vehicle_look(City *c, Scene *s, int who, const char *shape)
 /* each frame: every revealed edible at its matrix (looks keyed from 3 << 20); an InvisShape one is its effect alone */
 static void edible_sync(Scene *s)
 {
+    if (scene_failed(s)) return;
     if (!s->edibles || !s->owner)
         return;
     for (int i = 0, n = edible_count(s->edibles); i < n; i++) {
         const Edible *e = edible_get(s->edibles, i);
         int who = (3 << 20) + i;
         int show = e->phase != EP_GONE && e->shape ? vehicle_look(s->owner, s, who, e->shape) : -1;
+        if (scene_failed(s)) return;
         for (int k = 0; k < s->nlooks; k++)
             if (s->looks[k].who == who && s->looks[k].inst >= 0 && s->looks[k].inst != show)
                 s->instances[s->looks[k].inst].hidden = 1;
@@ -1302,6 +1547,7 @@ static void looks_past_end(Scene *s, int base, int n)
 /* each frame: every boss part at its matrix x RenderScale, an actor's clip at its time (looks keyed from 4 << 20) */
 static void boss_sync(Scene *s, double t)
 {
+    if (scene_failed(s)) return;
     if (!s->boss || !s->owner)
         return;
     looks_past_end(s, 4 << 20, boss_count(s->boss));
@@ -1315,6 +1561,7 @@ static void boss_sync(Scene *s, double t)
             look.shape = p->shape;
             look.clip = p->clip;
             show = unit_look(s->owner, s, who, &look);
+            if (scene_failed(s)) return;
         }
         for (int k = 0; k < s->nlooks; k++)
             if (s->looks[k].who == who && s->looks[k].inst >= 0 && s->looks[k].inst != show)
@@ -1339,6 +1586,7 @@ static void boss_sync(Scene *s, double t)
  * keyed from 5 << 20) */
 static void parade_sync(Scene *s, double t)
 {
+    if (scene_failed(s)) return;
     if (!s->parade || !s->owner)
         return;
     for (int i = 0, n = parade_count(s->parade); i < n; i++) {
@@ -1351,6 +1599,7 @@ static void parade_sync(Scene *s, double t)
             look.clip = o->clip;
             look.tmpl = o->tmpl;
             show = unit_look(s->owner, s, who, &look);
+            if (scene_failed(s)) return;
         }
         for (int k = 0; k < s->nlooks; k++)
             if (s->looks[k].who == who && s->looks[k].inst >= 0 && s->looks[k].inst != show)
@@ -1371,12 +1620,14 @@ static void parade_sync(Scene *s, double t)
 /* each frame: every vehicle at its matrix (looks keyed from 2 << 20) */
 static void vehicle_sync(Scene *s)
 {
+    if (scene_failed(s)) return;
     if (!s->traffic || !s->owner)
         return;
     for (int i = 0, n = vehicle_count(s->traffic); i < n; i++) {
         const VehObj *o = vehicle_obj(s->traffic, i);
         int who = (2 << 20) + i;
         int show = o->phase != VP_GONE && !o->hidden && o->shape ? vehicle_look(s->owner, s, who, o->shape) : -1;
+        if (scene_failed(s)) return;
         for (int k = 0; k < s->nlooks; k++)
             if (s->looks[k].who == who && s->looks[k].inst >= 0 && s->looks[k].inst != show)
                 s->instances[s->looks[k].inst].hidden = 1;
@@ -1386,6 +1637,7 @@ static void vehicle_sync(Scene *s)
             instance_turns(&s->instances[show], &o->tc, o->kind == VK_FIRETRUCK);   /* the fire truck's cannon */
             if (o->tmpl.at && !s->instances[show].shadow.at)
                 s->instances[show].shadow = group_sub(o->tmpl, "ShadowData");
+            if (scene_failed(s)) return;
         }
     }
 }
@@ -1397,17 +1649,20 @@ static void vehicle_sync(Scene *s)
  * carried with it; keyed by the object's uid (a slot is reused by the next freighter) */
 static void rail_flags(Scene *s, const RailObj *o, int show)
 {
+    if (scene_failed(s)) return;
     int k = 0;
     while (k < s->nrail_flag && s->rail_flag[k].uid != o->uid)
         k++;
     if (k == s->nrail_flag) {
         Group where;
         Record r1[1];
-        if (!show || !o->tmpl.at || s->nrail_flag >= 16 || !group_values(o->tmpl, "ClothBit|", &where, r1, 1))
-            return;
+        if (!show || !o->tmpl.at || s->nrail_flag >= 16) return;
+        uint32_t nflags = group_values(o->tmpl, "ClothBit|", &where, r1, 1);
+        if (scene_failed(s) || !nflags) return;
         s->rail_flag[k].uid = o->uid;
         s->rail_flag[k].first = (int)s->ninstances;
         place_flags(s->owner, s, o->tmpl, mat_identity());
+        if (scene_failed(s)) return;
         s->rail_flag[k].last = (int)s->ninstances;
         for (int i = s->rail_flag[k].first; i < s->rail_flag[k].last && i - s->rail_flag[k].first < 4; i++)
             s->rail_flag[k].rel[i - s->rail_flag[k].first] = s->instances[i].base;
@@ -1429,12 +1684,14 @@ static void rail_flags(Scene *s, const RailObj *o, int show)
 /* each frame: every rail object at its matrix (looks keyed from 6 << 20), its flags with it */
 static void rail_sync(Scene *s)
 {
+    if (scene_failed(s)) return;
     for (int k = 0; k < s->nrail_flag; k++)
         s->rail_flag[k].seen = 0;
     for (int i = 0, n = s->rail && s->owner ? rail_count(s->rail) : 0; i < n; i++) {
         const RailObj *o = rail_obj(s->rail, i);
         int who = (6 << 20) + i;
         int show = o->phase != RP_GONE && !o->hidden && o->shape ? vehicle_look(s->owner, s, who, o->shape) : -1;
+        if (scene_failed(s)) return;
         for (int k = 0; k < s->nlooks; k++)
             if (s->looks[k].who == who && s->looks[k].inst >= 0 && s->looks[k].inst != show)
                 s->instances[s->looks[k].inst].hidden = 1;
@@ -1443,9 +1700,11 @@ static void rail_sync(Scene *s)
             rail_draw_world(s->rail, i, s->instances[show].base.m);   /* between its steps */
             if (o->tmpl.at && !s->instances[show].shadow.at)
                 s->instances[show].shadow = group_sub(o->tmpl, "ShadowData");
+            if (scene_failed(s)) return;
         }
         if (o->phase != RP_GONE)
             rail_flags(s, o, show >= 0);
+        if (scene_failed(s)) return;
     }
     for (int k = 0; k < s->nrail_flag; k++)          /* an object gone (or the block's rail with it): its flags too */
         if (!s->rail_flag[k].seen)
@@ -1461,9 +1720,11 @@ static void rail_sync(Scene *s)
 static void pose_instance(Scene *s, Instance *in, double t);
 int scene_unit_node_now(Scene *s, int unit, const ArmyUnit *u, const char *node, float out[16])
 {
+    if (scene_failed(s)) return -2;
     if (!s->army || !s->owner || !u || u->phase == AU_GONE || !node)
         return -1;
     int show = unit_look(s->owner, s, (1 << 20) + unit, u);
+    if (scene_failed(s)) return -2;
     if (show < 0)
         return -1;
     Instance *in = &s->instances[show];
@@ -1474,6 +1735,7 @@ int scene_unit_node_now(Scene *s, int unit, const ArmyUnit *u, const char *node,
     if (!in->tree.n || !in->node)
         return -1;
     pose_instance(s, in, 0);
+    if (scene_failed(s)) return -2;
     for (uint32_t k = 0; k < in->tree.n; k++)
         if (ends_with(in->tree.nodes[k].name, node)) {
             Mat4 w = mat_mul(in->base, in->node[k]);
@@ -1486,6 +1748,7 @@ int scene_unit_node_now(Scene *s, int unit, const ArmyUnit *u, const char *node,
 /* each frame: every army unit at its place, its clip at anim_time / anim_len of the clip (looks keyed from 1 << 20) */
 static void army_sync(Scene *s, double t)
 {
+    if (scene_failed(s)) return;
     if (!s->army || !s->owner)
         return;
     looks_past_end(s, 1 << 20, army_count(s->army));   /* an eaten soldier the last of them: not left hanging */
@@ -1493,6 +1756,7 @@ static void army_sync(Scene *s, double t)
         const ArmyUnit *u = army_unit(s->army, i);
         int who = (1 << 20) + i;
         int show = u->phase != AU_GONE ? unit_look(s->owner, s, who, u) : -1;
+        if (scene_failed(s)) return;
         for (int k = 0; k < s->nlooks; k++)
             if (s->looks[k].who == who && s->looks[k].inst >= 0 && s->looks[k].inst != show)
                 s->instances[s->looks[k].inst].hidden = 1;
@@ -1504,6 +1768,7 @@ static void army_sync(Scene *s, double t)
         /* the template's RenderScale, a WorldObject property (the name table 0x3F3CD0, with Shape, MajorAxis and
          * HoldOffset) [R]: the soldiers', cops' and SWATs' 0.65 from DefActorProps, as the people's */
         float rs = u->tmpl.at ? group_num(u->tmpl, "RenderScale", 1) : 1;
+        if (scene_failed(s)) return;
         for (int k = 0; k < 12; k++)
             if ((k & 3) != 3)
                 in->base.m[k] *= rs;
@@ -1544,12 +1809,14 @@ static void army_sync(Scene *s, double t)
  * anim_time / anim_len of the clip; the other looks hidden */
 static void people_sync(Scene *s, double t)
 {
+    if (scene_failed(s)) return;
     if (!s->folk || !s->owner)
         return;
     int n = people_count(s->folk);
     for (int who = 0; who < n; who++) {
         const Person *p = people_get(s->folk, who);
         int show = p->phase != PP_GONE ? person_look(s->owner, s, who, p) : -1;
+        if (scene_failed(s)) return;
         for (int i = 0; i < s->nlooks; i++)
             if (s->looks[i].who == who && s->looks[i].inst >= 0 && s->looks[i].inst != show)
                 s->instances[s->looks[i].inst].hidden = 1;
@@ -1558,6 +1825,7 @@ static void people_sync(Scene *s, double t)
         Instance *in = &s->instances[show];
         in->hidden = 0;
         float rs = group_num(p->tmpl, "RenderScale", 1);
+        if (scene_failed(s)) return;
         Mat4 m;
         memcpy(m.m, p->world, sizeof m.m);
         for (int k = 0; k < 12; k++)
@@ -1619,6 +1887,7 @@ int scene_window_soldier(const Scene *s, int building, int storey, int column)
 
 void scene_window_soldier_take(Scene *s, int unit)
 {
+    if (scene_failed(s)) return;
     for (int i = 0; unit >= 0 && i < s->nslots; i++)
         if (s->slots[i].military && s->slots[i].unit == unit && slot_soldier(s, &s->slots[i]) >= 0) {
             s->slots[i].retired = 1;
@@ -1635,6 +1904,7 @@ void scene_window_soldier_take(Scene *s, int unit)
  * none, does not */
 static void scene_cell_broken(Scene *s, int building, int o, int col, int state)
 {
+    if (scene_failed(s)) return;
     for (int i = 0; i < s->nslots; i++) {
         struct WindowSlot *ws = &s->slots[i];
         if (ws->building != building || ws->storey != o || ws->column != col)
@@ -1660,18 +1930,22 @@ static void scene_cell_broken(Scene *s, int building, int o, int col, int state)
             continue;
         ws->retired = 1;
         people_window_fall(s->folk, who);
+        if (scene_failed(s)) return;
     }
 }
 
 static void order_add(Scene *s, int slot)            /* 0x3195E0: one more at the list's end */
 {
-    s->order = realloc(s->order, sizeof *s->order * (size_t)(s->norder + 1));
+    if (scene_failed(s)) return;
+    int *grown = realloc(s->order, sizeof *s->order * ((size_t)s->norder + 1));
+    if (!grown) { scene_fail(s); return; }
+    s->order = grown;
     s->order[s->norder++] = slot;
 }
 
 void scene_occupant_pad(Scene *s, int n)
 {
-    while (n-- > 0)
+    while (!scene_failed(s) && n-- > 0)
         order_add(s, -1);
 }
 
@@ -1689,7 +1963,7 @@ void scene_occupant_pad(Scene *s, int n)
  * never makes them; here they would be left out.) */
 void scene_occupant_slots(Scene *s, int bi)
 {
-    if (!s->occ_setup || bi < 0 || (uint32_t)bi >= s->nbuildings)
+    if (scene_failed(s) || !s->occ_setup || bi < 0 || (uint32_t)bi >= s->nbuildings)
         return;
     const SceneBuilding *sb = &s->buildings[bi];
     int win[512][3], n = 0;
@@ -1717,6 +1991,7 @@ void scene_occupant_slots(Scene *s, int bi)
     int military = total - (int)((float)total * s->nonmilitary_rate);
     float civ = group_num(sb->props, "NumNonMilitaryOccupants", -1);
     float mil = group_num(sb->props, "NumMilitaryOccupants", -1);
+    if (scene_failed(s)) return;
     if (civ >= 0) {
         int c = (int)civ < n ? (int)civ : n;
         military = n - c;
@@ -1735,9 +2010,12 @@ void scene_occupant_slots(Scene *s, int bi)
         if (!kinds)
             continue;
         int q = (int)(wrand_lf() % (uint32_t)kinds);
-        s->slots = realloc(s->slots, sizeof *s->slots * (size_t)(s->nslots + 1));
+        struct WindowSlot *grown = realloc(s->slots, sizeof *s->slots * ((size_t)s->nslots + 1));
+        if (!grown) { scene_fail(s); return; }
+        s->slots = grown;
         struct WindowSlot ws = { bi, win[k][0], win[k][1], q, is_mil, -1, win[k][2], 0, 0, 0, -1 };
         order_add(s, s->nslots);
+        if (scene_failed(s)) return;
         s->slots[s->nslots++] = ws;
     }
 }
@@ -1764,6 +2042,7 @@ static int order_before(const Scene *s, int a, int b)
 
 void scene_occupant_sort(Scene *s)
 {
+    if (scene_failed(s)) return;
     for (int i = 1; i < s->norder; i++) {
         int x = s->order[i], j = i;
         for (; j > 0 && order_before(s, x, s->order[j - 1]); j--)
@@ -1774,12 +2053,14 @@ void scene_occupant_sort(Scene *s)
 
 void scene_people_spawn(Scene *s, float dt)
 {
-    if (!s->folk || (!s->noccupants && !s->nmilitary))
+    if (scene_failed(s) || !s->folk || (!s->noccupants && !s->nmilitary))
         return;
     if (!s->slots_made) {                            /* (a host that made none with the edibles) */
         s->slots_made = 1;
-        for (uint32_t bi = 0; bi < s->nbuildings; bi++)
+        for (uint32_t bi = 0; bi < s->nbuildings; bi++) {
             scene_occupant_slots(s, (int)bi);
+            if (scene_failed(s)) return;
+        }
         scene_occupant_sort(s);
         if (getenv("RAMPAGE_TRACE")) {
             int nm = 0;
@@ -1852,6 +2133,7 @@ void scene_people_spawn(Scene *s, float dt)
             float bottom, height;
             building_storey(b, ls, &bottom, &height);
             ws->unit = army_spawn_window(s->army, s->military[ws->occupant], at);
+            if (scene_failed(s)) return;
             ws->win_x = at[0];
             ws->win_floor = b->min[2] + bottom;      /* its storey's floor now */
             if (getenv("RAMPAGE_TRACE"))
@@ -1859,9 +2141,11 @@ void scene_people_spawn(Scene *s, float dt)
         }
         else {
             int who = people_add_window(s->folk, s->occupant[ws->occupant], at, ws->building, ws->storey, ws->column);
+            if (scene_failed(s)) return;
             float bottom, height;
             building_storey(b, ls, &bottom, &height);
-            people_window_move(s->folk, who, b->min[2] + bottom, 0);   /* its storey's floor now */
+            people_window_move(s->folk, who, b->min[2] + bottom, 0);
+            if (scene_failed(s)) return;   /* its storey's floor now */
             if (getenv("RAMPAGE_TRACE"))
                 printf("  a window occupant of kind %d at %.1f %.1f %.1f (person %d)\n", ws->occupant, at[0], at[1],
                        at[2], who);
@@ -1874,6 +2158,7 @@ void scene_people_spawn(Scene *s, float dt)
 
 int scene_window_close(Scene *s, int building, int storey, int column)
 {
+    if (scene_failed(s)) return 0;
     if (building < 0 || (uint32_t)building >= s->nbuildings)
         return 0;
     Building *b = &s->buildings[building].b;
@@ -1890,6 +2175,7 @@ int scene_window_close(Scene *s, int building, int storey, int column)
 
 int scene_window_close_at(Scene *s, const float pos[3])
 {
+    if (scene_failed(s)) return 0;
     for (uint32_t i = 0; i < s->nbuildings; i++) {   /* the building whose front the point is on */
         const Building *b = &s->buildings[i].b;
         if (pos[0] < b->min[0] || pos[0] >= b->max[0] || fabsf(pos[1] - b->min[1]) > 2.5f)
@@ -1929,13 +2215,14 @@ static void traffic(Scene *s, Group block, float y0)
 
 /* the generated upper storeys: one quad per facade cell, its tile out of the 4 x 4 sheet. No normals: the game lights
  * the facade itself, a colour per grid vertex (building_light_grid), and draws it with that (light_facade) */
-static Mesh facade(uint32_t sheet, int width, int depth, const float *z, Record (*tiles)[64], const uint32_t *ntiles,
-                   int nstoreys)
+static int facade(uint32_t sheet, int width, int depth, const float *z, Record (*tiles)[64], const uint32_t *ntiles,
+                   int nstoreys, Mesh *out)
 {
     Mesh m = { 0 };
     int cells = width + 2 * depth;
     uint32_t nq = (uint32_t)(cells * nstoreys);
     m.parts = calloc(1, sizeof *m.parts);
+    if (!m.parts) return -1;
     m.nparts = 1;
     MeshPart *p = m.parts;
     p->material = sheet;
@@ -1943,6 +2230,7 @@ static Mesh facade(uint32_t sheet, int width, int depth, const float *z, Record 
     p->col = malloc(sizeof(float) * 16 * (nq ? nq : 1));
     p->uv = malloc(sizeof(float) * 8 * (nq ? nq : 1));
     p->tris = malloc(sizeof(uint32_t) * 6 * (nq ? nq : 1));
+    if (!p->pos || !p->col || !p->uv || !p->tris) { mesh_free(&m); return -1; }
     float hw = width * CELL / 2, hd = depth * CELL / 2;
     for (int st = 0; st < nstoreys; st++) {
         for (int cell = 0; cell < cells && (uint32_t)cell < ntiles[st]; cell++) {
@@ -1972,7 +2260,8 @@ static Mesh facade(uint32_t sheet, int width, int depth, const float *z, Record 
             p->ntris += 2;
         }
     }
-    return m;
+    *out = m;
+    return 0;
 }
 
 /* the sheet's ColumnDef| outlines (0x2D0FB0): pixels of a tile RefTexWidth / 4 x RefTexHeight / 4 to cell units,
@@ -1988,6 +2277,7 @@ static void sheet_columns(City *c, SceneBuilding *sb, const char *sheet)
     sb->crack_k = 1.0f / 8;
     sb->crack_tint[0] = sb->crack_tint[1] = sb->crack_tint[2] = 1;
     Group g = template_of(c, sheet), where;
+    if (city_load_failed(c)) return;
     if (!g.at)
         return;
     sb->inner_wall = (int)group_num(g, "InnerWallColumn", 0) & 3;
@@ -2038,16 +2328,21 @@ static void sheet_columns(City *c, SceneBuilding *sb, const char *sheet)
     }
 }
 
-static void part_reset(MeshPart *p, uint32_t quads)
+/* A failed reset leaves an empty, free-safe part; the sticky failure stops all callers. */
+static int part_reset(Scene *s, MeshPart *p, uint32_t quads, int normals, int textured)
 {
+    if (scene_failed(s)) return -2;
     free(p->pos); free(p->nrm); free(p->uv); free(p->col); free(p->tris);
     p->pos = malloc(sizeof(float) * 12 * (quads ? quads : 1));
-    p->nrm = malloc(sizeof(float) * 12 * (quads ? quads : 1));
-    p->uv = malloc(sizeof(float) * 8 * (quads ? quads : 1));
+    p->nrm = normals ? malloc(sizeof(float) * 12 * (quads ? quads : 1)) : NULL;
+    p->uv = textured ? malloc(sizeof(float) * 8 * (quads ? quads : 1)) : NULL;
     p->col = malloc(sizeof(float) * 16 * (quads ? quads : 1));
     p->tris = malloc(sizeof(uint32_t) * 6 * (quads ? quads : 1));
     p->nverts = p->ntris = 0;
+    if (!p->pos || (normals && !p->nrm) || (textured && !p->uv) || !p->col || !p->tris)
+        return scene_fail(s);
     p->rev++;
+    return 0;
 }
 
 /* one quad, corners in order around it, wound to face n */
@@ -2056,8 +2351,8 @@ static void part_quad(MeshPart *p, const float pos[4][3], const float uv[4][2], 
     uint32_t v0 = p->nverts;
     for (int k = 0; k < 4; k++) {
         memcpy(p->pos + 3 * p->nverts, pos[k], 12);
-        memcpy(p->nrm + 3 * p->nverts, n, 12);
-        memcpy(p->uv + 2 * p->nverts, uv[k], 8);
+        if (p->nrm) memcpy(p->nrm + 3 * p->nverts, n, 12);
+        if (p->uv) memcpy(p->uv + 2 * p->nverts, uv[k], 8);
         memcpy(p->col + 4 * p->nverts, col[k], 16);
         p->nverts++;
     }
@@ -2110,15 +2405,16 @@ static void face_normal(int face, float n[3])
  *   InnerWallColumn at the side cell's state, grey (0x80 halved). */
 static void facade_passes(Scene *s, SceneBuilding *sb)
 {
-    if (sb->mesh < 0 || s->meshes[sb->mesh].mesh.nparts < 4)
+    if (scene_failed(s) || sb->mesh < 0 || s->meshes[sb->mesh].mesh.nparts < 4)
         return;
     MeshPart *glass = &s->meshes[sb->mesh].mesh.parts[1], *crack = &s->meshes[sb->mesh].mesh.parts[2];
     MeshPart *inner = &s->meshes[sb->mesh].mesh.parts[3];
     const Building *b = &sb->b;
     int cells = 2 * b->depth + b->width;
-    part_reset(glass, (uint32_t)(b->storeys * cells));
-    part_reset(crack, (uint32_t)(b->storeys * cells * 4));
-    part_reset(inner, (uint32_t)(b->storeys * 2));
+    /* Only untextured glass is lit; cracks and inner walls carry their own colour. */
+    if (part_reset(s, glass, (uint32_t)(b->storeys * cells), !glass->material, 1) != 0 ||
+        part_reset(s, crack, (uint32_t)(b->storeys * cells * 4), 0, 1) != 0 ||
+        part_reset(s, inner, (uint32_t)(b->storeys * 2), 0, 1) != 0) return;
     float tint[4] = { s->cube_tint[0] / 256, s->cube_tint[1] / 256, s->cube_tint[2] / 256, 1 };
     for (int o = 0; o < b->storeys; o++) {
         int ls = building_live_of(b, o);
@@ -2214,14 +2510,6 @@ static void facade_passes(Scene *s, SceneBuilding *sb)
             part_quad(inner, pos, uv, grey, n);
         }
     }
-    free(crack->nrm);                                /* the cracks carry their light: drawn unlit (render_gl.c) */
-    crack->nrm = NULL;
-    free(inner->nrm);                                /* the inner corner walls: 0xFF808080 halved, no normal (0x2C63A0) */
-    inner->nrm = NULL;
-    if (glass->material) {                           /* the glass behind an InnerWindowTexture: one colour (G +0x6F0) */
-        free(glass->nrm);                            /* at every corner, format 0x142, unlit (0x2C92F0, 0x2D2700) */
-        glass->nrm = NULL;
-    }
 }
 
 /* the work queue (0x2BF270(Q, item, 4)) a relight (the building's item +0x158) and the ground floor's cracks (+0x16C)
@@ -2244,14 +2532,15 @@ static int light_grant(Scene *s, int *queued)
  * the full other way; the corners bottom left, bottom right, top right, top left. Not for a storey that is gone. */
 static void open_windows(Scene *s, SceneBuilding *sb)
 {
-    if (!sb->open_part || sb->mesh < 0 || s->meshes[sb->mesh].mesh.nparts <= (uint32_t)sb->open_part)
+    if (scene_failed(s) || !sb->open_part || sb->mesh < 0 || s->meshes[sb->mesh].mesh.nparts <= (uint32_t)sb->open_part)
         return;
     MeshPart *p = &s->meshes[sb->mesh].mesh.parts[sb->open_part];
     const Building *b = &sb->b;
     if (!b->nwindows && !p->ntris)
         return;
     int n = b->nwindows < 40 ? b->nwindows : 40;
-    part_reset(p, (uint32_t)n);
+    /* Window colour is all it has: drawn unlit and untextured. */
+    if (part_reset(s, p, (uint32_t)n, 0, 0) != 0) return;
     static const float DARK[4] = { 16.0f / 255, 16.0f / 255, 16.0f / 255, 1 }, N[3] = { 0, -1, 0 };
     for (int k = 0; k < n && b->state != BUILDING_GONE; k++) {
         const BuildingWindow *w = &b->window[k];
@@ -2262,17 +2551,13 @@ static void open_windows(Scene *s, SceneBuilding *sb)
         building_storey(b, ls, &bottom, &height);
         float x1 = w->x0 + (w->opens_h ? w->open * w->w : w->w), z1 = w->z0 + (w->opens_h ? w->h : w->open * w->h);
         float az[4][2] = { { w->x0, w->z0 }, { x1, w->z0 }, { x1, z1 }, { w->x0, z1 } };
-        float pos[4][3], uv[4][2] = { { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 } }, col[4][4];
+        float pos[4][3], col[4][4];
         for (int c = 0; c < 4; c++) {
             face_point(sb, FACE_FRONT, w->column, az[c][0], az[c][1], -0.015f, bottom, STOREY, pos[c]);
             memcpy(col[c], DARK, sizeof DARK);
         }
-        part_quad(p, pos, uv, col, N);
+        part_quad(p, pos, NULL, col, N);
     }
-    free(p->nrm);                                    /* its colour is all it has: drawn unlit, untextured */
-    p->nrm = NULL;
-    free(p->uv);
-    p->uv = NULL;
 }
 
 /* a group's Adornment| entries (0x2D1A30: the template's, then the instance's), placed by 0x30FAA0 / 0x30F710:
@@ -2309,6 +2594,7 @@ static int attachment_where(Group e, const SceneBuilding *sb, int nst, Adornment
 
 static void adornments(City *c, Scene *s, SceneBuilding *sb, Group from, int nst)
 {
+    if (scene_failed(s)) return;
     static Record r[MAX_REC];
     uint32_t n = from.at ? group_all(from, "Adornment|", r, MAX_REC) : 0;
     for (uint32_t i = 0; i < n; i++) {
@@ -2327,6 +2613,7 @@ static void adornments(City *c, Scene *s, SceneBuilding *sb, Group from, int nst
             continue;
         int missing = s->missing;
         a.inst = place_model(c, s, shape, sb->node, -1);
+        if (scene_failed(s)) return;
         s->missing = missing;
         if (a.inst < 0)
             continue;
@@ -2346,7 +2633,10 @@ static void adornments(City *c, Scene *s, SceneBuilding *sb, Group from, int nst
                         if (x > a.hi[k]) a.hi[k] = x;
                     }
         }
-        sb->adorn = realloc(sb->adorn, sizeof *sb->adorn * (size_t)(sb->nadorn + 1));
+        if (sb->nadorn == INT_MAX || (size_t)sb->nadorn + 1 > SIZE_MAX / sizeof *sb->adorn) { scene_fail(s); return; }
+        void *grown = realloc(sb->adorn, sizeof *sb->adorn * ((size_t)sb->nadorn + 1));
+        if (!grown) { scene_fail(s); return; }
+        sb->adorn = grown;
         sb->adorn[sb->nadorn++] = a;
     }
 }
@@ -2418,6 +2708,7 @@ static Mat4 flag_frame(const SceneBuilding *sb, const BuildingFlag *f, float sha
  * LocationOrigin) is 5 (0x347514): the roofs' flags, all LocationOrigin 5, have none */
 static void building_flags(City *c, Scene *s, SceneBuilding *sb, Group inst, int nst)
 {
+    if (scene_failed(s)) return;
     static Record r[MAX_REC];
     uint32_t n = inst.at ? group_all(inst, "ClothInstance|", r, MAX_REC) : 0;
     for (uint32_t i = 0; i < n; i++) {
@@ -2425,6 +2716,7 @@ static void building_flags(City *c, Scene *s, SceneBuilding *sb, Group inst, int
         const char *name = group_str(e, "OTRef|Name");
         Group t = template_of(c, name ? name : group_str(e, "Name"));
         const char *model = t.at ? group_str(t, "Shape|Shape") : NULL;
+        if (scene_failed(s)) return;
         if (!model || !ba.at)
             continue;
         BuildingFlag f = { 0 };
@@ -2432,7 +2724,9 @@ static void building_flags(City *c, Scene *s, SceneBuilding *sb, Group inst, int
         attachment_where(ba, sb, nst, &f.at, &origin);
         f.wall = group_num(e, "WallOffset", 0);
         f.off = cloth_offset(e);
+        if (scene_failed(s)) return;
         f.inst = flag_new(c, s, model, e, flag_frame(sb, &f, 0), &f.skin);
+        if (scene_failed(s)) return;
         if (f.inst < 0)
             continue;
         const Building *b = &sb->b;
@@ -2446,7 +2740,10 @@ static void building_flags(City *c, Scene *s, SceneBuilding *sb, Group inst, int
         if (getenv("RAMPAGE_TRACE"))
             printf("  on the building at x %.0f .. %.0f: side %d, storey %d of %d, its wall's plane %s\n", b->min[0],
                    b->max[0], side, f.at.record, nst, f.skin->has_plane ? "kept" : "none");
-        sb->flag = realloc(sb->flag, sizeof *sb->flag * (size_t)(sb->nflag + 1));
+        if (sb->nflag == INT_MAX || (size_t)sb->nflag + 1 > SIZE_MAX / sizeof *sb->flag) { scene_fail(s); return; }
+        void *grown = realloc(sb->flag, sizeof *sb->flag * ((size_t)sb->nflag + 1));
+        if (!grown) { scene_fail(s); return; }
+        sb->flag = grown;
         sb->flag[sb->nflag++] = f;
     }
 }
@@ -2507,6 +2804,7 @@ static void building_flags_update(Scene *s, SceneBuilding *sb, int steps)
  * sqrt 3.5) and a step more under its matrix as it is (0x1D90E0 with +0x1C, the world's step) [R] */
 void scene_building_flags_punch(Scene *s, int building, const float at[3])
 {
+    if (scene_failed(s)) return;
     if (building < 0 || (uint32_t)building >= s->nbuildings)
         return;
     SceneBuilding *sb = &s->buildings[building];
@@ -2524,6 +2822,7 @@ void scene_building_flags_punch(Scene *s, int building, const float at[3])
 
 static struct SceneFx *fx_request(Scene *s, const char *name, const float pos[3], const float dir[3])
 {
+    if (scene_failed(s)) return NULL;
     if (!name || s->nfxreq >= 64)
         return NULL;
     struct SceneFx *f = &s->fxreq[s->nfxreq++];
@@ -2555,6 +2854,7 @@ static int spawn_z(const SceneBuilding *sb, int *o, float *z)
 
 void scene_fx_started(Scene *s, FxWorld *w, const struct SceneFx *f, int id)
 {
+    if (scene_failed(s)) return;
     if (f->building < 0 || (uint32_t)f->building >= s->nbuildings || id < 0)
         return;
     SceneBuilding *sb = &s->buildings[f->building];
@@ -2585,6 +2885,7 @@ void scene_fx_started(Scene *s, FxWorld *w, const struct SceneFx *f, int id)
  * floor below it has fallen; a record whose effect is done is released */
 void scene_fx_follow(Scene *s, FxWorld *w)
 {
+    if (scene_failed(s)) return;
     for (uint32_t i = 0; i < s->nbuildings; i++) {
         SceneBuilding *sb = &s->buildings[i];
         int n = 0;
@@ -2611,6 +2912,7 @@ void scene_fx_follow(Scene *s, FxWorld *w)
 
 int scene_adornments_hit(Scene *s, const float centre[3], float radius)
 {
+    if (scene_failed(s)) return 0;
     int n = 0;
     for (uint32_t bi = 0; bi < s->nbuildings; bi++) {
         SceneBuilding *sb = &s->buildings[bi];
@@ -2643,9 +2945,11 @@ int scene_adornments_hit(Scene *s, const float centre[3], float radius)
 
 static int building(City *c, Scene *s, Group inst, float row_offset, float y0, int scenery)
 {
+    if (scene_failed(s)) return -2;
     SceneBuilding **list = scenery ? &s->scenery : &s->buildings;
     uint32_t *count = scenery ? &s->nscenery : &s->nbuildings;
     Group t = template_of(c, group_str(inst, "TemplateName")), where;
+    if (scene_failed(s)) return -2;
     if (!t.at) {
         s->missing++;
         return 0;
@@ -2660,6 +2964,7 @@ static int building(City *c, Scene *s, Group inst, float row_offset, float y0, i
     const char *ground = str_item(group_sub(t, "ShapeSet|GroundFloorShapes"), 0);
     if (ground)
         ground_inst = place_model(c, s, ground, node, -1);
+    if (scene_failed(s)) return -2;
     static Record fr[64], tiles[64][64];
     static Group floors[64];
     static uint32_t ntiles[64];
@@ -2677,16 +2982,21 @@ static int building(City *c, Scene *s, Group inst, float row_offset, float y0, i
         nst++;
     }
     const char *sheet = group_str(t, "TextureSheet");
+    if (scene_failed(s)) return -2;
     int sheet_name = sheet ? bdp_find_name(&c->bundle, sheet) : -1;
     int mesh = -1;
     if (nst && sheet_name >= 0) {
-        Mesh fm = facade((uint32_t)sheet_name, width, depth, z, tiles, ntiles, nst);
+        Mesh fm = { 0 };
+        if (facade((uint32_t)sheet_name, width, depth, z, tiles, ntiles, nst, &fm) != 0) return -1;
         /* glass, cracks, inner corner walls (facade_passes), the open windows (open_windows) */
-        fm.parts = realloc(fm.parts, sizeof *fm.parts * 5);
+        MeshPart *grown = realloc(fm.parts, sizeof *fm.parts * 5);
+        if (!grown) { mesh_free(&fm); return -1; }
+        fm.parts = grown;
         memset(fm.parts + 1, 0, sizeof *fm.parts * 4);
         fm.nparts = 5;
         Group sg = template_of(c, sheet);
         const char *glass = group_str(t, "Texture|InnerWindowTexture"), *crack = sg.at ? group_str(sg, "CrackTexture") : NULL;
+        if (scene_failed(s)) { mesh_free(&fm); return -2; }
         int gi = glass ? bdp_find_name(&c->bundle, glass) : -1, ki = crack ? bdp_find_name(&c->bundle, crack) : -1;
         fm.parts[1].material = gi > 0 ? (uint32_t)gi : 0;
         fm.parts[2].material = ki > 0 ? (uint32_t)ki : 0;
@@ -2696,9 +3006,10 @@ static int building(City *c, Scene *s, Group inst, float row_offset, float y0, i
         fm.lead = 1;                                     /* [R 0x2C92F0 before 0x2C81A0] the glass, then the sheet */
         fm.parts[0].blend = 2;                           /* the sheet over it by its alpha, its depth written (GS state
                                                           * 2: ALPHA 0x44): its panes (alpha 0x4D) let the rooms show */
-        mesh = (int)scene_add_mesh(s, fm, s->city);
+        mesh = scene_add_mesh(s, fm, s->city);
+        if (mesh < 0) { mesh_free(&fm); return -2; }
         facade_inst = new_instance(s, node, -1);
-        push_item(s, (uint32_t)mesh, facade_inst, -1, NULL);
+        if (facade_inst < 0 || push_item(s, (uint32_t)mesh, facade_inst, -1, NULL) != 0) return -2;
     }
     /* its cells (the game's grid, 0x2D1A30): the box is 6 + 3 x storeys + 1.5 (the roof's band) high */
     if (nst && width > 0 && width <= BUILDING_CELLS && depth > 0 && depth <= (BUILDING_CELLS - width) / 2) {
@@ -2784,6 +3095,7 @@ static int building(City *c, Scene *s, Group inst, float row_offset, float y0, i
         sb->b.hesitation = group_num(t, "HesitationTime", sb->b.hesitation);
         sb->b.min_crack = (int)group_num(t, "MinCollapseCrackLevel", (float)sb->b.min_crack);
         sheet_columns(c, sb, sheet);
+        if (scene_failed(s)) return -2;
         sb->b.outlined = 0;
         for (int k = 0; k < 4; k++)
             if (sb->outline[k][0] >= 0)
@@ -2817,9 +3129,12 @@ static int building(City *c, Scene *s, Group inst, float row_offset, float y0, i
             sb->skeleton_hp[st] = (int)group_num(floors[st], "DamagedSkeletonHP", (float)(sb->b.floor_hp[st] / 2));
             Mat4 at = mat_mul(node, mat_trs_z(0, 0, z[st], 0));
             const char *sk = group_str(floors[st], "Skeleton"), *dsk = group_str(floors[st], "DamagedSkeleton");
+            if (scene_failed(s)) return -2;
             int missing = s->missing;
             sb->skeleton[st] = sk ? place_model(c, s, sk, at, -1) : -1;
+            if (scene_failed(s)) return -2;
             sb->damaged_skeleton[st] = dsk ? place_model(c, s, dsk, at, -1) : -1;
+            if (scene_failed(s)) return -2;
             s->missing = missing;                    /* an interior not found is not counted as missing */
             if (sb->skeleton[st] >= 0) s->instances[sb->skeleton[st]].hidden = 1;
             if (sb->damaged_skeleton[st] >= 0) s->instances[sb->damaged_skeleton[st]].hidden = 1;
@@ -2831,7 +3146,9 @@ static int building(City *c, Scene *s, Group inst, float row_offset, float y0, i
                     sb->quad[st][i] = v;
                     sb->b.cell[st][i].tile = (uint8_t)((int)record_num(tiles[st][k]) % 4);
                     sb->b.cell[st][i].room = (uint8_t)((st * 7u + (unsigned)i * 13u + *count * 5u) & 15u);   /* [G] */
-                    if (cell_flags(floors[st], k) & CELL_MIRRORED) {   /* [R 0x2C82AC]: its u0 and u1 swapped */
+                    int flags = cell_flags(floors[st], k);
+                    if (scene_failed(s)) return -2;
+                    if (flags & CELL_MIRRORED) {   /* [R 0x2C82AC]: its u0 and u1 swapped */
                         sb->b.cell[st][i].flags |= CELL_MIRRORED;
                         MeshPart *fp = mesh >= 0 ? &s->meshes[mesh].mesh.parts[0] : NULL;
                         if (fp && fp->uv && (uint32_t)v + 4 <= fp->nverts) {
@@ -2854,15 +3171,19 @@ static int building(City *c, Scene *s, Group inst, float row_offset, float y0, i
         if (!top)
             break;
         roof_inst[k] = place_model(c, s, top, mat_mul(node, mat_trs_z(0, 0, GROUND_FLOOR + STOREY * (float)nfloors, 0)), -1);
+        if (scene_failed(s)) return -2;
         if (k > 0 && roof_inst[k] >= 0)
             s->instances[roof_inst[k]].hidden = 1;
     }
     top_inst = roof_inst[0];
     Record obj[MAX_REC];
     uint32_t no = group_values(inst, "ObjectInstance|", &where, obj, MAX_REC);
+    if (scene_failed(s)) return -2;
     s->placing_building = !scenery && *count > had ? (int)(*count - 1) : -1;
-    for (uint32_t i = 0; i < no; i++)
+    for (uint32_t i = 0; i < no; i++) {
         place_object(c, s, record_group(where, obj[i]), node);
+        if (scene_failed(s)) return -2;
+    }
     no = group_values(inst, "ActorInstance|", &where, obj, MAX_REC);   /* its actors: the one there is, Las Vegas'
                                                                          * VegasCowboySign (AnimatedSign.bsf) */
     for (uint32_t i = 0; i < no; i++) {
@@ -2870,15 +3191,19 @@ static int building(City *c, Scene *s, Group inst, float row_offset, float y0, i
         const char *sc = at.at ? group_str(at, "Script|ScriptName") : NULL;
         if (sc && !_stricmp(sc, "AnimatedSign.bsf"))
             place_object(c, s, ai, node);
+        if (scene_failed(s)) return -2;
     }
     s->placing_building = -1;
     if (*count > had) {                              /* its pieces, to move */
         SceneBuilding *sb = &(*list)[*count - 1];
         adornments(c, s, sb, t, nst);
+        if (scene_failed(s)) return -2;
         adornments(c, s, sb, inst, nst);
+        if (scene_failed(s)) return -2;
         const char *rubble = group_str(t, "Shape|RubbleShape");
         int missing = s->missing;
         sb->rubble = rubble ? place_model(c, s, rubble, node, -1) : -1;
+        if (scene_failed(s)) return -2;
         s->missing = missing;
         if (sb->rubble >= 0)
             s->instances[sb->rubble].hidden = 1;
@@ -2886,12 +3211,17 @@ static int building(City *c, Scene *s, Group inst, float row_offset, float y0, i
         memcpy(sb->roof_inst, roof_inst, sizeof roof_inst);
         sb->first = first;
         sb->last = (int)s->ninstances;
-        sb->rest = malloc(sizeof *sb->rest * (size_t)(sb->last - sb->first + 1));
+        Mat4 *rest = malloc(sizeof *rest * (size_t)(sb->last - sb->first + 1));
+        if (!rest)
+            return -1;                              /* scene_free owns the partially built building */
         for (int i = sb->first; i < sb->last; i++)
-            sb->rest[i - sb->first] = s->instances[i].base;
+            rest[i - sb->first] = s->instances[i].base;
+        sb->rest = rest;
         facade_passes(s, sb);
+        if (scene_failed(s)) return -2;
         adornments_place(s, sb, mat_identity());
-        building_flags(c, s, sb, inst, nst);         /* after last: its flags are not moved as its pieces */
+        building_flags(c, s, sb, inst, nst);
+        if (scene_failed(s)) return -2;         /* after last: its flags are not moved as its pieces */
     }
     return 0;
 }
@@ -2947,6 +3277,7 @@ static void read_lights(Scene *s, const char *text, uint32_t len)
 static void lighting(City *c, Scene *s, Group ld)
 {
     const char *file = group_str(ld, "text|LightFile");
+    if (scene_failed(s)) return;
     uint32_t size;
     uint8_t *data = vol_read(c->vol, "common.bdp", &size);
     Bundle common;
@@ -3082,10 +3413,11 @@ static void light_facade(SceneBuilding *sb, MeshPart *p)
 
 /* a copy of a mesh whose parts with normals and no colours get colours instead of the normals (lit here, drawn
  * unlit); the others as they are */
-static Mesh mesh_copy_lit(const Mesh *m)
+static int mesh_copy_lit(const Mesh *m, Mesh *out)
 {
     Mesh c = { 0 };
     c.parts = calloc(m->nparts ? m->nparts : 1, sizeof *c.parts);
+    if (!c.parts) return -1;
     c.nparts = m->nparts;
     for (uint32_t i = 0; i < m->nparts; i++) {
         const MeshPart *p = &m->parts[i];
@@ -3096,34 +3428,45 @@ static Mesh mesh_copy_lit(const Mesh *m)
         q->ntris = p->ntris;
         q->blend = p->blend;
         q->pos = malloc(12 * nv);
-        memcpy(q->pos, p->pos, 12 * (size_t)p->nverts);
+        if (!q->pos) goto failed;
+        if (p->nverts) memcpy(q->pos, p->pos, 12 * (size_t)p->nverts);
         q->tris = malloc(12 * nt);
-        memcpy(q->tris, p->tris, 12 * (size_t)p->ntris);
+        if (!q->tris) goto failed;
+        if (p->ntris) memcpy(q->tris, p->tris, 12 * (size_t)p->ntris);
         if (p->uv) {
             q->uv = malloc(8 * nv);
-            memcpy(q->uv, p->uv, 8 * (size_t)p->nverts);
+            if (!q->uv) goto failed;
+            if (p->nverts) memcpy(q->uv, p->uv, 8 * (size_t)p->nverts);
         }
         if (p->nrm && !p->col) {
             q->col = malloc(16 * nv);
+            if (!q->col) goto failed;
             for (uint32_t k = 0; k < 4 * p->nverts; k++)
                 q->col[k] = 1;
             continue;
         }
         if (p->nrm) {
             q->nrm = malloc(12 * nv);
-            memcpy(q->nrm, p->nrm, 12 * (size_t)p->nverts);
+            if (!q->nrm) goto failed;
+            if (p->nverts) memcpy(q->nrm, p->nrm, 12 * (size_t)p->nverts);
         }
         if (p->col) {
             q->col = malloc(16 * nv);
-            memcpy(q->col, p->col, 16 * (size_t)p->nverts);
+            if (!q->col) goto failed;
+            if (p->nverts) memcpy(q->col, p->col, 16 * (size_t)p->nverts);
         }
     }
-    return c;
+    *out = c;
+    return 0;
+failed:
+    mesh_free(&c);
+    return -1;
 }
 
 /* the ground-floor and top models' items get meshes of their own (the building light is per building) */
-static void light_items_make(Scene *s, SceneBuilding *sb)
+static int light_items_make(Scene *s, SceneBuilding *sb)
 {
+    if (scene_failed(s)) return -2;
     sb->nlit_items = 0;
     for (uint32_t i = 0; i < s->nitems && sb->nlit_items < 16; i++) {
         DrawItem *it = &s->items[i];
@@ -3133,12 +3476,16 @@ static void light_items_make(Scene *s, SceneBuilding *sb)
         if (it->skin || (it->instance != sb->ground && it->instance != sb->top && !roof))
             continue;
         uint32_t src = it->mesh;
-        Mesh copy = mesh_copy_lit(&s->meshes[src].mesh);
-        uint32_t mi = scene_add_mesh(s, copy, s->meshes[src].b);
-        s->items[i].mesh = mi;
+        Mesh copy = { 0 };
+        if (mesh_copy_lit(&s->meshes[src].mesh, &copy) != 0)
+            return -1;
+        int mi = scene_add_mesh(s, copy, s->meshes[src].b);
+        if (mi < 0) { mesh_free(&copy); return -2; }
+        s->items[i].mesh = (uint32_t)mi;
         sb->lit_item[sb->nlit_items] = (int)i;
         sb->lit_src[sb->nlit_items++] = (int)src;
     }
+    return 0;
 }
 
 /* 0x33A920: the bottom-row grid vertex a ground-floor vertex follows, as an index into the row as the game keeps it
@@ -3178,45 +3525,45 @@ static float fixed_412(float u)                     /* a UV as the game stores i
  *   (x > 0), k (2.5D - y) on the left.
  * Drawn (0x339E40, from the grid's draw 0x2CD530 right after the lit ground model, with its place and its sink) only
  * once ground_cracks has shown it (+0x61): here a part of the ground model's lit mesh, so it goes where that goes */
-static void ground_cracks_make(Scene *s, SceneBuilding *sb)
+static int ground_cracks_make(Scene *s, SceneBuilding *sb)
 {
-    sb->gf_item = sb->gf_part = -1;
+    /* Once per build: building() initializes gf_item/gf_part to -1 and gf_vert to NULL.
+     * Keep existing owners untouched until all applicable overlay construction succeeds. */
     int k = 0;
     while (k < sb->nlit_items && (sb->ground < 0 || s->items[sb->lit_item[k]].instance != sb->ground))
         k++;
     if (k == sb->nlit_items || sb->mesh < 0 || s->meshes[sb->mesh].mesh.nparts < 3)
-        return;
+        return 0;
     const Mesh *src = &s->meshes[sb->lit_src[k]].mesh;
     uint32_t pi = 0;
     while (pi < src->nparts && !(src->parts[pi].nrm && src->parts[pi].uv && !src->parts[pi].col))
         pi++;
     if (pi == src->nparts)
-        return;
+        return 0;
     const MeshPart *sp = &src->parts[pi];
     Mesh *m = &s->meshes[s->items[sb->lit_item[k]].mesh].mesh;
-    MeshPart *parts = realloc(m->parts, sizeof *parts * (m->nparts + 1));
-    if (!parts)
-        return;
-    m->parts = parts;
-    MeshPart *p = &parts[m->nparts];
-    memset(p, 0, sizeof *p);
+    MeshPart overlay = { 0 };
+    MeshPart *p = &overlay;
+    uint8_t (*gf_vert)[3] = NULL;
     size_t nv = sp->nverts ? sp->nverts : 1, nt = sp->ntris ? sp->ntris : 1;
     p->material = s->meshes[sb->mesh].mesh.parts[2].material;   /* the facade's cracks' CrackTexture */
     p->blend = 1;
     p->nverts = sp->nverts;
     p->pos = malloc(12 * nv);
-    memcpy(p->pos, sp->pos, 12 * (size_t)sp->nverts);
     p->tris = malloc(12 * nt);
-    memcpy(p->tris, sp->tris, 12 * (size_t)sp->ntris);
     p->uv = malloc(8 * nv);
     p->col = calloc(4 * nv, sizeof *p->col);
-    sb->gf_vert = calloc(nv, sizeof *sb->gf_vert);
+    gf_vert = calloc(nv, sizeof *gf_vert);
+    if (!p->pos || !p->tris || !p->uv || !p->col || !gf_vert)
+        goto failed;
+    if (sp->nverts) memcpy(p->pos, sp->pos, 12 * (size_t)sp->nverts);
+    if (sp->ntris) memcpy(p->tris, sp->tris, 12 * (size_t)sp->ntris);
     float w5 = CELL * (float)sb->b.width, d5 = CELL * (float)sb->b.depth, ck = sb->crack_k;
     for (uint32_t v = 0; v < sp->nverts; v++) {
         const float *x = sp->pos + 3 * v, *n = sp->nrm + 3 * v;
         int f = (int)(42.5f * x[2] + 0.5f);
-        sb->gf_vert[v][0] = (uint8_t)ground_zone(x, n, w5, d5);
-        sb->gf_vert[v][1] = (uint8_t)(f < 0 ? 0 : f > 255 ? 255 : f);
+        gf_vert[v][0] = (uint8_t)ground_zone(x, n, w5, d5);
+        gf_vert[v][1] = (uint8_t)(f < 0 ? 0 : f > 255 ? 255 : f);
         float u, t;
         if (fabsf(n[2]) > 0.9f) {
             u = ck * (x[0] + d5);
@@ -3229,9 +3576,23 @@ static void ground_cracks_make(Scene *s, SceneBuilding *sb)
         p->uv[2 * v] = fixed_412(u);
         p->uv[2 * v + 1] = fixed_412(t);
     }
+    MeshPart *parts = realloc(m->parts, sizeof *parts * (m->nparts + 1));
+    if (!parts)
+        goto failed;
+    m->parts = parts;
+    parts[m->nparts] = overlay;
+    sb->gf_vert = gf_vert;
     sb->gf_part = (int)m->nparts++;
     sb->gf_item = sb->lit_item[k];
     sb->gf_ntris = (int)sp->ntris;
+    return 0;
+failed:
+    free(overlay.pos);
+    free(overlay.tris);
+    free(overlay.uv);
+    free(overlay.col);
+    free(gf_vert);
+    return -1;
 }
 
 /* 0x339F20: the overlay's colours, when the work queue grants its item (0x2BF210: G+0x670 set) [R]. The bottom vertex
@@ -3339,15 +3700,17 @@ static void light_building(Scene *s, SceneBuilding *sb, int play)
 }
 
 /* at the block's end, everything placed and posed: the neighbours, the models' own meshes, the first light */
-static void light_buildings(Scene *s)
+static int light_buildings(Scene *s)
 {
     for (uint32_t i = 0; i < s->nbuildings; i++) {
         shade_neighbours(s, i);
-        light_items_make(s, &s->buildings[i]);
-        ground_cracks_make(s, &s->buildings[i]);
+        if (light_items_make(s, &s->buildings[i]) != 0 ||
+            ground_cracks_make(s, &s->buildings[i]) != 0)
+            return -1;
     }
     for (uint32_t i = 0; i < s->nscenery; i++)
-        light_items_make(s, &s->scenery[i]);
+        if (light_items_make(s, &s->scenery[i]) != 0)
+            return -1;
     for (uint32_t i = 0; i < s->nbuildings; i++) {
         light_building(s, &s->buildings[i], 1);
         const SceneBuilding *sb = &s->buildings[i];
@@ -3359,6 +3722,7 @@ static void light_buildings(Scene *s)
     }
     for (uint32_t i = 0; i < s->nscenery; i++)
         light_building(s, &s->scenery[i], 0);
+    return 0;
 }
 
 /* ---------------------------------------------------------------- posing */
@@ -3380,13 +3744,27 @@ static void pose_instance(Scene *s, Instance *in, double t)
     int mk = scene_monster_slot(s, (int)(in - s->instances));
     const SceneMonster *sm = mk >= 0 ? &s->mon[mk] : NULL;
     float w = in->held && in->blend_left > 0 && in->blend_time > 0 ? in->blend_left / in->blend_time : 0;
+    double body_phase = 0, face_phase = 0;
+    int body_ready = 0, face_ready = 0;
     for (uint32_t i = 0; i < in->tree.n; i++) {
         TreeNode *nd = &in->tree.nodes[i];
         float tr[3] = { nd->t[0], nd->t[1], nd->t[2] }, q[4] = { nd->q[0], nd->q[1], nd->q[2], nd->q[3] };
         if (in->has_clip)
-            clip_pose(&in->clip, t + in->offset, i, tr, q);
+        {
+            if (!body_ready && i < in->clip.bones && !(in->clip.duration <= 0)) {
+                body_phase = clip_phase(&in->clip, t + in->offset);
+                body_ready = 1;
+            }
+            clip_pose_phase(&in->clip, body_phase, i, tr, q);
+        }
         if (in->has_face && in->face_mask && in->face_mask[i])   /* the face clip's, fully (weight 1.0) */
-            clip_pose(&in->face, in->face_t * in->face.duration, i, tr, q);
+        {
+            if (!face_ready && i < in->face.bones && !(in->face.duration <= 0)) {
+                face_phase = clip_phase(&in->face, in->face_t * in->face.duration);
+                face_ready = 1;
+            }
+            clip_pose_phase(&in->face, face_phase, i, tr, q);
+        }
         if (nd->parent < 0) {                        /* [R 0x2FFF10] the root's motion comes out of the clip's
                                                       * pose (0x301080; the root rewritten at 0x3003C8) before the
                                                       * blend towards the kept pose, which came out the same way */
@@ -3441,31 +3819,33 @@ static void pose_instance(Scene *s, Instance *in, double t)
 
 static float monster_sway(const Scene *s, int k);
 
-static void skin_item(const Scene *s, const Instance *in, DrawItem *it)
+static void skin_item(Scene *s, const Instance *in, DrawItem *it, int rebuild_palette)
 {
     Skin *sk = it->skin;
     static Mat4 palette[256];
     uint32_t nb = in->tree.n < 256 ? in->tree.n : 256;
-    for (uint32_t j = 0; j < nb; j++) {
-        Mat4 ib;
-        memcpy(ib.m, in->tree.nodes[j].inverse_bind, sizeof ib.m);
-        palette[j] = mat_mul(in->node[j], ib);
-    }
-    if (in->mirrored) {                              /* the game mirrors the pose (0x194BA0); for a mesh that is
-                                                        symmetric this is S x the other side's matrix x S, S the
-                                                        reflection of x */
-        static Mat4 other[256];
+    if (rebuild_palette) {
         for (uint32_t j = 0; j < nb; j++) {
-            int m = in->tree.nodes[j].mirror;
-            other[j] = palette[m >= 0 && (uint32_t)m < nb ? (uint32_t)m : j];
+            Mat4 ib;
+            memcpy(ib.m, in->tree.nodes[j].inverse_bind, sizeof ib.m);
+            palette[j] = mat_mul(in->node[j], ib);
         }
-        for (uint32_t j = 0; j < nb; j++) {
-            Mat4 k = other[j];
-            for (int c = 0; c < 4; c++) {            /* S k S: negate row 0 and column 0, the corner twice */
-                k.m[4 * c] = -k.m[4 * c];
-                k.m[c] = -k.m[c];
+        if (in->mirrored) {                              /* the game mirrors the pose (0x194BA0); for a mesh that is
+                                                            symmetric this is S x the other side's matrix x S, S the
+                                                            reflection of x */
+            static Mat4 other[256];
+            for (uint32_t j = 0; j < nb; j++) {
+                int m = in->tree.nodes[j].mirror;
+                other[j] = palette[m >= 0 && (uint32_t)m < nb ? (uint32_t)m : j];
             }
-            palette[j] = k;
+            for (uint32_t j = 0; j < nb; j++) {
+                Mat4 k = other[j];
+                for (int c = 0; c < 4; c++) {            /* S k S: negate row 0 and column 0, the corner twice */
+                    k.m[4 * c] = -k.m[4 * c];
+                    k.m[c] = -k.m[c];
+                }
+                palette[j] = k;
+            }
         }
     }
     const Mesh *m = &s->meshes[it->mesh].mesh;
@@ -3529,22 +3909,32 @@ static void skin_item(const Scene *s, const Instance *in, DrawItem *it)
             }
         }
         int np = cloth_count(sk->cloth);
-        float *lp = malloc(sizeof(float) * 6 * (size_t)(np ? np : 1)), *ln = lp + 3 * np;
+        uint32_t count = (uint32_t)(np ? np : 1);
+        if (count > s->cloth_scratch_particles) {
+            float *grown = realloc(s->cloth_scratch, sizeof(float) * 6 * (size_t)count);
+            if (!grown)
+                return;                              /* keep the rigid pose and retry scratch growth next update */
+            s->cloth_scratch = grown;
+            s->cloth_scratch_particles = count;
+        }
+        float *lp = s->cloth_scratch, *ln = lp + 3 * np;
         cloth_to_local(sk->cloth, lp, ln);
+        int trace_cloth = getenv("RAMPAGE_CLOTH") != NULL;
         float dev = 0;
         for (uint32_t k = 0; k < sk->nverts; k++) {
             int32_t q = sk->particle[k];
             if (q < 0 || q >= np)
                 continue;
-            float d2 = 0;
-            for (int j = 0; j < 3; j++)
-                d2 += (sk->pos[3 * k + j] - lp[3 * q + j]) * (sk->pos[3 * k + j] - lp[3 * q + j]);
-            if (d2 > dev) dev = d2;
+            if (trace_cloth) {
+                float d2 = 0;
+                for (int j = 0; j < 3; j++)
+                    d2 += (sk->pos[3 * k + j] - lp[3 * q + j]) * (sk->pos[3 * k + j] - lp[3 * q + j]);
+                if (d2 > dev) dev = d2;
+            }
             memcpy(sk->pos + 3 * k, lp + 3 * q, 12);
             memcpy(sk->nrm + 3 * k, ln + 3 * q, 12);
         }
-        free(lp);
-        if (getenv("RAMPAGE_CLOTH"))
+        if (trace_cloth)
             printf("cloth: %d particles, the farthest %.3f from its rigid place\n", np, sqrtf(dev));
     }
 }
@@ -3708,13 +4098,21 @@ int scene_monster_shoulder(const Scene *s, int k, int hand, float at[3], float *
 
 static void update(Scene *s, double t, int all)
 {
+    if (scene_failed(s)) return;
     people_sync(s, t);
+    if (scene_failed(s)) return;
     army_sync(s, t);
+    if (scene_failed(s)) return;
     vehicle_sync(s);
+    if (scene_failed(s)) return;
     rail_sync(s);
+    if (scene_failed(s)) return;
     edible_sync(s);
+    if (scene_failed(s)) return;
     boss_sync(s, t);
+    if (scene_failed(s)) return;
     parade_sync(s, t);
+    if (scene_failed(s)) return;
     for (uint32_t i = 0; i < s->ninstances; i++) {
         Instance *in = &s->instances[i];
         if (in->hidden && !all && scene_monster_slot(s, (int)i) < 0)
@@ -3730,6 +4128,8 @@ static void update(Scene *s, double t, int all)
             }
         }
     }
+    /* Poses and IK are final here. Nothing in this serial loop may re-enter skinning or change a pose. */
+    const Instance *last_skin_instance = NULL;
     for (uint32_t i = 0; i < s->nitems; i++) {
         DrawItem *it = &s->items[i];
         Instance *in = &s->instances[it->instance];
@@ -3738,7 +4138,8 @@ static void update(Scene *s, double t, int all)
         if (in->hidden && !all && scene_monster_slot(s, it->instance) < 0)
             continue;                                /* (nor skinned) */
         if (it->skin) {
-            skin_item(s, in, it);
+            skin_item(s, in, it, in != last_skin_instance);
+            last_skin_instance = in;
             it->world = in->base;
         } else {
             it->world = it->node >= 0 ? mat_mul(in->base, in->node[it->node]) : in->base;
@@ -3755,19 +4156,27 @@ void scene_update(Scene *s, double t) { update(s, t, 0); }
 
 int city_build(City *c, const char *block_name, int night, Scene *s)
 {
+    int saved_crowd = c->create_crowd, saved_nrunners = c->nrunners;
+    Group saved_runners[16];
+    memcpy(saved_runners, c->runners, sizeof saved_runners);
+    int crowd_sound = 0;
     memset(s, 0, sizeof *s);
+    s->owner = c;                                   /* before the first inheritable lookup */
     s->city = &c->bundle;
+    if (scene_failed(s)) goto failed;
     for (int k = 0; k < SCENE_MONSTERS; k++)
         s->mon[k].inst = s->mon[k].sway_building = -1;
     s->sky = -1;
     s->ground_inst = -1;
     s->placing_building = -1;
     s->mesh_of_entry = malloc(sizeof *s->mesh_of_entry * (c->bundle.nentries ? c->bundle.nentries : 1));
+    if (!s->mesh_of_entry) goto failed;
     for (uint32_t i = 0; i < c->bundle.nentries; i++)
         s->mesh_of_entry[i] = -1;
     char key[128];
     snprintf(key, sizeof key, "BlockDef|%s", block_name);
     Group block = group_sub(group_sub(c->world, "BlockData"), key), ld = group_sub(c->world, night ? "LightingDataNight" : "LightingData"), where;
+    if (scene_failed(s)) goto failed;
     if (!block.at)
         goto failed;
     Mat4 root = mat_identity();
@@ -3777,18 +4186,22 @@ int city_build(City *c, const char *block_name, int night, Scene *s)
     if (ld.at) {
         const char *backdrop = group_str(ld, "Shape|Backdrop"), *sky = group_str(ld, "Shape|SkyBox");
         if (backdrop) place_model(c, s, backdrop, root, -1);
+        if (scene_failed(s)) goto failed;
         if (sky) s->sky = place_model(c, s, sky, root, -1);
+        if (scene_failed(s)) goto failed;
         lighting(c, s, ld);
     }
     const char *ground = group_str(block, "Shape|GroundShape");
     if (ground) {
         int gi = place_model(c, s, ground, root, -1);
+        if (scene_failed(s)) goto failed;
         if (s->ground_inst < 0)                      /* the play block's, the first built */
             s->ground_inst = gi;
     }
     float row_offset = group_num(block, "BackRowOffset", 10);
     static Record r[MAX_REC];
     uint32_t n = group_values(block, "BuildingInstance|", &where, r, MAX_REC);
+    if (scene_failed(s)) goto failed;
     for (uint32_t i = 0; i < n; i++) {
         /* [R 0x305B28 .. 0x305BB8, 0x305D4C .. 0x305D94] the play block (0x302DC8: 0x3059D0's a2 = 1) makes no
          * Building of an instance whose LeftEdgeXPos is outside [-50, 50) (the blocks ahead, a2 = 0, make them all): it
@@ -3806,20 +4219,25 @@ int city_build(City *c, const char *block_name, int night, Scene *s)
     s->placing_block = 1;
     for (int k = 0; k < 3; k++) {
         n = group_values(block, objects[k], &where, r, MAX_REC);
+        if (scene_failed(s)) goto failed;
         s->placing_attack = k == 1;                  /* [R 0x3050F0: these are made AttackObjects, 0x315330] */
-        for (uint32_t i = 0; i < n; i++)
+        for (uint32_t i = 0; i < n; i++) {
             place_object(c, s, record_group(where, r[i]), root);
+            if (scene_failed(s)) goto failed;
+        }
     }
     s->placing_attack = 0;
     s->placing_block = 0;
     /* the people (people.c): the block's ActorInstance| entries (SpawnedItem = 1: comes after an earlier one is
      * gone), Traffic's two crowds of the block's occupants' runners, the window occupants later */
-    s->owner = c;
     s->folk = people_new(people_clip_seconds, c);
+    if (!s->folk || scene_failed(s)) goto failed;
+    people_set_failure(s->folk, people_city_failed, c);
     people_set_templates(s->folk, people_template, c);
     {                                                /* [R 0x31A6AC .. 0x31A7A4] DroppableDef: its names (records of
                                                       * kind 2), its rate the last number (+0x34; none: kept, 0.5) */
         Group dd = group_sub(block, "DroppableDef");
+        if (scene_failed(s)) goto failed;
         const char *names[16];
         int nn = 0;
         float rate = 0.5f;
@@ -3840,31 +4258,41 @@ int city_build(City *c, const char *block_name, int night, Scene *s)
             s->scripted[k].hut_id = people_add_hut(s->folk, s->scripted[k].t, s->scripted[k].pos);
         else
             people_add_band(s->folk, s->scripted[k].t, s->scripted[k].pos);
+        if (scene_failed(s)) goto failed;
     }
     n = group_all(block, "WaterObject|", r, MAX_REC);   /* the harbour, the pools (0x338CC0) */
     for (uint32_t i = 0; i < n && s->nwater < 16; i++) {
         WaterDef wd;
         static const float at[3] = { 0, 0, 0 };
-        if (water_read(record_group(block, r[i]), &wd) == 0 && (s->water[s->nwater] = water_new(&wd, at, 0)) != NULL)
-            s->nwater++;
+        int read = water_read(record_group(block, r[i]), &wd);
+        if (scene_failed(s)) goto failed;
+        if (!read && (s->water[s->nwater] = water_new(&wd, at, 0)) != NULL) s->nwater++;
     }
     n = group_all(block, "ActorInstance|", r, MAX_REC);
     for (uint32_t i = 0; i < n; i++) {
         Group a = record_group(block, r[i]), t = template_of(c, group_str(a, "Name"));
-        if (!a.at || group_num(a, "SpawnedItem", 0) != 0)
-            continue;
+        if (scene_failed(s)) goto failed;
+        int spawned = group_num(a, "SpawnedItem", 0) != 0;
+        if (scene_failed(s)) goto failed;
+        if (!a.at || spawned) continue;
         if (!t.at) {
             s->missing++;
             continue;
         }
-        if (parade_script_ours(group_str(t, "Script|ScriptName")))   /* a biker: parade.c's (main) */
-            continue;
+        int parade = parade_script_ours(group_str(t, "Script|ScriptName"));
+        if (scene_failed(s)) goto failed;
+        if (parade) continue;                       /* a biker: parade.c's (main) */
         float xyz[3];
         location(a, xyz);
-        people_set_instance(s->folk, people_add(s->folk, t, xyz, group_num(a, "ZRotation", 0)), a);   /* (its chain) */
+        float rotation = group_num(a, "ZRotation", 0);
+        if (scene_failed(s)) goto failed;
+        int who = people_add(s->folk, t, xyz, rotation);
+        if (scene_failed(s)) goto failed;
+        people_set_instance(s->folk, who, a);
         s->people++;
     }
     people_set_block(s->folk, block);                /* the SpawnedItem ones come by the chains (people.h) */
+    if (scene_failed(s)) goto failed;
     Group occ = group_sub(block, "Occupants");
     s->music = group_str(block, "Music");
     s->block = block;
@@ -3876,11 +4304,14 @@ int city_build(City *c, const char *block_name, int night, Scene *s)
     s->military_end = group_num(occ, "MilitaryEndRate", 0.9f);
     s->military_range = group_num(occ, "MilitaryTimeRange", 240);
     n = occ.at ? group_values(occ, "MilitaryInstance|", &where, r, MAX_REC) : 0;
+    if (scene_failed(s)) goto failed;
     for (uint32_t i = 0; i < n && s->nmilitary < 16; i++) {
         Group mi = record_group(where, r[i]);
         const char *name = group_str(mi, "OTRef|Name");
-        if (!name || !template_of(c, name).at)
-            continue;
+        if (scene_failed(s)) goto failed;
+        Group military = template_of(c, name);
+        if (scene_failed(s)) goto failed;
+        if (!name || !military.at) continue;
         s->military[s->nmilitary] = name;
         s->military_freq[s->nmilitary++] = group_num(mi, "Frequency", 1);
     }
@@ -3892,6 +4323,7 @@ int city_build(City *c, const char *block_name, int night, Scene *s)
         Group oi = record_group(where, r[i]);
         const char *name = group_str(oi, "OTRef|Name");
         Group t = template_of(c, name);
+        if (scene_failed(s)) goto failed;
         if (!t.at)
             continue;
         s->occupant[s->noccupants] = t;
@@ -3899,27 +4331,30 @@ int city_build(City *c, const char *block_name, int night, Scene *s)
         char rn[96];
         snprintf(rn, sizeof rn, "%sRunner", name);
         Group rt = template_of(c, rn);
+        if (scene_failed(s)) goto failed;
         if (fill && rt.at && c->nrunners < 16)
             c->runners[c->nrunners++] = rt;
     }
     /* [R] Traffic::onActivateBlock: the crowds come once a world (bCreateCrowd, set by its onInit), on the first block
      * with runners whose CreateCrowd (1 unless set; 0 in HK01, HK02, SF10) is not 0; with them the 3D sound
      * Crowd_Panic at the block's origin (SoundEffect.start(name, 1): it goes when it has played, sound.c) */
-    if (c->create_crowd && c->nrunners && group_num(block, "CreateCrowd", 1) != 0) {
+    int create_crowd = c->create_crowd && c->nrunners && group_num(block, "CreateCrowd", 1) != 0;
+    if (scene_failed(s)) goto failed;
+    if (create_crowd) {
         static const float CROWD[2][3] = { { -14, 0.5f, 0 }, { 8, -3, 0 } };
-        static const float ORIGIN[3] = { 0, 0, 0 };
         c->create_crowd = 0;
-        for (int k = 0; k < 2 && c->nrunners; k++)
+        for (int k = 0; k < 2 && c->nrunners; k++) {
             s->people += people_crowd(s->folk, c->runners, c->nrunners, CROWD[k]);
-        int se = sound_effect_start("Crowd_Panic", 1);
-        if (se >= 0)                                 /* (sfx.isValid()) */
-            sound_effect_set_point(se, ORIGIN);
+            if (scene_failed(s)) goto failed;
+        }
+        crowd_sound = 1;                            /* commit only after all later construction succeeds */
     }
     traffic(s, block, 0);
     /* the next two blocks behind it (0x302AF0): slot 1 at y + 41, slot 2 at y + 82 (hard-coded), their ground, every
      * building (0x3059D0) and the objects and waters LoadWhenWaiting (slot 1) or LoadWhenDistant (slot 2) has
      * (0x3050F0), and their traffic; no people. Every BlockList ends in two buffer blocks, so the last block has them too. */
     Group bl = group_sub(group_sub(c->world, "BlockData"), "BlockList");
+    if (scene_failed(s)) goto failed;
     Record lr[MAX_REC];
     uint32_t nl = group_items(bl, lr, MAX_REC);
     int at = -1;
@@ -3930,6 +4365,7 @@ int city_build(City *c, const char *block_name, int night, Scene *s)
         const char *next = record_str(bl, lr[at + slot]);
         snprintf(key, sizeof key, "BlockDef|%s", next);
         Group nb = group_sub(group_sub(c->world, "BlockData"), key);
+        if (scene_failed(s)) goto failed;
         if (!nb.at)
             continue;
         float y0 = 41.0f * (float)slot;
@@ -3937,17 +4373,21 @@ int city_build(City *c, const char *block_name, int night, Scene *s)
         const char *g = group_str(nb, "Shape|GroundShape");
         if (g)
             place_model(c, s, g, there, -1);
+        if (scene_failed(s)) goto failed;
         float bro = group_num(nb, "BackRowOffset", 10);
         n = group_values(nb, "BuildingInstance|", &where, r, MAX_REC);
+        if (scene_failed(s)) goto failed;
         for (uint32_t i = 0; i < n; i++)
             if (building(c, s, record_group(where, r[i]), bro, y0, 1) != 0)
                 goto failed;
         for (int k = 0; k < 3; k++) {
             n = group_values(nb, objects[k], &where, r, MAX_REC);
+            if (scene_failed(s)) goto failed;
             for (uint32_t i = 0; i < n; i++) {
                 Group o = record_group(where, r[i]);
                 if (group_num(o, slot == 1 ? "LoadWhenWaiting" : "LoadWhenDistant", 0) != 0)
                     place_object(c, s, o, there);
+                if (scene_failed(s)) goto failed;
             }
         }
         /* its waters with the same key (0x3050F0 at 0x305888 .. 0x305960: the reader with f12 = the slot's y > 0):
@@ -3957,37 +4397,55 @@ int city_build(City *c, const char *block_name, int night, Scene *s)
             Group o = record_group(nb, r[i]);
             WaterDef wd;
             float off[3] = { 0, y0, 0 };
-            if (group_num(o, slot == 1 ? "LoadWhenWaiting" : "LoadWhenDistant", 0) != 0 && water_read(o, &wd) == 0 &&
-                (s->water[s->nwater] = water_new(&wd, off, 1)) != NULL)
-                s->nwater++;
+            int load = group_num(o, slot == 1 ? "LoadWhenWaiting" : "LoadWhenDistant", 0) != 0;
+            if (scene_failed(s)) goto failed;
+            int read = load ? water_read(o, &wd) : -1;
+            if (scene_failed(s)) goto failed;
+            if (!read && (s->water[s->nwater] = water_new(&wd, off, 1)) != NULL) s->nwater++;
         }
         traffic(s, nb, y0);
     }
     update(s, 0, 1);
+    if (scene_failed(s)) goto failed;
     obstacle_boxes(s);
-    light_buildings(s);
+    if (scene_failed(s)) goto failed;
+    if (light_buildings(s) != 0)
+        goto failed;
+    if (scene_failed(s)) goto failed;
+    if (crowd_sound) {
+        static const float ORIGIN[3] = { 0, 0, 0 };
+        int se = sound_effect_start("Crowd_Panic", 1);
+        if (se >= 0) sound_effect_set_point(se, ORIGIN);
+    }
     return 0;
 failed:
+    c->create_crowd = saved_crowd;
+    c->nrunners = saved_nrunners;
+    memcpy(c->runners, saved_runners, sizeof saved_runners);
     scene_free(s);
     return -1;
 }
 
 void city_build_left(City *c, const char *block_name, Scene *s)
 {
+    if (scene_failed(s)) return;
     char key[96];
     snprintf(key, sizeof key, "BlockDef|%s", block_name ? block_name : "");
     Group b = group_sub(group_sub(c->world, "BlockData"), key), where;
+    if (scene_failed(s)) return;
     if (!b.at)
         return;
     const char *g = group_str(b, "Shape|GroundShape");
     if (g)
         place_model(c, s, g, mat_trs_z(0, -41, 0, 0), -1);
+    if (scene_failed(s)) return;
     float back = group_num(b, "BackRowOffset", 10);
     static Record r[MAX_REC];
     uint32_t n = group_values(b, "BuildingInstance|", &where, r, MAX_REC);
     for (uint32_t i = 0; i < n; i++) {
         Group inst = record_group(where, r[i]), t = template_of(c, group_str(inst, "TemplateName"));
         float left = group_num(inst, "LeftEdgeXPos", 0);
+        if (scene_failed(s)) return;
         if (!t.at || left < -50.0f || !(left < 50.0f))   /* [R 0x303EB4 .. 0x303EF0] */
             continue;
         const char *shape = group_str(t, "Shape|RubbleShape");
@@ -3998,8 +4456,10 @@ void city_build_left(City *c, const char *block_name, Scene *s)
         float w = group_num(t, "Width", 0);          /* [R 0x303C90] where the building stood, 41 behind */
         place_model(c, s, shape, mat_trs_z(left + 0.5f * CELL * w, -36 + (group_num(inst, "Row", 0) != 0 ? back : 0),
                                            0, 0), -1);
+        if (scene_failed(s)) return;
     }
     update(s, 0, 1);
+    if (scene_failed(s)) return;
 }
 
 /* ---------------------------------------------------------------- monsters */
@@ -4032,20 +4492,25 @@ uint32_t monster_names(const Vol *vol, const char **names, uint32_t max)
 
 static Bundle *own_bundle(const Vol *vol, Scene *s, const char *file)
 {
+    if (scene_failed(s)) return NULL;
+    if (!vol_find(vol, file)) return NULL;          /* truly absent optional bundle */
     uint32_t size;
     uint8_t *data = vol_read(vol, file, &size);
     if (!data || s->nown == (int)(sizeof s->own / sizeof *s->own)) {
         free(data);
+        scene_fail(s);
         return NULL;
     }
     Bundle *b = calloc(1, sizeof *b);
     if (!b) {
         free(data);
+        scene_fail(s);
         return NULL;
     }
     if (bdp_load(b, data, size) != 0) {
         free(data);
         free(b);
+        scene_fail(s);
         return NULL;
     }
     b->scope = "Monsters";
@@ -4056,39 +4521,55 @@ static Bundle *own_bundle(const Vol *vol, Scene *s, const char *file)
 static Skin *new_skin(const Mesh *m)
 {
     Skin *sk = calloc(1, sizeof *sk);
-    for (uint32_t i = 0; i < m->nparts; i++)
+    if (!sk) return NULL;
+    for (uint32_t i = 0; i < m->nparts; i++) {
+        if (m->parts[i].nverts > UINT32_MAX - sk->nverts) goto failed;
         sk->nverts += m->parts[i].nverts;
-    sk->bones = calloc(sk->nverts ? sk->nverts : 1, sizeof *sk->bones);
-    sk->weights = calloc(sk->nverts ? sk->nverts : 1, sizeof *sk->weights);
-    sk->pos = calloc(3 * (sk->nverts ? sk->nverts : 1), sizeof(float));
-    sk->nrm = calloc(3 * (sk->nverts ? sk->nverts : 1), sizeof(float));
+    }
+    size_t n = sk->nverts ? sk->nverts : 1;
+    if (n > SIZE_MAX / sizeof *sk->bones || n > SIZE_MAX / sizeof *sk->weights ||
+        n > SIZE_MAX / (3 * sizeof(float))) goto failed;
+    sk->bones = calloc(n, sizeof *sk->bones);
+    sk->weights = calloc(n, sizeof *sk->weights);
+    sk->pos = calloc(3 * n, sizeof(float));
+    sk->nrm = calloc(3 * n, sizeof(float));
+    if (!sk->bones || !sk->weights || !sk->pos || !sk->nrm) goto failed;
     return sk;
+failed:
+    skin_free(sk);
+    return NULL;
 }
 
 int city_monster(City *c, Scene *s, const char *monster, int clip_index, float x, float y, float deg)
 {
+    if (scene_failed(s)) return -2;
     char file[96];
     if (s->nmon >= SCENE_MONSTERS)
         return -1;
+    int own_start = s->nown;
     SceneMonster *sm = &s->mon[s->nmon];
     snprintf(file, sizeof file, "%s.cmp", monster);
     Bundle *mb = own_bundle(c->vol, s, file);
+    if (scene_failed(s)) return -2;
     snprintf(file, sizeof file, "%s_anims.cmp", monster);
     Bundle *ab = own_bundle(c->vol, s, file);
+    if (scene_failed(s)) return -2;
     if (!mb || !ab)
-        return -1;
+        goto failed_bundles;
     const BdpEntry *te = NULL;
     for (uint32_t i = 0; i < mb->nentries && !te; i++)
         if (mb->entries[i].type == ET_TREE && mb->entries[i].extra == 1)
             te = &mb->entries[i];
     if (!te)
-        return -1;
+        goto failed_bundles;
     int id = new_instance(s, mat_trs_z(x, y, 0, deg), -1);
+    if (id < 0) return id;
     Instance *in = &s->instances[id];
-    tree_read(mb, te, NULL, &in->tree);
+    if (tree_read(mb, te, NULL, &in->tree) != 0) return scene_fail(s);
     in->node = calloc(in->tree.n ? in->tree.n : 1, sizeof *in->node);
     in->pose = calloc(in->tree.n ? in->tree.n : 1, sizeof *in->pose);
     in->held = calloc(in->tree.n ? in->tree.n : 1, sizeof *in->held);
+    if (!in->node || !in->pose || !in->held) return scene_fail(s);
     /* its clips: the keyframed ones for this skeleton; -1 picks the body idle (SKELETON_n_IDLE, else ..._SHORT) */
     const BdpEntry *pick = NULL;
     int k = 0, pick_rank = 0;
@@ -4111,7 +4592,8 @@ int city_monster(City *c, Scene *s, const char *monster, int clip_index, float x
         }
         k++;
     }
-    if (pick && clip_read(pick, &in->clip) == 0) {
+    if (pick) {
+        if (clip_read(pick, &in->clip) != 0) return scene_fail(s);
         in->has_clip = 1;
         sm->clip = bdp_name(ab, pick->name);
         if (!strncmp(sm->clip, "000", 3))
@@ -4123,16 +4605,18 @@ int city_monster(City *c, Scene *s, const char *monster, int clip_index, float x
     for (uint32_t i = 0; i < mb->nentries; i++)
         if (mb->entries[i].type == ET_CLOTH && !cloth) {
             ncloth = cloth_particles(&mb->entries[i], &cloth);
+            if (!cloth) return scene_fail(s);
             cloth_entry = &mb->entries[i];
         }
     for (uint32_t i = 0; i < mb->nentries; i++) {
         const BdpEntry *e = &mb->entries[i];
         if (e->type != ET_SKINNED && e->type != ET_MESH)
             continue;
-        Mesh m;
-        if (mesh_read(e, &m) != 0)
-            continue;
-        Skin *sk = new_skin(&m);
+        Mesh m = { 0 };
+        Skin *sk = NULL;
+        if (mesh_read(e, &m) != 0) goto mesh_failed;
+        sk = new_skin(&m);
+        if (!sk) goto mesh_failed;
         uint32_t v = 0;
         for (uint32_t pi = 0; pi < m.nparts; pi++) {
             const MeshPart *p = &m.parts[pi];
@@ -4152,10 +4636,12 @@ int city_monster(City *c, Scene *s, const char *monster, int clip_index, float x
                     }
             }
         }
-        if (!m.parts[0].bones && cloth_entry && m.nparts) {   /* the cloth mesh: on the simulation */
+        if (m.nparts && !m.parts[0].bones && cloth_entry) {   /* the cloth mesh: on the simulation */
             sk->cloth = cloth_new(cloth_entry->data, cloth_entry->size);
-            if (sk->cloth) {
+            if (!sk->cloth) goto mesh_failed;
+            {
                 sk->particle = malloc(sizeof *sk->particle * (sk->nverts ? sk->nverts : 1));
+                if (!sk->particle) goto mesh_failed;
                 for (uint32_t k = 0; k < sk->nverts; k++)
                     sk->particle[k] = -1;
                 uint32_t base = 0;                   /* the mesh's own vertex -> particle table (0x1AA960), else a
@@ -4163,8 +4649,9 @@ int city_monster(City *c, Scene *s, const char *monster, int clip_index, float x
                 for (uint32_t pi = 0; pi < m.nparts; base += m.parts[pi].nverts, pi++) {
                     const MeshPart *p = &m.parts[pi];
                     ClothMeshPart cp;
-                    if (!e->wii &&                   /* the Wii's has none: its vertices are on their particles */
-                        cloth_mesh_part(sk->cloth, (int)pi, e->data, e->size, e->data2, e->size2, &cp) == 0) {
+                    int status = e->wii ? -1 : cloth_mesh_part(sk->cloth, (int)pi, e->data, e->size, e->data2, e->size2, &cp);
+                    if (status == -2) goto mesh_failed;
+                    if (status == 0) {
                         if ((uint32_t)cp.nverts == p->nverts)
                             for (uint32_t j = 0; j < p->nverts; j++)
                                 sk->particle[base + j] = cp.particle[j];
@@ -4184,7 +4671,16 @@ int city_monster(City *c, Scene *s, const char *monster, int clip_index, float x
                 }
             }
         }
-        push_item(s, scene_add_mesh(s, m, mb), id, -1, sk);
+        int mi = scene_add_mesh(s, m, mb);
+        if (mi < 0) goto mesh_failed;
+        memset(&m, 0, sizeof m);
+        if (push_item(s, (uint32_t)mi, id, -1, sk) != 0) goto mesh_failed;
+        continue;
+mesh_failed:
+        skin_free(sk);
+        mesh_free(&m);
+        free(cloth);
+        return scene_fail(s);
     }
     free(cloth);
     sm->inst = id;
@@ -4197,7 +4693,16 @@ int city_monster(City *c, Scene *s, const char *monster, int clip_index, float x
     sm->bundle = mb;
     s->nmon++;
     update(s, 0, 1);
+    if (scene_failed(s)) return -2;
     return s->nmon - 1;
+failed_bundles:
+    while (s->nown > own_start) {
+        Bundle *b = s->own[--s->nown];
+        s->own[s->nown] = NULL;
+        bdp_free(b);
+        free(b);
+    }
+    return -1;
 }
 
 int scene_monster_clip(Scene *s, int k, const char *suffix, float *speed)
@@ -4240,6 +4745,7 @@ int scene_monster_clip(Scene *s, int k, const char *suffix, float *speed)
 
 int scene_monster_play(Scene *s, int k, const char *clip)
 {
+    if (scene_failed(s)) return -2;
     Instance *in = mon_inst(s, k);
     if (!in || !s->mon[k].anims || !clip)
         return -1;
@@ -4255,7 +4761,7 @@ int scene_monster_play(Scene *s, int k, const char *clip)
             continue;
         Clip c;
         if (clip_read(e, &c) != 0)
-            return -1;
+            return scene_fail(s);
         if (in->has_clip)
             clip_free(&in->clip);
         in->clip = c;
@@ -4282,6 +4788,7 @@ static void mark_subtree(const Tree *t, int root, uint8_t *mask)
 
 int scene_monster_face(Scene *s, int k, const char *clip, int head)
 {
+    if (scene_failed(s)) return -2;
     Instance *in = mon_inst(s, k);
     if (!in || !s->mon[k].anims || !clip)
         return -1;
@@ -4295,8 +4802,17 @@ int scene_monster_face(Scene *s, int k, const char *clip, int head)
             e = &ab->entries[i];
     }
     Clip c;
-    if (!e || clip_read(e, &c) != 0)
+    if (!e)
         return -1;
+    if (clip_read(e, &c) != 0)
+        return scene_fail(s);
+    if (!in->face_mask) {
+        in->face_mask = calloc(in->tree.n ? in->tree.n : 1, 1);
+        if (!in->face_mask) {
+            clip_free(&c);                         /* unpublished replacement */
+            return scene_fail(s);
+        }
+    }
     if (in->has_face)
         clip_free(&in->face);
     in->face = c;
@@ -4304,8 +4820,6 @@ int scene_monster_face(Scene *s, int k, const char *clip, int head)
     in->face_t = 0;
     /* the mask (0x2EA458): the subtree of Bip01 Head; for five skeletons the subtree three nodes above it and their
      * brows and eyes by name; setFacialAnim's head layer adds or takes out the head itself */
-    if (!in->face_mask)
-        in->face_mask = calloc(in->tree.n ? in->tree.n : 1, 1);
     memset(in->face_mask, 0, in->tree.n);
     int hd = -1;
     for (uint32_t i = 0; i < in->tree.n && hd < 0; i++)
@@ -4427,6 +4941,7 @@ static const char *hitter_move(const Scene *s, const SceneBuilding *sb)
 
 void scene_block_left(Scene *s)
 {
+    if (scene_failed(s)) return;
     s->left = 1;
     for (uint32_t i = 0; i < s->nbuildings; i++) {
         SceneBuilding *sb = &s->buildings[i];
@@ -4444,6 +4959,7 @@ void scene_block_left(Scene *s)
  * 0x2BA930); a floating number at the attacker's place (+0x2C, 0x2BAAD0) [R] */
 static void building_scoring(Scene *s, SceneBuilding *sb, int i)
 {
+    if (scene_failed(s)) return;
     for (int q = 0; q < sb->b.nscore; q++) {
         int ev = sb->b.score[q].event;
         if (ev == BSCORE_NO_ONE) {
@@ -4465,12 +4981,14 @@ static void building_scoring(Scene *s, SceneBuilding *sb, int i)
         army_score_building(s->army, sb->hitter, i, sb->props, ev == BSCORE_CELL ? ARMY_SCORE_CELL :
                             ev == BSCORE_FLOOR ? ARMY_SCORE_FLOOR : ARMY_SCORE_BUILDING, sb->b.score[q].state,
                             hitter_move(s, sb), sb->b.width, sb->b.n, fronts, nf, at);
+        if (scene_failed(s)) return;
     }
     sb->b.nscore = 0;
 }
 
 void scene_buildings_update(Scene *s, float dt)
 {
+    if (scene_failed(s)) return;
     s->water_acc += dt;                              /* the water, a world step at a time: 0x338180 -> 0x336DC0 in */
     if (s->water_acc > 0.25f)                        /* the world's object update (0x284E40), dt gWorld +4 = 1/30 [R] */
         s->water_acc = 0.25f;
@@ -4517,6 +5035,7 @@ void scene_buildings_update(Scene *s, float dt)
             float bottom, height;
             building_storey(&sb->b, ls, &bottom, &height);
             people_window_move(s->folk, w, sb->b.min[2] + bottom, sb->b.shake_time > 0 ? building_shake(&sb->b) : 0);
+            if (scene_failed(s)) return;
         }
         for (int k = 0; s->army && (moving || sb->moving) && k < s->nslots; k++) {
             /* [R 0x30CD20] its window soldiers too: the update is the Actor's, and they are the slots' actors as the
@@ -4533,6 +5052,7 @@ void scene_buildings_update(Scene *s, float dt)
             pos[2] += sb->b.min[2] + bottom - ws->win_floor;
             ws->win_floor = sb->b.min[2] + bottom;
             army_window_place(s->army, ws->unit, pos);
+            if (scene_failed(s)) return;
         }
         /* its light again (0x2BF180: when it changed, +0x154, kept until it is served, or a neighbour's top did,
          * 0x31C860, used up even when refused), through the work queue, before the passes that use it */
@@ -4556,6 +5076,7 @@ void scene_buildings_update(Scene *s, float dt)
             scene_fx(s, sb->fx_wall_small, sb->b.hit_debris[k], in);
         }
         building_scoring(s, sb, (int)i);
+        if (scene_failed(s)) return;
         sb->b.nhit_debris = 0;
         if (sb->b.pre_collapse || sb->b.drop_dust) {   /* about to fall, or a storey down: the dust at its foot
                                                       * [R 0x2BD890 .. 0x2BD934, 0x2BD740 .. 0x2BD798] */
@@ -4570,13 +5091,16 @@ void scene_buildings_update(Scene *s, float dt)
             sb->b.pre_collapse = sb->b.drop_dust = 0;
         }
         open_windows(s, sb);                         /* the open windows, as they now are (0x2BECC0) */
+        if (scene_failed(s)) return;
         if (!sb->b.dirty || sb->mesh < 0) {
             if (moving || relit)
                 facade_passes(s, sb);
+            if (scene_failed(s)) return;
             continue;
         }
         sb->b.dirty = 0;
         facade_passes(s, sb);
+        if (scene_failed(s)) return;
         /* the cells' debris effects, as the building asked for them (building.c: 0x2BB950, 0x2BD7D0 through 0x3101C0):
          * a first crack Glass_Large where the cell's column has an Outline, else Wall_Small; Wall_Small; Wall_Large;
          * placed on the front at the cell's middle, in the face's frame (0x30F710: the front's the identity) [R] */
@@ -4604,6 +5128,7 @@ void scene_buildings_update(Scene *s, float dt)
             if (s->edibles && k - 1 < BUILDING_STOREYS)   /* 0x317A70: its edibles gone, those next to it out */
                 edible_floor_fell(s->edibles, (int)i, sb->b.live[k - 1], k < sb->b.n ? sb->b.live[k] : -1,
                                   k >= 2 ? sb->b.live[k - 2] : -1);
+            if (scene_failed(s)) return;
             for (int n = 0; k - 1 < BUILDING_STOREYS && n < s->nslots; n++) {
                 /* [R 0x317A70] the occupants' slots of the fallen floor too (the one list): their actors flagged
                  * 0x800, which the actor update (0x30CD20) deletes, no window closed; the slots never filled again.
@@ -4624,7 +5149,8 @@ void scene_buildings_update(Scene *s, float dt)
         }
         sb->seen_falls = sb->b.falls;
         if (s->traffic && sb->b.state == BUILDING_CRACKING && sb->seen_state != BUILDING_CRACKING)
-            vehicle_building_gone(s->traffic, (int)i);   /* onBuildingDestruction: its roof rockets fly */
+            vehicle_building_gone(s->traffic, (int)i);
+        if (scene_failed(s)) return;   /* onBuildingDestruction: its roof rockets fly */
         sb->seen_state = sb->b.state;
         for (int ls = 0; (s->folk || s->edibles) && ls < sb->b.n; ls++)   /* 0x317DC0: a front cell set to 2 or more */
             for (int col = 0; col < sb->b.width; col++) {
@@ -4640,8 +5166,10 @@ void scene_buildings_update(Scene *s, float dt)
                                                       * not setCellDamage, and the blow that felled it returns before
                                                       * its own cell (0x2BBAE4), so no 0x317DC0 (its slots: 0x317A70) */
                 scene_cell_broken(s, (int)i, o, col, st);
+                if (scene_failed(s)) return;
                 if (s->edibles && first)             /* its edible comes out (0x317BC0) */
                     edible_cell_broken(s->edibles, (int)i, o, col, st, sb->b.state);
+                if (scene_failed(s)) return;
             }
         MeshPart *p = &s->meshes[sb->mesh].mesh.parts[0];
         for (int st = 0; st < sb->b.storeys; st++)
@@ -4696,6 +5224,7 @@ void scene_monster_blend_step(Scene *s, int k, float dt)
 
 void scene_monster_face_blend(Scene *s, int k, float seconds)
 {
+    if (scene_failed(s)) return;
     Instance *in = mon_inst(s, k);
     if (!in)
         return;
@@ -4705,6 +5234,10 @@ void scene_monster_face_blend(Scene *s, int k, float seconds)
     }
     if (!in->face_held)
         in->face_held = calloc(in->tree.n ? in->tree.n : 1, sizeof *in->face_held);
+    if (!in->face_held) {
+        scene_fail(s);
+        return;
+    }
     memcpy(in->face_held, in->pose, sizeof *in->face_held * in->tree.n);
     in->face_blend_left = in->face_blend_time = seconds;
 }
@@ -4712,12 +5245,9 @@ void scene_monster_face_blend(Scene *s, int k, float seconds)
 /* a pose (each node's local t, q) as the other side has it: 0x194BA0's rule [R], a pair swapped and each local
  * L' = S(the parent's axis) L S(its own axis), the root's parent axis the model's x (reflect_axis: Bip01 Sx L Sy,
  * Pelvis Sy L Sz, the others Sz L Sz), so that composed it is reflect_node's Sx M[mirror(n)] S_n */
-static void mirror_pose(const Instance *in, float (*p)[7])
+static void mirror_pose(const Instance *in, float (*p)[7], float (*was)[7])
 {
     uint32_t n = in->tree.n;
-    float (*was)[7] = malloc(sizeof *was * (n ? n : 1));
-    if (!was)
-        return;
     memcpy(was, p, sizeof *was * n);
     for (uint32_t i = 0; i < n; i++) {
         int m = in->tree.nodes[i].mirror, par = in->tree.nodes[i].parent;
@@ -4746,21 +5276,36 @@ static void mirror_pose(const Instance *in, float (*p)[7])
             p[i][k] = src[k] * (k == pa ? -1.0f : 1.0f);
         p[i][3] = -x; p[i][4] = -y; p[i][5] = -z; p[i][6] = w;   /* stored for row vectors (mat_tq) */
     }
-    free(was);
 }
 
 /* a clip starting on the other side: the game mirrors the new pose (0x194BA0 in 0x2FFF10) before it blends towards
  * the kept one, which stays as it was drawn; here the side is the drawing's, so the kept pose goes to the new side */
 void scene_monster_mirror(Scene *s, int k, int mirrored)
 {
+    if (scene_failed(s)) return;
     Instance *in = mon_inst(s, k);
     if (!in || !in->mirrored == !mirrored)
         return;
+    int body = in->held && in->blend_left > 0;
+    int face = in->face_held && in->face_blend_left > 0;
+    float (*was)[7] = NULL;
+    if (body || face) {
+        if (in->tree.n && sizeof *was > SIZE_MAX / in->tree.n) {
+            scene_fail(s);
+            return;
+        }
+        was = malloc(sizeof *was * (in->tree.n ? in->tree.n : 1));
+        if (!was) {
+            scene_fail(s);                         /* neither hold nor the side has changed */
+            return;
+        }
+    }
     in->mirrored = mirrored;
-    if (in->held && in->blend_left > 0)
-        mirror_pose(in, in->held);
-    if (in->face_held && in->face_blend_left > 0)
-        mirror_pose(in, in->face_held);
+    if (body)
+        mirror_pose(in, in->held, was);
+    if (face)
+        mirror_pose(in, in->face_held, was);
+    free(was);
 }
 
 int scene_monster_root(const Scene *s, int k, double seconds, float t[3], float q[4])
@@ -4901,10 +5446,7 @@ void scene_free(Scene *s)
         mesh_free(&s->meshes[i].mesh);
     for (uint32_t i = 0; i < s->nitems; i++)
         if (s->items[i].skin) {
-            Skin *sk = s->items[i].skin;
-            if (sk->cloth) cloth_free(sk->cloth);
-            free(sk->particle);
-            free(sk->bones); free(sk->weights); free(sk->pos); free(sk->nrm); free(sk);
+            skin_free(s->items[i].skin);
         }
     for (uint32_t i = 0; i < s->ninstances; i++) {
         tree_free(&s->instances[i].tree);
@@ -4958,5 +5500,6 @@ void scene_free(Scene *s)
         free(s->scenery[i].light);
     }
     free(s->scenery);
+    free(s->cloth_scratch);
     memset(s, 0, sizeof *s);
 }

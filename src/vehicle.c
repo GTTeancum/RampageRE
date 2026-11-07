@@ -7,6 +7,42 @@
 #include "vehicle.h"
 #include "wrand.h"
 
+/* Callback arguments are evaluated before this boundary, including inherited reads. */
+static int host_stopped(const VehicleHost *h)
+{
+    return h && h->failed && h->failed(h->ctx);
+}
+static Group host_find(const VehicleHost *h, const char *book, const char *name)
+{
+    if (host_stopped(h) || !h->find) return (Group){ 0 };
+    Group result = h->find(h->ctx, book, name);
+    return host_stopped(h) ? (Group){ 0 } : result;
+}
+static int host_shape_box(const VehicleHost *h, const char *shape, float min[3], float max[3])
+{
+    if (host_stopped(h) || !h->shape_box) return 0;
+    int result = h->shape_box(h->ctx, shape, min, max);
+    return host_stopped(h) ? 0 : result;
+}
+static int host_shape_sphere(const VehicleHost *h, const char *shape, float centre[3], float *radius)
+{
+    if (host_stopped(h) || !h->shape_sphere) return 0;
+    int result = h->shape_sphere(h->ctx, shape, centre, radius);
+    return host_stopped(h) ? 0 : result;
+}
+static int host_node_world(const VehicleHost *h, const VehObj *o, const char *node, float out[16])
+{
+    if (host_stopped(h) || !h->node_world) return 0;
+    int result = h->node_world(h->ctx, o, node, out);
+    return host_stopped(h) ? 0 : result;
+}
+static int host_rod(const VehicleHost *h, const char *effect, float dir[3], float *speed, float *length, float *cycle, int *loops)
+{
+    if (host_stopped(h) || !h->rod) return 0;
+    int result = h->rod(h->ctx, effect, dir, speed, length, cycle, loops);
+    return host_stopped(h) ? 0 : result;
+}
+
 #define PI 3.14159265f
 #define TIMESTEP (1.0f / 30.0f)                      /* gWorld.getTimeStep(): its step, 1/30 [R 0x2B7800] */
 #define MAX_OBJS 128
@@ -176,7 +212,7 @@ static float tnum(const VehObj *o, const char *key, float def) { return gnum(o->
 
 static Group find_template(Vehicles *v, const char *name)
 {
-    return v->host.find && name ? v->host.find(v->host.ctx, "Objects1_Props", name) : (Group){ 0 };
+    return v->host.find && name ? host_find(&v->host, "Objects1_Props", name) : (Group){ 0 };
 }
 
 static int kind_of_template(Group t)
@@ -200,7 +236,7 @@ static int idx(const Vehicles *v, const VehObj *o) { return (int)(o - v->o); }
 static VehicleEvent *emit(Vehicles *v, int type, int obj, const char *name, const float pos[3])
 {
     static VehicleEvent spare;
-    if (v->nev >= MAX_EVENTS) {
+    if (host_stopped(&v->host) || v->nev >= MAX_EVENTS) {
         memset(&spare, 0, sizeof spare);
         return &spare;
     }
@@ -264,7 +300,7 @@ static void add_stats(Vehicles *v, VehObj *o, int monster, int type)
     e->amount = (float)(int)tnum(o, "Points", 0);
     e->v[0] = tnum(o, "Health", 0);
     e->v[1] = tnum(o, "Energy", 0);
-    if (v->army) {
+    if (!host_stopped(&v->host) && v->army) {
         army_add_stats(v->army, monster, o->tmpl, type);
         e->id = 1;
     }
@@ -389,7 +425,7 @@ static const float *book_box(Group g, float b[6])
 static void obj_shape_read(const Vehicles *v, const VehObj *o, CollideShape *s)
 {
     float tb[6], mb[6], c[3] = { 0, 0, 0 }, r = 1;
-    int have = o->shape && v->host.shape_box && v->host.shape_box(v->host.ctx, o->shape, mb, mb + 3);
+    int have = o->shape && v->host.shape_box && host_shape_box(&v->host, o->shape, mb, mb + 3);
     if (have) {
         float h[3];
         for (int k = 0; k < 3; k++) {
@@ -400,7 +436,7 @@ static void obj_shape_read(const Vehicles *v, const VehObj *o, CollideShape *s)
     }
     /* [R 0x28FD70 -> 0x184CB0] the sphere the model keeps, the union of its parts' spheres (0x185AA0) */
     if (have && v->host.shape_sphere)
-        v->host.shape_sphere(v->host.ctx, o->shape, c, &r);
+        host_shape_sphere(&v->host, o->shape, c, &r);
     collide_shape_pick(s, have ? c : NULL, r, o->tmpl.at ? book_box(o->tmpl, tb) : NULL, tnum(o, "CollisionRadius", -1),
                        tnum(o, "AutoCollisionBox", 0) != 0, NULL, -1, 0, have ? mb : NULL);
 }
@@ -634,6 +670,7 @@ static int traffic_update(Vehicles *v, float dt)
 
 int vehicle_load_traffic(Vehicles *v, int s, Group block_def)
 {
+    if (v && host_stopped(&v->host)) return 0;
     if (s < 0 || s >= SLOTS)
         return 0;
     TrafficSlot *ts = &v->slot[s];
@@ -876,7 +913,7 @@ static Group weapon_group(Group tmpl, Group *book_out, Vehicles *v)
     if (wc.at && group_values(wc, "Weapon|", &where, r, 4) > 0)
         w = record_group(where, r[0]);
     const char *name = gstr(w, "WeaponName");
-    *book_out = v->host.find && name ? v->host.find(v->host.ctx, "Weapons", name) : (Group){ 0 };
+    *book_out = v->host.find && name ? host_find(&v->host, "Weapons", name) : (Group){ 0 };
     return w;
 }
 /* [R] 0x299EC8: the template's own Weapon group first, then the book's (Weapons.bdp) */
@@ -1064,7 +1101,7 @@ static float ray_monster(const Vehicles *v, const float p[3], const float d[3], 
 static void ft_weapon(Vehicles *v, VehObj *o, float dt)
 {
     float from[3], nw[16];
-    int have_node = v->host.node_world && o->w.node && v->host.node_world(v->host.ctx, o, o->w.node, nw);
+    int have_node = v->host.node_world && o->w.node && host_node_world(&v->host, o, o->w.node, nw);
     if (have_node) {
         from[0] = nw[12]; from[1] = nw[13]; from[2] = nw[14];
     } else {
@@ -1089,11 +1126,11 @@ static void ft_weapon(Vehicles *v, VehObj *o, float dt)
     }
     float cn[16];
     const char *ctl = o->tc.rot_node ? o->tc.rot_node : o->tc.elev_node;
-    if (!(have_node && ctl && v->host.node_world(v->host.ctx, o, ctl, cn)))
+    if (!(have_node && ctl && host_node_world(&v->host, o, ctl, cn)))
         army_frame_turn(o->beam.R, front, o->tc.yaw, o->tc.pitch);
     float rd[3], speed, length, cycle;
     int loops, rod = v->host.rod && o->w.fire_fx &&
-                     v->host.rod(v->host.ctx, o->w.fire_fx, rd, &speed, &length, &cycle, &loops);
+                     host_rod(&v->host, o->w.fire_fx, rd, &speed, &length, &cycle, &loops);
     float bdir[3];
     army_beam_axis(o->beam.R, 1, dir, rod ? rd : NULL, bdir);
     if (o->w.firing) {
@@ -1365,12 +1402,14 @@ static VehObj *spawn_obj(Vehicles *v, const char *name, const float pos[3], floa
 
 int vehicle_spawn(Vehicles *v, const char *tmpl_name, const float pos[3], float facing, int building)
 {
+    if (v && host_stopped(&v->host)) return -1;
     VehObj *o = spawn_obj(v, tmpl_name, pos, facing, building);
     return o ? idx(v, o) : -1;
 }
 
 int vehicle_kind_of(Vehicles *v, const char *tmpl_name)
 {
+    if (v && host_stopped(&v->host)) return -1;
     return kind_of_template(find_template(v, tmpl_name));
 }
 
@@ -1397,6 +1436,7 @@ void vehicle_hidden_save(const Vehicles *v, VehicleHidden *out)
 
 int vehicle_level_start(Vehicles *v, float x, const VehicleHidden *keep)
 {
+    if (v && host_stopped(&v->host)) return -1;
     float a[3] = { x, 0, -0.5f }, b[3] = { 100, -5, -0.5f };
     v->drawn = 1;                                    /* its Construct's frand: the caller's, with Traffic's own */
     VehObj *o = spawn_obj(v, "HiddenVehicle", keep && keep->have ? keep->a : a, 0, -1);
@@ -1418,6 +1458,7 @@ int vehicle_level_start(Vehicles *v, float x, const VehicleHidden *keep)
 
 void vehicle_building_gone(Vehicles *v, int building)   /* Rocket.bsf onBuildingDestruction [R]: a waiting one flies */
 {
+    if (v && host_stopped(&v->host)) return;
     for (int i = 0; i < v->n; i++) {
         VehObj *o = &v->o[i];
         if (o->phase == VP_ALIVE && o->kind == VK_ROCKET && o->building == building && o->flags == 0)
@@ -1475,6 +1516,7 @@ static void obj_step(Vehicles *v, VehObj *o)
 
 void vehicle_update(Vehicles *v, float dt, const ArmyMonster *m, int nm, const ArmyBox *b, int nb)
 {
+    if (v && host_stopped(&v->host)) return;
     v->m = m;
     v->nm = m ? nm : 0;
     v->b = b;
@@ -1499,6 +1541,7 @@ void vehicle_update(Vehicles *v, float dt, const ArmyMonster *m, int nm, const A
 
 void vehicle_shot(Vehicles *v, int obj, const float dir[3])
 {
+    if (v && host_stopped(&v->host)) return;
     if (obj < 0 || obj >= v->n)
         return;
     VehObj *o = &v->o[obj];
@@ -1510,6 +1553,7 @@ void vehicle_shot(Vehicles *v, int obj, const float dir[3])
 
 int vehicle_hit(Vehicles *v, int monster, const float centre[3], float radius, float amount)
 {
+    if (v && host_stopped(&v->host)) return 0;
     (void)amount;                                    /* Vehicle.bsf and Rocket.bsf do not look at it */
     int hits = 0;
     for (int i = 0; i < v->n; i++) {
@@ -1545,6 +1589,7 @@ void vehicle_set_collide(Vehicles *v, CollideWorld *w) { v->cw = w; }
 
 void vehicle_collide_add(Vehicles *v, CollideWorld *w)
 {
+    if (v && host_stopped(&v->host)) return;
     for (int i = 0; i < v->n; i++) {
         VehObj *o = &v->o[i];
         o->cobj = -1;
@@ -1603,6 +1648,7 @@ int vehicle_nearest_pickup(const Vehicles *v, const float hand[3], const float r
  * never comes: it stays counted in the traffic until it is thrown, eaten or explodes), then onPickup */
 void vehicle_grab(Vehicles *v, int obj, int monster, float blend)
 {
+    if (v && host_stopped(&v->host)) return;
     (void)monster;
     if (obj < 0 || obj >= v->n || v->o[obj].phase != VP_ALIVE)
         return;
@@ -1620,6 +1666,7 @@ void vehicle_grab(Vehicles *v, int obj, int monster, float blend)
  * (army_hold_blend, 0x310B50) */
 void vehicle_hold(Vehicles *v, int obj, const float hand_world[16], int mirrored, float dt)
 {
+    if (v && host_stopped(&v->host)) return;
     if (obj < 0 || obj >= v->n || v->o[obj].phase != VP_HELD)
         return;
     VehObj *o = &v->o[obj];
@@ -1654,6 +1701,7 @@ void vehicle_hold(Vehicles *v, int obj, const float hand_world[16], int mirrored
  * then onThrow(monster, eat); it keeps the hand's turn as it flies, with no spin [R, VEHICLE_NOTES "The hold"] */
 void vehicle_throw(Vehicles *v, int obj, int monster, int eat, const float vel[3], float monster_heading)
 {
+    if (v && host_stopped(&v->host)) return;
     if (obj < 0 || obj >= v->n || v->o[obj].phase != VP_HELD)
         return;
     VehObj *o = &v->o[obj];
@@ -1718,6 +1766,7 @@ void vehicle_draw_world(const Vehicles *v, int i, float out[16])
 
 int vehicle_events(Vehicles *v, VehicleEvent *out, int max)
 {
+    if (v && host_stopped(&v->host)) return 0;
     int n = v->nev < max ? v->nev : max;
     memcpy(out, v->ev, sizeof *out * (size_t)n);
     memmove(v->ev, v->ev + n, sizeof *v->ev * (size_t)(v->nev - n));

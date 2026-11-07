@@ -202,6 +202,7 @@ typedef struct {
 
 typedef struct {
     const Bundle *city;
+    int construction_failed;                       /* sticky: only scene_free may use a failed partial Scene */
     Bundle *own[2 * SCENE_MONSTERS]; int nown;        /* bundles loaded for this scene (the monsters and their clips) */
     SceneMesh *meshes; uint32_t nmeshes, meshes_cap;
     int32_t *mesh_of_entry;                           /* per city bundle entry: its SceneMesh, -1 = not loaded */
@@ -314,11 +315,26 @@ typedef struct {
     /* the next two blocks of the city's BlockList, drawn behind this one at y + 41 and y + 82 (the block manager
      * 0x4D4E80's slots 1 and 2, 0x302AF0): their buildings are scenery, out of the play */
     SceneBuilding *scenery; uint32_t nscenery;
+    /* Shared by sequential skin_item calls; largest cloth's local positions/normals, freed by scene_free. */
+    float *cloth_scratch;
+    uint32_t cloth_scratch_particles;
 } Scene;
 
 typedef struct City City;
-City *city_open(const Vol *vol, const char *name);   /* NULL if the city's bundles are not in the archive */
+/* NULL on missing required media or error. On failure, keeps the previous live resolver.
+ * Optional output is 0 on success/ordinary absence, 1 for invalid keys, allocation or
+ * present-data read/parse/inheritance failure, including before a City owner exists. */
+City *city_open_checked(const Vol *vol, const char *name, int *load_failed_out);
+City *city_open(const Vol *vol, const char *name);   /* legacy wrapper without failure classification */
 void city_close(City *c);
+/* Present property data failed to read/parse/allocate, or its success cache is full.
+ * Sticky: activate/new_world/build never clear it. Absence is not a failure. */
+int city_load_failed(const City *c);
+/* Explicit recovery only after the prior operation, Scene and all borrowing managers
+ * have been torn down. Keeps successful cached Books stable until city_close. */
+void city_reset_load_failure(City *c);
+/* Latches owner City's failure into Scene; never destroys during an active callback. */
+int scene_failed(Scene *s);
 /* Restore a live city as the property-book resolver, or clear it with NULL. */
 void city_activate(City *c);
 uint32_t city_blocks(City *c, const char **names, uint32_t max);   /* the block list, without repeats */
@@ -343,11 +359,14 @@ void scene_monster_sway(Scene *s, int k, int building);
 /* the root's axes held (bit 0 x, 1 y, 2 z) at hold, and turn degrees about Z taken out of it: the motion the
  * monster itself makes */
 void scene_monster_root_motion(Scene *s, int k, int axes, const float hold[3], float turn);
+/* Clip replacement: 0 = ok, -1 = optional absence, -2 = sticky fatal reader/allocation failure. */
 int scene_monster_play(Scene *s, int k, const char *clip);
 int scene_monster_slot(const Scene *s, int inst);  /* the monster slot whose instance inst is, -1 none */
-/* the face layer plays clip (head: Bip01 Head itself too), at face_t 0 .. 1 (Instance.face_t); 0 = ok */
+/* the face layer plays clip (head: Bip01 Head itself too), at face_t 0 .. 1 (Instance.face_t);
+ * same result contract as scene_monster_play. Fatal failures require stopping same-frame Scene use. */
 int scene_monster_face(Scene *s, int k, const char *clip, int head);
-/* the face bones blend over seconds from where they are now (a face clip starting, 0x2FF910) */
+/* the face bones blend over seconds from where they are now (a face clip starting, 0x2FF910);
+ * allocation failure sets construction_failed. The caller must stop before dispatching more events. */
 void scene_monster_face_blend(Scene *s, int k, float seconds);
 /* the monster's hand (0 left, 1 right, as drawn) in the world, as the clips posed it (before the IK); 0 = ok */
 int scene_monster_hand(const Scene *s, int k, int hand, Mat4 *world);
@@ -431,6 +450,7 @@ int scene_monster_clip_root(const Scene *s, int k, const char *clip, double seco
 /* a bake (0x300FE0): the root of the pose kept for the blend (and the last one) set to this (the new clip's at its start) */
 void scene_monster_hold_root(Scene *s, int k, const float t[3], const float q[4]);
 /* the side it is drawn on (mirrored or not); a blend under way keeps the pose it had as it was drawn */
+/* Scratch allocation failure sets construction_failed without changing the side or either held pose. */
 void scene_monster_mirror(Scene *s, int k, int mirrored);
 int city_camera(City *c, Group *two_tilts);
 /* a group of a property book by the book's name ("Objects1_Props", "Weapons": <name>.bdp in the Vol); one the book

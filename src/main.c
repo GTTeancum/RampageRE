@@ -349,6 +349,8 @@ typedef struct Viewer {
 } Viewer;
 
 /* gCommon.getPlayType() of the game played: the demo's 0, else --play's or the shell's (unset: the campaign) */
+static int scene_construction_stop(Viewer *v);
+
 static int play_type(const Viewer *v) { return v->attract ? GP_ATTRACT : v->play_type ? v->play_type : GP_CAMPAIGN; }
 /* a city's place in the campaign: the profile's CityData index (0: Las Vegas when it has not got it) */
 static int campaign_index(const Viewer *v, const char *city)
@@ -390,6 +392,7 @@ static CamShake *mon_shake(Mon *mo)
  * at 0xC0 and the small one off for that long), on the monster's pad (+0xFC); never a computer's monster (+0x108) */
 static void mon_rumble(const Mon *mo, int ms)
 {
+    if (scene_construction_stop(mo->v)) return;
     if (mo->v->pads_live && mo->v->vibrate && !mo->is_ai && mo->drive != DRIVE_COMPUTER)
         pad_rumble(mo->slot, 0xC0 / 255.0f, ms / 1000.0f);
 }
@@ -468,12 +471,16 @@ static float root_yaw(Mon *mo, double t)
 }
 
 /* the monster plays the clip of the runner's state, from the runner's time */
+static int scene_construction_stop(Viewer *v);
+
 static void play_state(Mon *mo)
 {
+    if (scene_construction_stop(mo->v)) return;
     Viewer *v = mo->v;
     const MoveState *st = &mo->graph.states[mo->run.state];
     if (scene_monster_play(&v->scene, mo->slot, st->clip) != 0)
         printf("%s: no clip %s\n", st->name ? st->name : "?", st->clip ? st->clip : "-");
+    if (scene_construction_stop(v)) return;
     mo->entry_yaw = root_yaw(mo, clip_at(mo, st, mo->run.time));
     mo->entry_t = clip_at(mo, st, mo->run.time);
     if (getenv("RAMPAGE_ROOT")) {
@@ -491,6 +498,7 @@ static void play_state(Mon *mo)
     mo->mirror = mo->mirror_queued;                    /* 0x2E67E8: a clip starts in the queued mirror state */
     mo->input.mirrored = mo->mirror;
     scene_monster_mirror(&v->scene, mo->slot, mo->mirror);
+    if (scene_construction_stop(v)) return;
     float q[4];
     if (root_at(mo, clip_at(mo, st, mo->run.time), mo->entry_root, q) != 0)
         memset(mo->entry_root, 0, sizeof mo->entry_root);
@@ -506,52 +514,62 @@ static void clip_event(Mon *mo, const MoveEvent *e);
  * Expression_Burp's belch, Expression_Spew's fire and smoke (type 12), their sounds (6), Expression_Barf's doBarf */
 static void face_events(Mon *mo, const MoveNode *n, float from, float to)
 {
-    for (int i = 0; n && i < n->nevents; i++)
+    if (scene_construction_stop(mo->v)) return;
+    for (int i = 0; n && i < n->nevents && !scene_construction_stop(mo->v); i++)
         if (n->events[i].at > from && n->events[i].at <= to)
-            clip_event(mo, &n->events[i]);
+            { clip_event(mo, &n->events[i]); if (scene_construction_stop(mo->v)) return; }
 }
 
 static void face_start(Mon *mo)
 {
+    if (scene_construction_stop(mo->v)) return;
     Viewer *v = mo->v;
     const FaceRec *f = &mo->faces.list[0];
     const MoveNode *n = f->node;
     int r = scene_monster_face(&v->scene, mo->slot, n->clip, f->head);
     if (getenv("RAMPAGE_TRACE"))
         printf("face %s: %s -> %d\n", f->name, n->clip, r);
-    if (r != 0)
+    if (scene_construction_stop(v) || r != 0)
         return;
     mo->face = n;
     scene_monster_face_blend(&v->scene, mo->slot, n->blend);   /* 0x2FF910: from the face as it was, over the node's blend */
+    if (scene_construction_stop(v)) return;
     mo->face_ev = 0;
     face_events(mo, n, -1, 0);
+    if (scene_construction_stop(mo->v)) return;
 }
 
 static void face_play(Mon *mo, const char *name, int head, int loop, int count)
 {
+    if (scene_construction_stop(mo->v)) return;
     const MoveNode *n = moves_node(&mo->graph, name);
     if (n && n->clip && face_set(&mo->faces, n, name, head, loop, count) == FACE_START)
-        face_start(mo);
+        { face_start(mo); if (scene_construction_stop(mo->v)) return; }
 }
 
 /* Monsters.bsf's DefaultFacialAnim: Expression_Idle, looping, the head itself left to the body */
 static void face_default(Mon *mo)
 {
+    if (scene_construction_stop(mo->v)) return;
     face_play(mo, "Expression_Idle", 0, 1, 0);
+    if (scene_construction_stop(mo->v)) return;
 }
 
 /* the face clip's clock: 0 .. 1 at its node's rate; at its end (0x2E95D0) it plays again while it loops or has
  * plays left, else the next queued face, else the default face (look.c); the delayed belches (appendBelch) */
 static void face_step(Mon *mo, float dt)
 {
+    if (scene_construction_stop(mo->v)) return;
     Viewer *v = mo->v;
     if (!mo->face || !mon_in(mo))
         return;
     if (face_tick(&mo->faces, dt))
-        face_play(mo, "Expression_Burp", 0, 0, 1);
+        { face_play(mo, "Expression_Burp", 0, 0, 1); if (scene_construction_stop(mo->v)) return; }
+    if (scene_construction_stop(v)) return;
     float ev = mo->face_ev;                          /* 0x2F4500: the node's rate x dt x the speed (+0xA8C) */
     mo->face_ev += mo->face->rate * dt * mo->power.speed;
     face_events(mo, mo->face, ev, mo->face_ev);
+    if (scene_construction_stop(mo->v)) return;
     Instance *in = mon_in(mo);
     in->face_t += mo->face->rate * dt;
     if (in->face_t < 1)
@@ -560,11 +578,15 @@ static void face_step(Mon *mo, float dt)
     case FACE_RESTART:
         in->face_t = 0;
         scene_monster_face_blend(&v->scene, mo->slot, mo->face->blend);
+        if (scene_construction_stop(v)) return;
         mo->face_ev = 0;                             /* 0x2E964C */
         face_events(mo, mo->face, -1, 0);
+    if (scene_construction_stop(mo->v)) return;
         break;
-    case FACE_START: face_start(mo); break;
-    default: face_default(mo); break;
+    case FACE_START: face_start(mo);
+    if (scene_construction_stop(mo->v)) return; break;
+    default: face_default(mo);
+    if (scene_construction_stop(mo->v)) return; break;
     }
 }
 
@@ -586,11 +608,13 @@ static void mon_rage_fx(Mon *mo, int on);
 static int rage_fx_at(Mon *mo, float at[3]);
 static void mon_nick_fx(Mon *mo);
 static Group army_find(void *ctx, const char *book, const char *name);
+static int world_load_failed(void *ctx);
 
 /* a group of the monster's property book (MONSTER_DATA's "George_prop.prb": the book George_prop); a Wii monster's
  * from the Wii's copy first, the one its graph was made with (docs/WII_PLAN.md) */
 static Group mon_props(Mon *mo, const char *group)
 {
+    if (scene_construction_stop(mo->v)) return (Group){ 0 };
     Viewer *v = mo->v;
     char book[64];
     snprintf(book, sizeof book, "%s", mo->have_graph && mo->graph.props ? mo->graph.props : "");
@@ -603,8 +627,9 @@ static Group mon_props(Mon *mo, const char *group)
     return b && b->wii ? city_book_group_wii(v->city, book, group) : city_book_group(v->city, book, group);
 }
 
-static void start_moves(Mon *mo)
+static int start_moves(Mon *mo)
 {
+    if (scene_construction_stop(mo->v)) return -1;
     Viewer *v = mo->v;
     mon_fx_stop_all(mo);
     mon_rage_fx(mo, 0);
@@ -615,40 +640,63 @@ static void start_moves(Mon *mo)
         mo->have_graph = 0;
     }
     if (!mon_in(mo) || !v->scene.mon[mo->slot].bundle || moves_read(v->scene.mon[mo->slot].bundle, &mo->graph) != 0)
-        return;
+        return 0;                                /* absent graph keeps the existing no-graph behavior */
+    if (moves_start(&mo->run, &mo->graph, moves_find(&mo->graph, "Ground_Idle")) != 0) {
+        moves_stop(&mo->run);
+        moves_free(&mo->graph);
+        if (mo->have_ag) {
+            dir_graph_free(&mo->ag);
+            mo->have_ag = 0;
+        }
+        dir_ai_init(&mo->ai);
+        mo->is_ai = 0;
+        mo->face = NULL;
+        face_init(&mo->faces);
+        printf("Unable to start %s: insufficient memory or invalid move graph.\n",
+               mo->monster >= 0 ? v->monsters[mo->monster] : "monster");
+        return -1;
+    }
     mo->have_graph = 1;
     {                                                /* the property book's footfalls (MonsterFx), DisableFootDrag */
         foot_props_default(&mo->feet_fx);
         Group g = mon_props(mo, "MonsterFx");
+    if (scene_construction_stop(mo->v)) return -1;
         foot_props_read(&mo->feet_fx, g);
-        const char *rage = g.at ? group_str(g, "RageFx") : NULL;   /* (0x2F5D80) */
+    if (scene_construction_stop(mo->v)) return -1;
+        const char *rage = g.at ? group_str(g, "RageFx") : NULL;
+    if (scene_construction_stop(mo->v)) return -1;   /* (0x2F5D80) */
         snprintf(mo->rage_fx_name, sizeof mo->rage_fx_name, "%s", rage ? rage : "");
         g = mon_props(mo, "MiscData");
+    if (scene_construction_stop(mo->v)) return -1;
         foot_init(&mo->feet, g.at && group_num(g, "DisableFootDrag", 0) != 0);
+    if (scene_construction_stop(mo->v)) return -1;
         if (mon_in(mo))                   /* Use3LinkFootIK, RTWSmoothFactor, the ankle (0x2E5640) */
-            foot_ik_props(&mo->feet, g, &mon_in(mo)->tree);
+            { foot_ik_props(&mo->feet, g, &mon_in(mo)->tree); if (scene_construction_stop(mo->v)) return -1; }
         memset(&mo->feet_ik, 0, sizeof mo->feet_ik);
         mo->feet_ik.links = mo->feet.links;
         memset(&mo->tail, 0, sizeof mo->tail);       /* found on the next posing (0x2FABC0) */
         for (int i = 0; i < mo->weapons.n; i++)      /* a burst on stops with the weapons it had */
             if (mo->weapons.w[i].firing && mo->weapons.w[i].fx >= 0 && v->fxw)
                 fx_stop(v->fxw, mo->weapons.w[i].fx);
-        g = mon_props(mo, "WeaponList");             /* its weapons (0x2D4C40) */
-        army_mon_weapons_read(&mo->weapons, g, army_find, v);
+        g = mon_props(mo, "WeaponList");
+    if (scene_construction_stop(mo->v)) return -1;             /* its weapons (0x2D4C40) */
+        army_mon_weapons_read_checked(&mo->weapons, g, army_find, v, world_load_failed);
+    if (scene_construction_stop(mo->v)) return -1;
     }
     if (mo->have_ag)
         dir_graph_free(&mo->ag);
     mo->have_ag = dir_graph_read(v->scene.mon[mo->slot].bundle, &mo->ag) == 0;
     dir_ai_init(&mo->ai);
     mo->is_ai = 0;
-    moves_start(&mo->run, &mo->graph, moves_find(&mo->graph, "Ground_Idle"));
     mo->face = NULL;
     face_init(&mo->faces);
     memset(&mo->head, 0, sizeof mo->head);
     look_limits_default(&mo->look_lim);
     mo->friction = MONSTER_FRICTION;
     mo->air_hits = 0;                                /* (0x2E9D90, the setup's only) */
-    face_default(mo);                                 /* Monsters::PostInit */
+    face_default(mo);
+    if (scene_construction_stop(mo->v)) return -1;                                 /* Monsters::PostInit */
+    if (scene_construction_stop(v)) return -1;
     /* [R 0x323180] the hands' +0x4 is 0.75; Lizzie.bsf's own PostInit (0x2E75C0 asks "<monster>::PostInit" first)
      * sets setHandThickness(0.5) (binding 95, 0x2AB330: +0xC780) in place of Monsters' setMaxJumpSpinCount(2), whose
      * +0xABC nothing reads */
@@ -700,6 +748,8 @@ static void start_moves(Mon *mo)
         }
     if (v->play)                                     /* with --clip the chosen clip stays until G */
         play_state(mo);
+    if (scene_construction_stop(v)) return -1;
+    return 0;
 }
 
 /* the world's side of a monster's start (with player 1's): the game's next block, the upgrade, the shakes */
@@ -721,7 +771,9 @@ static void play_reset(Viewer *v)
  * MiscData|IsFemale of its property book (MONSTER_DATA +0xAA4): Amanda, Jill, Lizzie, Natalie, Snapper, Venus */
 static int monster_female(Mon *mo)
 {
+    if (scene_construction_stop(mo->v)) return 0;
     Group g = mon_props(mo, "MiscData");
+    if (scene_construction_stop(mo->v)) return 0;
     return g.at && group_num(g, "IsFemale", 0) != 0;
 }
 
@@ -733,6 +785,7 @@ static int people_window_reuse_ready(void *ctx, int who);
 
 static int people_visible(void *ctx, const float p[3], float radius)
 {
+    if (scene_construction_stop((Viewer *)ctx)) return 0;
     const Viewer *v = ctx;
     const float (*r)[3] = (const float (*)[3])v->view.rows;
     float d[3] = { p[0] - v->view.pos[0], p[1] - v->view.pos[1], p[2] - v->view.pos[2] };
@@ -756,15 +809,18 @@ static void boss_weapon_tick(void *ctx, ArmyWeapon *w, int may, const float from
 /* the army's host (army.h): books, clip lengths and model bounds from the city */
 static Group rubble_tmpl(void *ctx, const char *name)
 {
+    if (scene_construction_stop((Viewer *)ctx)) return (Group){ 0 };
     return city_template(((Viewer *)ctx)->city, name);
 }
 static int rubble_box(void *ctx, const char *shape, float min[3], float max[3])
 {
+    if (scene_construction_stop((Viewer *)ctx)) return -1;
     return city_shape_box(((Viewer *)ctx)->city, shape, min, max) == 0 ? 0 : -1;
 }
 /* the city's WorldData (<City>_Props): its MonsterRevealDef */
 static Group world_data(Viewer *v)
 {
+    if (scene_construction_stop((Viewer *)v)) return (Group){ 0 };
     char book[64];
     snprintf(book, sizeof book, "%s_Props", CITIES[v->city_index]);
     return city_book_group(v->city, book, "WorldData");
@@ -773,6 +829,7 @@ static Group world_data(Viewer *v)
  * own monsters (its lists name them, docs/WII_PLAN.md decision 4); the PS2's monsters keep the PS2's lists */
 static Group reveal_world_data(Viewer *v, const char *player1)
 {
+    if (scene_construction_stop((Viewer *)v)) return (Group){ 0 };
     char book[64];
     snprintf(book, sizeof book, "%s_Props", CITIES[v->city_index]);
     if (v->wii_roster.n && player1 && profile_ps2_monster(player1) < 0)
@@ -783,6 +840,7 @@ static Group reveal_world_data(Viewer *v, const char *player1)
  * docs/WII_PLAN.md phase 5); {0} without */
 static Group wii_block_def(Viewer *v)
 {
+    if (scene_construction_stop((Viewer *)v)) return (Group){ 0 };
     char book[64], key[96];
     if (!v->wii_roster.n || v->block >= v->nblocks)
         return (Group){ 0 };
@@ -792,11 +850,13 @@ static Group wii_block_def(Viewer *v)
 }
 static int game_all_revealed(void *ctx)
 {
+    if (scene_construction_stop((Viewer *)ctx)) return 0;
     Viewer *v = ctx;
     return reveal_all_revealed(world_data(v), &v->roster);
 }
 static void game_block_rubble(void *ctx, const char *name)   /* the block left's rubble (0x303C90) */
 {
+    if (scene_construction_stop((Viewer *)ctx)) return;
     Viewer *v = ctx;
     int k = -1;
     for (uint32_t i = 0; name && i < v->nblocks; i++)
@@ -806,7 +866,9 @@ static void game_block_rubble(void *ctx, const char *name)   /* the block left's
     rh.tmpl = rubble_tmpl;
     rh.shape_box = rubble_box;
     rh.ctx = v;
+    rh.failed = world_load_failed;
     rubble_load(&v->rubble, v->scene.block, k >= 0 && k != (int)v->block, &rh);
+    if (scene_construction_stop((Viewer *)ctx)) return;
 }
 static int game_rubble_point(void *ctx, const float pos[3], float radius, float out[3])
 {
@@ -822,9 +884,11 @@ static int game_rubble_point(void *ctx, const float pos[3], float radius, float 
 /* the cryotubes of the block: the edibles get them in their cells */
 static void add_tubes(Viewer *v)
 {
+    if (scene_construction_stop((Viewer *)v)) return;
     for (int i = 0; v->edibles && i < v->ntubes; i++)
         if (v->tubes[i].building >= 0 && v->tubes[i].building < (int)v->scene.nbuildings) {
             int s = edible_add_cryotube(v->edibles, v->tubes[i].building, v->tubes[i].floor, v->tubes[i].cell);
+    if (scene_construction_stop((Viewer *)v)) return;
             if (getenv("RAMPAGE_TRACE"))
                 printf("  cryotube: building %d (%d storeys, %d wide), floor %d, cell %d: %s\n", v->tubes[i].building,
                        v->scene.buildings[v->tubes[i].building].b.n, v->scene.buildings[v->tubes[i].building].b.width,
@@ -835,16 +899,19 @@ static void add_tubes(Viewer *v)
 
 static Group army_find(void *ctx, const char *book, const char *name)
 {
+    if (scene_construction_stop((Viewer *)ctx)) return (Group){ 0 };
     return city_book_group(((Viewer *)ctx)->city, book, name);
 }
 static int army_shape_box(void *ctx, const char *shape, float min[3], float max[3])
 {
+    if (scene_construction_stop((Viewer *)ctx)) return 0;
     return city_shape_box(((Viewer *)ctx)->city, shape, min, max) == 0;
 }
 /* a FireEffect's collision rod (fx.c fx_rod, 0x1F9290): the beams' reach */
 static int effect_rod(void *ctx, const char *effect, float dir[3], float *speed, float *length, float *cycle,
                       int *loops)
 {
+    if (scene_construction_stop((Viewer *)ctx)) return 0;
     const Viewer *v = ctx;
     FxRod r;
     if (!v->fxlib || !fx_rod(v->fxlib, effect, &r))
@@ -859,14 +926,40 @@ static int effect_rod(void *ctx, const char *effect, float dir[3], float *speed,
 
 static int model_sphere(void *ctx, const char *shape, float centre[3], float *radius)
 {
+    if (scene_construction_stop((Viewer *)ctx)) return 0;
     return city_shape_sphere(((Viewer *)ctx)->city, shape, centre, radius) == 0;
 }
+/* A constructor failure leaves Scene destructible, but it must not be used again this frame. */
+static int scene_construction_stop(Viewer *v)
+{
+    if (!v->scene.construction_failed && !city_load_failed(v->city))
+        return 0;
+    if (!v->exit_game)
+        fprintf(stderr, "Scene construction failed: insufficient memory or invalid data.\n");
+    v->scene.construction_failed = 1;
+    v->play = 0;
+    v->exit_game = 1;                              /* retain ownership until the normal world exit */
+    return 1;
+}
+
+/* Shared by engine-agnostic managers. Never releases owners inside a callback. */
+static int world_load_failed(void *ctx)
+{
+    return scene_construction_stop((Viewer *)ctx);
+}
+
 static int army_node_world(void *ctx, const ArmyUnit *u, const char *node, float out[16])
 {
+    if (scene_construction_stop((Viewer *)ctx)) return 0;
     Viewer *v = ctx;                                 /* the weapon's node on the unit's look as drawn */
+    if (scene_construction_stop(v))
+        return 0;                                   /* later callbacks in this army_update cannot re-enter Scene */
     int k = v->army ? (int)(u - army_unit(v->army, 0)) : -1;
     int ok = v->army && (scene_unit_node(&v->scene, k, node, out) == 0 ||   /* else the look of what it plays now */
                          scene_unit_node_now(&v->scene, k, u, node, out) == 0);
+    if (scene_construction_stop((Viewer *)ctx)) return 0;
+    if (scene_construction_stop(v))
+        return 0;                                   /* boolean callback: fatal is never a true/success value */
     if (getenv("RAMPAGE_NODES"))
         printf("  %s node %s: %s (%s, %s)\n", u->name ? u->name : "?", node, ok ? "found" : "not found", u->anim,
                u->shape ? u->shape : "-");
@@ -874,6 +967,7 @@ static int army_node_world(void *ctx, const ArmyUnit *u, const char *node, float
 }
 static int boss_node_world(void *ctx, const BossPart *p, const char *node, float out[16])
 {
+    if (scene_construction_stop((Viewer *)ctx)) return 0;
     Viewer *v = ctx;                                 /* a node of the part's look as drawn */
     int ok = 0;
     for (int i = 0, n = v->boss ? boss_count(v->boss) : 0; i < n && !ok; i++)
@@ -885,6 +979,7 @@ static int boss_node_world(void *ctx, const BossPart *p, const char *node, float
 }
 static int vehicle_node_world(void *ctx, const VehObj *o, const char *node, float out[16])
 {
+    if (scene_construction_stop((Viewer *)ctx)) return 0;
     Viewer *v = ctx;                                 /* a node of the object's look as drawn */
     int ok = v->veh && scene_vehicle_node(&v->scene, (int)(o - vehicle_obj(v->veh, 0)), node, out) == 0;
     if (getenv("RAMPAGE_NODES"))
@@ -893,10 +988,12 @@ static int vehicle_node_world(void *ctx, const VehObj *o, const char *node, floa
 }
 static float parade_clip_seconds(void *ctx, const char *anim, const char *shape)
 {
+    if (scene_construction_stop((Viewer *)ctx)) return 0;
     return city_clip_seconds(((Viewer *)ctx)->city, anim, shape);
 }
 static float army_clip_seconds(void *ctx, const char *anim, const char *shape)
 {
+    if (scene_construction_stop((Viewer *)ctx)) return 0;
     (void)ctx; (void)anim; (void)shape;
     return 0;                                        /* army.c falls back to the clip's own length */
 }
@@ -937,7 +1034,6 @@ static void huds_close(Viewer *v)
     v->hud = NULL;
 }
 
-#ifdef RAMPAGE_LOW_MEMORY
 /* No destructor here calls back into a scene or property book. Free the old block's
  * managers before allocating its replacement, rather than one by one afterwards. */
 static void block_managers_free(Viewer *v)
@@ -981,8 +1077,7 @@ static void world_release(Viewer *v)
     }
     block_managers_free(v);
     game_free(v->game); v->game = NULL;
-    if (v->have_scene)
-        scene_free(&v->scene);
+    scene_free(&v->scene);
     v->have_scene = 0;
     city_close(v->city); v->city = NULL;
     memset(v->blocks, 0, sizeof v->blocks);
@@ -999,17 +1094,17 @@ static void world_release(Viewer *v)
     v->nrsnd = v->nosnd = v->nbsnd = v->nppfx = v->narmed_people = 0;
     v->nweather_fx = v->weather_due = 0;
 }
-#endif
 
 static int monster_index(const Viewer *v, const char *name);
 
 /* 0x2B6BE0 / 0x2B72B0: the slot after the players gets the monster to reveal (roster index rm), hidden and out of
  * the play (+0x108 = +0x109 = 1) until startReveal */
-static void extra_add(Viewer *v, int k, int rm)
+static int extra_add(Viewer *v, int k, int rm)
 {
+    if (scene_construction_stop((Viewer *)v)) return -1;
     int mi = monster_index(v, v->roster.name[rm]);
     if (k != v->nmon || k >= MONSTERS || mi < 0 || v->scene.nmon != k)
-        return;
+        return 0;
     Mon *mo = &v->mon[k];
     mo->v = v;
     mo->slot = k;
@@ -1024,12 +1119,18 @@ static void extra_add(Viewer *v, int k, int rm)
     mo->streaker = -1;
     mo->reveal = 1;
     mo->shown = 0;
-    if (city_monster(v->city, &v->scene, v->monsters[mi], -1, mo->mx, mo->my, mo->heading) != k)
-        return;
-    start_moves(mo);
+    int added = city_monster(v->city, &v->scene, v->monsters[mi], -1, mo->mx, mo->my, mo->heading);
+    if (scene_construction_stop(v))
+        return -1;
+    if (added != k)
+        return 0;
+    if (start_moves(mo) != 0)
+        { if (scene_construction_stop((Viewer *)v)) return -1; return -1;
+    if (scene_construction_stop((Viewer *)v)) return -1; }
     v->extra = k;
     if (mon_in(mo))
         mon_in(mo)->hidden = 1;
+    return 0;
 }
 
 /* 0x2D3F90: the extra monster hides and leaves the world (stopReveal, the Continue) */
@@ -1109,6 +1210,7 @@ static void block_left(Viewer *v);
 
 static void build(Viewer *v)
 {
+    if (scene_construction_stop((Viewer *)v)) return;
 #ifdef RAMPAGE_LOW_MEMORY
     if (v->rnd)
         rnd_scene(v->rnd, NULL);                    /* release old GPU storage before allocating the new scene */
@@ -1138,17 +1240,18 @@ static void build(Viewer *v)
         memset(&v->hidden, 0, sizeof v->hidden);
     }
     v->have_scene = city_build(v->city, v->blocks[v->block], v->night, &v->scene) == 0;
-#ifdef RAMPAGE_LOW_MEMORY
-    if (!v->have_scene) {                          /* a failed grid load is not a playable partial block */
+    if (scene_construction_stop((Viewer *)v)) return;
+    if (!v->have_scene) {                          /* a failed load is not a playable partial block on any target */
         printf("Unable to build %s %s: insufficient memory or invalid data.\n",
                CITIES[v->city_index], v->blocks[v->block]);
         v->play = 0;
         v->exit_game = 1;                          /* the frame's normal exit path returns to the shell */
         return;
     }
-#endif
-    if (v->have_scene && v->game_built && v->left_block >= 0)
+    if (v->have_scene && v->game_built && v->left_block >= 0) {
         city_build_left(v->city, v->blocks[v->left_block], &v->scene);
+    if (scene_construction_stop((Viewer *)v)) return;
+    }
     if (!v->game_built) {                            /* a new world: its monster to reveal comes with reveal_load */
         v->extra = -1;
         memset(&v->rwalk, 0, sizeof v->rwalk);
@@ -1156,16 +1259,26 @@ static void build(Viewer *v)
     for (int k = 0; k < v->nmon + (v->extra >= 0); k++) {   /* the monsters, slot by slot (player 1's: none, none at
                                                       * all), and the one to reveal */
         Mon *mo = &v->mon[k];
-        if (v->have_scene && have_monster(v) && mo->monster >= 0 &&
-            city_monster(v->city, &v->scene, v->monsters[mo->monster], k ? -1 : v->clip, mo->mx, mo->my,
-                         mo->heading) == k)
-            printf("%s: %s\n", v->monsters[mo->monster], v->scene.mon[k].clip ? v->scene.mon[k].clip : "-");
+        if (v->have_scene && have_monster(v) && mo->monster >= 0) {
+            int added = city_monster(v->city, &v->scene, v->monsters[mo->monster], k ? -1 : v->clip, mo->mx, mo->my,
+                                     mo->heading);
+            if (scene_construction_stop(v))
+                return;
+            if (added == k)
+                printf("%s: %s\n", v->monsters[mo->monster], v->scene.mon[k].clip ? v->scene.mon[k].clip : "-");
+        }
         {                                            /* the game's next block: its goals and AI go on */
             DirAI ai = mo->ai;
             int is_ai = mo->is_ai;
             float hp = mo->hp, energy = mo->energy;
             EdiblePower power = mo->power;
-            start_moves(mo);
+            if (start_moves(mo) != 0) {
+    if (scene_construction_stop((Viewer *)v)) return;
+                v->play = 0;
+                v->exit_game = 1;                  /* fail the load, never run a partial monster */
+                return;
+            }
+    if (scene_construction_stop((Viewer *)v)) return;
             if (v->game_built) {
                 mo->ai = ai;
                 mo->is_ai = is_ai;
@@ -1186,7 +1299,7 @@ static void build(Viewer *v)
             }
         }
         if (getenv("RAMPAGE_TRACE") && mo->have_graph)
-            printf("properties %s%s\n", mo->graph.props ? mo->graph.props : "-", monster_female(mo) ? ", female" : "");
+            { printf("properties %s%s\n", mo->graph.props ? mo->graph.props : "-", monster_female(mo) ? ", female" : ""); if (scene_construction_stop((Viewer *)v)) return; }
     }
     if (v->extra >= 0 && !v->mon[v->extra].shown && mon_in(&v->mon[v->extra]))
         mon_in(&v->mon[v->extra])->hidden = 1;
@@ -1218,6 +1331,7 @@ static void build(Viewer *v)
         host.node_world = army_node_world;
         host.rod = effect_rod;
         host.ctx = v;
+        host.failed = world_load_failed;
         v->army = army_new(&host);
         if (v->army) {
             army_set_collide(v->army, &v->cw);
@@ -1225,6 +1339,7 @@ static void build(Viewer *v)
         }
         if (v->army) {
             army_load_block(v->army, v->scene.block);
+    if (scene_construction_stop((Viewer *)v)) return;
             army_activate(v->army, !v->game);        /* the game's BeginBlockNI activates it (GE_AI_ACTIVATE): the
                                                       * next block is built as the results start (0x334C40 leaves
                                                       * gAIMgr's bit 8 off), its clocks still [R] */
@@ -1248,6 +1363,7 @@ static void build(Viewer *v)
         vh.rod = effect_rod;
         vh.node_world = vehicle_node_world;
         vh.ctx = v;
+        vh.failed = world_load_failed;
         v->veh = vehicle_new(&vh);
         if (v->veh)
             vehicle_set_collide(v->veh, &v->cw);
@@ -1256,11 +1372,12 @@ static void build(Viewer *v)
                 vehicle_bind_army(v->veh, v->army);
             for (int k = 0; k < 3; k++)
                 if (v->scene.traffic_def[k].at)
-                    vehicle_load_traffic(v->veh, k, v->scene.traffic_def[k]);
+                    { vehicle_load_traffic(v->veh, k, v->scene.traffic_def[k]); if (scene_construction_stop((Viewer *)v)) return; }
             vehicle_level_start(v->veh, v->hidden_x, &v->hidden);
+    if (scene_construction_stop((Viewer *)v)) return;
             for (int k = 0; k < v->scene.nrockets; k++)
-                vehicle_spawn(v->veh, v->scene.rockets[k].name, v->scene.rockets[k].pos, v->scene.rockets[k].facing,
-                              v->scene.rockets[k].building);
+                { vehicle_spawn(v->veh, v->scene.rockets[k].name, v->scene.rockets[k].pos, v->scene.rockets[k].facing,
+                              v->scene.rockets[k].building); if (scene_construction_stop((Viewer *)v)) return; }
         }
     }
     v->scene.traffic = v->veh;
@@ -1283,6 +1400,7 @@ static void build(Viewer *v)
         sh.shape_sphere = model_sphere;
         sh.find = rubble_tmpl;                       /* a template by name: the geysers the fountains leave */
         sh.ctx = v;
+        sh.failed = world_load_failed;
         v->sobj = streetobj_new(&sh);
         for (int k = 0; k < SCENE_STREET_MAX; k++)   /* one a script makes has no scene entry */
             v->street_of[k] = -1;
@@ -1298,13 +1416,14 @@ static void build(Viewer *v)
             v->sobj_of[k] = !v->sobj ? -1 : so->parent >= 0 ?   /* a billboard's attachment, after it */
                             streetobj_add_attachment(v->sobj, v->sobj_of[so->parent], so->t, so->world) :
                             streetobj_add(v->sobj, so->t, so->inst, so->world, so->building, so->attack);
+    if (scene_construction_stop((Viewer *)v)) return;
             if (v->sobj_of[k] >= 0)
                 v->street_of[v->sobj_of[k]] = k;
             if (v->sobj_of[k] >= 0 && so->nnode)     /* the crane's nodes */
                 streetobj_nodes(v->sobj, v->sobj_of[k], (const float (*)[3])so->node, so->nnode);
         }
         if (v->sobj)
-            streetobj_start(v->sobj, sbs, nb);
+            { streetobj_start(v->sobj, sbs, nb); if (scene_construction_stop((Viewer *)v)) return; }
         if (getenv("RAMPAGE_TRACE"))
             printf("street objects: %d\n", v->sobj ? streetobj_count(v->sobj) : 0);
     }
@@ -1320,11 +1439,13 @@ static void build(Viewer *v)
         ph.shape_sphere = model_sphere;
         ph.clip_seconds = parade_clip_seconds;
         ph.ctx = v;
+        ph.failed = world_load_failed;
         v->parade = parade_new(&ph);
         if (v->parade)
             parade_set_collide(v->parade, &v->cw);
         if (v->parade) {
             int n = parade_load_block(v->parade, v->scene.block);
+    if (scene_construction_stop((Viewer *)v)) return;
             if (getenv("RAMPAGE_TRACE"))
                 printf("parade: %d objects\n", n);
             parade_activate(v->parade, !v->game);    /* the game's BeginBlockNI activates it (GE_AI_ACTIVATE) */
@@ -1343,6 +1464,7 @@ static void build(Viewer *v)
         rh.shape_box = army_shape_box;
         rh.shape_sphere = model_sphere;
         rh.ctx = v;
+        rh.failed = world_load_failed;
         v->rail = rail_new(&rh);
         if (v->rail)
             rail_set_collide(v->rail, &v->cw);
@@ -1350,6 +1472,7 @@ static void build(Viewer *v)
             if (v->army)
                 rail_bind_army(v->rail, v->army);
             rail_load_block(v->rail, v->scene.block);
+    if (scene_construction_stop((Viewer *)v)) return;
             rail_activate(v->rail, !v->game);        /* (gAIMgr's record, the freighter's: as the army's) */
             static const char *const OBJ[] = { "ObjectInstance|", "AttackObjectInstance|", "XObjectInstance|" };
             for (int k = 0; k < 3; k++) {
@@ -1360,14 +1483,19 @@ static void build(Viewer *v)
                     Group where;
                     Record rr[256];
                     uint32_t n = group_values(bd, OBJ[j], &where, rr, 256);
+    if (scene_construction_stop((Viewer *)v)) return;
                     for (uint32_t i = 0; i < n; i++) {
                         Group o = record_group(where, rr[i]);
                         if (k && group_num(o, k == 1 ? "LoadWhenWaiting" : "LoadWhenDistant", 0) == 0)
-                            continue;
+                            { if (scene_construction_stop((Viewer *)v)) return; continue;
+    if (scene_construction_stop((Viewer *)v)) return; }
                         const char *name = group_str(o, "Name");
+    if (scene_construction_stop((Viewer *)v)) return;
                         if (!name || rail_kind_of(v->rail, name) < 0)
-                            continue;
+                            { if (scene_construction_stop((Viewer *)v)) return; continue;
+    if (scene_construction_stop((Viewer *)v)) return; }
                         Group loc = group_sub(o, "Location");
+    if (scene_construction_stop((Viewer *)v)) return;
                         Record lr[3];
                         uint32_t nl = loc.at ? group_items(loc, lr, 3) : 0;
                         float p[3];
@@ -1375,6 +1503,7 @@ static void build(Viewer *v)
                             p[q] = q < nl ? record_num(lr[q]) : 0;
                         p[1] += 41.0f * (float)k;
                         int id = rail_spawn(v->rail, name, p, group_num(o, "ZRotation", 0) / 57.2957795f, o);
+    if (scene_construction_stop((Viewer *)v)) return;
                         if (getenv("RAMPAGE_TRACE"))
                             printf("rail: %s at %.1f %.1f %.1f -> %d\n", name, p[0], p[1], p[2], id);
                     }
@@ -1393,15 +1522,19 @@ static void build(Viewer *v)
         eh.cell_place = edible_cell_where;
         eh.cell_follow = edible_cell_follow;
         eh.ctx = v;
+        eh.failed = world_load_failed;
         v->edibles = edible_new(&eh);
         if (v->edibles) {
             edible_load_block(v->edibles, v->scene.block);
+    if (scene_construction_stop((Viewer *)v)) return;
             for (uint32_t i = 0; i < v->scene.nbuildings; i++) {   /* 0x3196F0: a building's window slots, then
                                                       * its edibles, the draws in that order */
                 const SceneBuilding *sb = &v->scene.buildings[i];
                 int before = edible_slots(v->edibles), own = 0;
                 scene_occupant_slots(&v->scene, (int)i);
+    if (scene_construction_stop((Viewer *)v)) return;
                 edible_add_building(v->edibles, (int)i, sb->inst, sb->props, sb->b.width, sb->b.n);
+    if (scene_construction_stop((Viewer *)v)) return;
                 for (int k = before; k < edible_slots(v->edibles); k++) {   /* its edibles' new slots: those in a
                                                       * cell of no occupant's slot are slots of their own; the first
                                                       * occupant's slot of its cell takes its kind (+0xE, 0x319EAC) */
@@ -1417,6 +1550,7 @@ static void build(Viewer *v)
                     own += !shared;
                 }
                 scene_occupant_pad(&v->scene, own);
+                if (scene_construction_stop(v)) return;
             }
             scene_occupant_sort(&v->scene);          /* 0x31A540: then the list sorted (0x31AE20) */            v->scene.slots_made = 1;
             if (getenv("RAMPAGE_TRACE")) {
@@ -1427,7 +1561,8 @@ static void build(Viewer *v)
                        "the civilians' the %d after\n", v->scene.nslots - nm, nm, v->scene.norder, v->scene.order_mil,
                        v->scene.order_civ);
             }
-            add_tubes(v);                            /* a reveal's tubes, for the block now built */
+            add_tubes(v);
+    if (scene_construction_stop((Viewer *)v)) return;                            /* a reveal's tubes, for the block now built */
             if (getenv("RAMPAGE_TRACE"))
                 printf("edibles: %d kinds, %d slots\n", edible_kinds(v->edibles), edible_slots(v->edibles));
         }
@@ -1442,6 +1577,7 @@ static void build(Viewer *v)
         }
         shadow_ground_init(&v->sg, v->have_scene && group_num(v->scene.block, "EnableGroundShadow", 1) != 0, nb,
                            (const float (*)[6])boxes, NULL, NULL);
+    if (scene_construction_stop((Viewer *)v)) return;
         for (int k = 0; k < v->nmon; k++)
             shadow_monster_init(&v->mon[k].smon);
     }
@@ -1464,15 +1600,17 @@ static void build(Viewer *v)
         bh.play = v->play_values;
         bh.generators = &v->ny_generators;
         bh.ctx = v;
+        bh.failed = world_load_failed;
         v->boss = boss_new(&bh);
         v->boss_block = 0;
         if (v->boss) {
             int n = boss_load_block(v->boss, v->scene.block);
+    if (scene_construction_stop((Viewer *)v)) return;
             v->boss_block = n > 0;
             if (v->scene.traffic_def[1].at)
-                n += boss_load_waiting(v->boss, v->scene.traffic_def[1], 41, 1);
+                { n += boss_load_waiting(v->boss, v->scene.traffic_def[1], 41, 1); if (scene_construction_stop((Viewer *)v)) return; }
             if (v->scene.traffic_def[2].at)
-                n += boss_load_waiting(v->boss, v->scene.traffic_def[2], 82, 2);
+                { n += boss_load_waiting(v->boss, v->scene.traffic_def[2], 82, 2); if (scene_construction_stop((Viewer *)v)) return; }
             boss_activate(v->boss, !v->game);        /* (gAIMgr's record: as the army's) */
             if (getenv("RAMPAGE_TRACE"))
                 printf("bosses: %d\n", n);
@@ -1492,11 +1630,12 @@ static void build(Viewer *v)
             gh.block_rubble = game_block_rubble;
             gh.rubble_point = game_rubble_point;
             gh.ctx = v;
+            gh.failed = world_load_failed;
             if (v->roster.n == 0) {                  /* ShellData's MonsterData: the 30, the profile's flags */
                 if (v->wii_roster.n)                 /* (the Wii's 40) */
                     v->roster = v->wii_roster;
                 else
-                    reveal_roster_load(&v->roster, city_book_group(v->city, "ShellData", "MonsterData"));
+                    { reveal_roster_load(&v->roster, city_book_group(v->city, "ShellData", "MonsterData")); if (scene_construction_stop((Viewer *)v)) return; }
                 rubble_seed(&v->rubble, 1);
             }
             int pm[MONSTERS];                        /* 0x3236F0: the city's monster, not one of the players' */
@@ -1507,20 +1646,29 @@ static void build(Viewer *v)
             const char *p1 = v->nmon && v->mon[0].monster >= 0 ? v->monsters[v->mon[0].monster] : NULL;
             int rm = reveal_load(&v->reveal, reveal_world_data(v, p1), play_type(v) == GP_CAMPAIGN,
                                  v->nmon, pm, &v->roster);
+    if (scene_construction_stop((Viewer *)v)) return;
             v->ntubes = 0;
-            if (rm >= 0)                             /* with one player: the world's extra monster, hidden */
-                extra_add(v, reveal_extra_slot(&v->reveal, v->nmon), rm);
+            if (rm >= 0 && extra_add(v, reveal_extra_slot(&v->reveal, v->nmon), rm) != 0) {
+    if (scene_construction_stop((Viewer *)v)) return;
+                v->play = 0;
+                v->exit_game = 1;                  /* scene owns the model; normal world exit releases it */
+                return;
+            }
+    if (scene_construction_stop((Viewer *)v)) return;
             if (getenv("RAMPAGE_TRACE"))
                 printf("reveal: %s%s\n", rm >= 0 ? v->roster.name[rm] : "-", v->extra >= 0 ? " (shown)" : "");
             GameConfig gc = { play_type(v), v->nmon, v->num_bots,
                               campaign_index(v, CITIES[v->city_index]), v->prof.ncities,
                               city_block_index(v->city, v->blocks[v->block]), v->prof.current.seed[0],
                               v->prof.cheats, v->prof.current.seed[1], { 0 } };
+    if (scene_construction_stop((Viewer *)v)) return;
             memcpy(gc.cities_won, v->cities_won, sizeof gc.cities_won);   /* King of the World's so far */
             v->game = game_new(&gh, &gc);
             building_set_one_hit((v->prof.cheats & PCH_40000000) != 0);
             if (v->game && game_load_city(v->game, CITIES[v->city_index]) == 0) {
+    if (scene_construction_stop((Viewer *)v)) return;
                 game_start(v->game);
+    if (scene_construction_stop((Viewer *)v)) return;
                 /* the city's total and flags [R 0x33DB90]: a campaign city resumed at a later block (the start block
                  * the profile's status has) keeps its checkpoint's, a challenge missed before staying missed; any
                  * other start begins at 0 and "All Challenges Met" until one is not (the world's start clears them
@@ -1536,9 +1684,11 @@ static void build(Viewer *v)
                 v->music_now = v->music_vol = profile_music_volume(&v->prof) / 0.75f;
                 sound_settings(v->sfx_vol * 0.75f, v->music_now * 0.75f, 250);
             } else {
+    if (scene_construction_stop((Viewer *)v)) return;
                 game_free(v->game);
                 v->game = NULL;
             }
+    if (scene_construction_stop((Viewer *)v)) return;
         }
     }
     if (v->have_scene && v->scene.folk) {
@@ -1586,12 +1736,14 @@ static void build(Viewer *v)
     }
     challenge_init(&v->challenge);                   /* the block's challenge (0x3468F0, at its activation) */
     challenge_upgrade_props(&v->challenge, city_template(v->city, "MonsterUpgrade"));
+    if (scene_construction_stop((Viewer *)v)) return;
     if (v->have_scene && have_monster(v))           /* player 1's monster and its upgrades whoever plays [R 0x346D34:
                                                       * gCommon +0x214, the current record's monster 0; 0x346D9C its
                                                       * flags at +0x234] */
     {
         challenge_load(&v->challenge, v->scene.block, wii_block_def(v), v->game ? game_play_type(v->game) : GP_CAMPAIGN,
                        v->boss_block, v->monsters[v->mon[0].monster], v->upgrades[v->mon[0].monster & 63]);
+    if (scene_construction_stop((Viewer *)v)) return;
         if (getenv("RAMPAGE_TRACE"))
             printf("challenge %s: %d goals, the upgrade for %s %s\n",
                    v->challenge.identifier ? v->challenge.identifier : "-", v->challenge.ngoals,
@@ -1602,14 +1754,20 @@ static void build(Viewer *v)
                                                       * boss bar on the boss block) and ChallengeText's card */
         HudChallenge ch;
         challenge_hud(&v->challenge, v->boss_block, &ch);
+    if (scene_construction_stop((Viewer *)v)) return;
         ch.pause_scale = challenge_icon_scale(&v->challenge, 1);
+    if (scene_construction_stop((Viewer *)v)) return;
         hud_challenge(v->hud, &ch);
     }
     if (v->game && !v->hud && !v->game_built)        /* no screens to answer the results: after 3 s */
         game_auto_results(v->game, 3.0f);
     Group tt;
-    if (city_camera(v->city, &tt) == 0)
+    int have_camera = city_camera(v->city, &tt) == 0;
+    if (scene_construction_stop(v)) return;
+    if (have_camera) {
         cam_settings(&v->cam_settings, tt);
+        if (scene_construction_stop(v)) return;
+    }
     if (!v->game_built) {                            /* the game's next block: the cameras go on */
         cam_init(&v->cam, &v->cam_settings);
         dircam_init(&v->cd, &v->cam);
@@ -1630,13 +1788,32 @@ static int open_city(Viewer *v, int index, uint32_t block, int game_block)
     if (v->rnd)
         rnd_scene(v->rnd, NULL);                    /* GPU cache can be rebuilt if the load fails; CPU state stays */
 #endif
-    City *c = city_open(&v->vol, CITIES[index]);
+    int load_failed = 0;
+    City *c = city_open_checked(&v->vol, CITIES[index], &load_failed);
     if (!c) {
-        city_activate(v->city);                    /* a partially opened city may have changed the book resolver */
+        city_activate(v->city);                    /* preserve the old resolver until its owned world is released */
+        if (load_failed) {
+            v->scene.construction_failed = 1;      /* even a failure before a City exists must reach safe teardown */
+            scene_construction_stop(v);
+            return -1;
+        }
 #ifdef RAMPAGE_LOW_MEMORY
         if (v->rnd)
             rnd_scene(v->rnd, v->have_scene ? &v->scene : NULL);
 #endif
+        return -1;
+    }
+    RevealRoster roster = v->roster;
+    const char *blocks[64];
+    if (roster.n && !v->wii_roster.n)
+        reveal_roster_load(&roster, city_book_group(c, "ShellData", "MonsterData"));
+    uint32_t nblocks = city_load_failed(c) ? 0 : city_blocks(c, blocks, 64);
+    const char *at = !city_load_failed(c) && game_block >= 0 ? city_game_block(c, game_block) : NULL;
+    if (city_load_failed(c)) {
+        city_close(c);
+        city_activate(v->city);
+        v->scene.construction_failed = 1;          /* c is unpublished; preserve its failure before destroying it */
+        scene_construction_stop(v);
         return -1;
     }
 #ifdef RAMPAGE_LOW_MEMORY
@@ -1652,10 +1829,9 @@ static int open_city(Viewer *v, int index, uint32_t block, int game_block)
     city_activate(c);
     v->city_index = index;
     v->ny_generators = v->band_sound = 0;            /* the city's onLoadScript loads its scripts' bundle anew */
-    if (v->roster.n && !v->wii_roster.n)             /* its names are the old city's book's: read from this one's */
-        reveal_roster_load(&v->roster, city_book_group(c, "ShellData", "MonsterData"));
-    v->nblocks = city_blocks(c, v->blocks, 64);
-    const char *at = game_block >= 0 ? city_game_block(c, game_block) : NULL;
+    v->roster = roster;
+    v->nblocks = nblocks;
+    memcpy(v->blocks, blocks, nblocks * sizeof *blocks);
     for (uint32_t i = 0; at && i < v->nblocks; i++)
         if (!_stricmp(v->blocks[i], at)) {
             block = i;
@@ -1663,7 +1839,7 @@ static int open_city(Viewer *v, int index, uint32_t block, int game_block)
         }
     v->block = block < v->nblocks ? block : 0;
     build(v);
-    return v->have_scene ? 0 : -1;
+    return v->have_scene && !v->exit_game ? 0 : -1;
 }
 
 /* the viewer's answers to the graph's script checks (Monsters.bsf: there are no buildings, people or power-ups to
@@ -1730,6 +1906,7 @@ static int held_edible(const Mon *mo)
  * the trams and the cable cars (People_Pour), 2 the garbage truck (Garbage_Pour, and it hurts) */
 static int held_shaker(const Mon *mo)
 {
+    if (scene_construction_stop(mo->v)) return 0;
     const Viewer *v = mo->v;
     Group t = { 0 }, in = { 0 };
     if (mo->held_vehicle >= 0 && v->veh) {
@@ -1744,12 +1921,14 @@ static int held_shaker(const Mon *mo)
         }
     }
     float k = in.at ? group_num(in, "IsShaker", -1) : -1;
+    if (scene_construction_stop(mo->v)) return 0;
     return (int)(k >= 0 ? k : t.at ? group_num(t, "IsShaker", 0) : 0);
 }
 
 /* addHitPoints(amount): + heals, - hurts (0 .. its most; nothing at 0 HP) */
 static void mon_add_hp(Mon *mo, float amount)
 {
+    if (scene_construction_stop(mo->v)) return;
     if (mo->hp > 0)
         mo->hp = fmaxf(0, fminf(mon_hp_max(mo), mo->hp + amount));
 }
@@ -1794,6 +1973,7 @@ static int along(Mon *mo, float p0)
 
 static int answer(void *ctx, const char *call, const float *a)
 {
+    if (scene_construction_stop(((Mon *)ctx)->v)) return 0;
     Mon *mo = ctx;
     Viewer *v = mo ? mo->v : NULL;
     if (!mo)
@@ -1842,6 +2022,7 @@ static int answer(void *ctx, const char *call, const float *a)
     if (!strcmp(call, "Monsters::canGrabPerson")) return window_person(mo, a + 1) >= 0 || window_soldier(mo, a + 1) >= 0;
     if (!strcmp(call, "Monsters::canDoPunch")) {     /* not at a person's or a power-up's window */
         int e = edible_call(mo, call, a + 1);
+    if (scene_construction_stop(((Mon *)ctx)->v)) return 0;
         return e >= 0 ? e : window_person(mo, a + 1) < 0 && window_soldier(mo, a + 1) < 0;
     }
     if (strstr(call, "::canGrabPowerup") || strstr(call, "::checkForHazard"))
@@ -1884,11 +2065,12 @@ static int answer(void *ctx, const char *call, const float *a)
 static void let_go(Mon *mo, int keep);
 static int set_reaction(Mon *mo, int slot)
 {
+    if (scene_construction_stop(mo->v)) return 0;
     if (mo->defeated || mo->scale < 0.3f)
         return 0;
     mo->pending_slot = slot;
     if (moves_slot(&mo->graph, slot, mo->column) >= 0)
-        let_go(mo, 0);
+        { let_go(mo, 0); if (scene_construction_stop(mo->v)) return 0; }
     return 1;
 }
 
@@ -1986,6 +2168,7 @@ static int obj_where(const Viewer *v, int src, int obj, int serial, float pos[3]
 /* add3DSfx(name, keep) on that object; an object not (or no longer) there: the sound where it was asked for, once */
 static void obj_sound(Viewer *v, int src, int obj, const char *name, int keep, const float at[3])
 {
+    if (scene_construction_stop((Viewer *)v)) return;
     float pos[3];
     int serial = src == OS_ARMY && v->army && army_unit(v->army, obj) ? army_unit(v->army, obj)->serial : 0;
     if (src == OS_PEOPLE_OBJECT)
@@ -2018,6 +2201,7 @@ static void obj_sound(Viewer *v, int src, int obj, const char *name, int keep, c
 /* remove3DSfx: that object's sounds of that name (NULL: all of them) stopped */
 static void obj_sound_stop(Viewer *v, int src, int obj, const char *name)
 {
+    if (scene_construction_stop((Viewer *)v)) return;
     for (int k = 0; k < v->nosnd; k++)
         if (v->osnd[k].src == src && v->osnd[k].obj == obj && (!name || !_stricmp(v->osnd[k].name, name))) {
             if (getenv("RAMPAGE_TRACE"))
@@ -2057,6 +2241,7 @@ static void obj_sounds_step(Viewer *v)
  * (+0x4C, 0x2BC1B8) is not followed; no monster's was seen to have it] */
 static void building_alarm(Viewer *v, SceneBuilding *sb)
 {
+    if (scene_construction_stop((Viewer *)v)) return;
     if (!sb->alarm_sound)
         return;
     if (sb->alarm_played && fabsf(v->play_now - sb->alarm_at) <= sb->alarm_duration)
@@ -2086,6 +2271,7 @@ static void building_alarm(Viewer *v, SceneBuilding *sb)
  * Only the roar reaches 2.5 (and "hitcell b floor col amount") */
 static void building_script(Viewer *v, SceneBuilding *sb, float amount)
 {
+    if (scene_construction_stop((Viewer *)v)) return;
     building_alarm(v, sb);
     if (amount < 2.5f)
         return;
@@ -2093,8 +2279,9 @@ static void building_script(Viewer *v, SceneBuilding *sb, float amount)
     if (sb->school && v->play_now >= sb->swarm_next) {
         sb->swarm_next = v->play_now + 20.0f;
         Group t = sb->swarm ? city_template(v->city, sb->swarm) : (Group){ 0 };
+    if (scene_construction_stop((Viewer *)v)) return;
         if (t.at && v->scene.folk)
-            people_add_swarm(v->scene.folk, t, at);
+            { people_add_swarm(v->scene.folk, t, at); if (scene_construction_stop((Viewer *)v)) return; }
         if (getenv("RAMPAGE_TRACE"))
             printf("  building %d school: swarm %s at %.1f %.1f %.1f%s\n", (int)(sb - v->scene.buildings),
                    sb->swarm ? sb->swarm : "-", at[0], at[1], at[2], t.at ? "" : " (none)");
@@ -2110,6 +2297,7 @@ static void building_script(Viewer *v, SceneBuilding *sb, float amount)
 
 static void hit_building_front(Mon *mo, const float *p, float gain)
 {
+    if (scene_construction_stop(mo->v)) return;
     Viewer *v = mo->v;
     int mirror = mo->mirror, side = 0, kind = (int)p[0];
     if (kind == 0 || kind == 1 || kind == 3 || kind == 4) side = mirror;
@@ -2145,12 +2333,14 @@ static void hit_building_front(Mon *mo, const float *p, float gain)
     if (best) {
         scene_building_flags_punch(&v->scene, bi, bq);
         building_script(v, best, 2.0f);
+    if (scene_construction_stop(mo->v)) return;
     }
     if (hit && (kind <= 2 || kind == 6) &&             /* +2 energy (Monsters.bsf), the rage when full */
         edible_power_hit_building(&mo->power, 1, gain, mo->mode == MODE_AIRBORNE || mo->mode == MODE_TAKEOFF,
                                   others_full(mo))) {
         edible_power_start_rage(&mo->power, others_full(mo));
         set_reaction(mo, 54);
+    if (scene_construction_stop(mo->v)) return;
         rage_started(mo);
     }
     mo->energy = mo->power.energy;
@@ -2182,6 +2372,7 @@ static int mon_building_below(const Mon *mo)
  * "Bip01 Spine". */
 static void hit_building_roof(Mon *mo, const char *bone)
 {
+    if (scene_construction_stop(mo->v)) return;
     Viewer *v = mo->v;
     int bi = mon_building_below(mo);
     Mat4 w;
@@ -2199,7 +2390,7 @@ static void hit_building_roof(Mon *mo, const char *bone)
         sb->hitter = mo->slot;
     int col, roof = sb->b.roof, hit = building_hit_roof(&sb->b, at, 2.0f, &col);
     if (col >= 0)                                    /* (0x2BBE80 went on to Building::hit) */
-        building_script(v, sb, 2.0f);
+        { building_script(v, sb, 2.0f); if (scene_construction_stop(mo->v)) return; }
     if (getenv("RAMPAGE_TRACE"))
         printf("  hitBuildingRoof %s at %.1f %.1f %.1f: building %d roof %d -> %d, top storey %d column %d %s "
                "(state %d, %d storeys, HP %d)\n", bone, at[0], at[1], at[2], bi, roof, sb->b.roof, sb->b.n - 1, col,
@@ -2215,6 +2406,7 @@ static float dist_to(const float a[3], const float b[3])
 /* throwObject(eat, x, y, z) (0x2D9DC0): what the monster holds eaten, or smashed away with (x, y, z) in its frame */
 static void throw_held(Mon *mo, int eat, float x, float y, float z)
 {
+    if (scene_construction_stop(mo->v)) return;
     Viewer *v = mo->v;
     /* [R 0x2D9DC0] throwObject(vel, 0, eat): the velocity in the monster's frame, turned by its matrix (x
      * mirrored with it) and by its +0x2560 angle, always 0: the head animator's +0x68 (the animator at +0x24F8,
@@ -2229,26 +2421,31 @@ static void throw_held(Mon *mo, int eat, float x, float y, float z)
         mo->thrown_t = 1;
     if (mo->held_unit >= 0 && v->army) {
         army_throw(v->army, mo->held_unit, mo->slot, eat, vel, mo->heading / 57.2957795f);
+    if (scene_construction_stop(mo->v)) return;
         mo->held_unit = -1;
         return;
     }
     if (mo->held_vehicle >= 0 && v->veh) {
         vehicle_throw(v->veh, mo->held_vehicle, mo->slot, eat, vel, mo->heading / 57.2957795f);
+    if (scene_construction_stop(mo->v)) return;
         mo->held_vehicle = -1;
         return;
     }
     if (mo->held_parade >= 0 && v->parade) {
         parade_throw(v->parade, mo->held_parade, mo->slot, eat, mo->heading / 57.2957795f);
+    if (scene_construction_stop(mo->v)) return;
         mo->held_parade = -1;
         return;
     }
     if (mo->held_rail >= 0 && v->rail) {
         rail_throw(v->rail, mo->held_rail, mo->slot, eat, vel);
+    if (scene_construction_stop(mo->v)) return;
         mo->held_rail = -1;
         return;
     }
     if (mo->held_sobj >= 0 && v->sobj) {
         streetobj_fly(v->sobj, mo->held_sobj, mo->slot, eat, vel);
+    if (scene_construction_stop(mo->v)) return;
         mo->held_sobj = -1;
         return;
     }
@@ -2259,7 +2456,9 @@ static void throw_held(Mon *mo, int eat, float x, float y, float z)
         int first = pp && !(pp->flags & 0x40000000u);    /* addStats once per object */
         const char *name = pp ? pp->name : NULL;
         PeopleEaten got = people_eat(v->scene.folk, mo->held, mo->slot);
+    if (scene_construction_stop(mo->v)) return;
         monster_stats(mo, got.health, got.energy);
+    if (scene_construction_stop(mo->v)) return;
         if (got.fart)
             mon_fart_later(mo, 2.0f);
         if (got.eat_fx)                              /* the lightning on the priest's eater */
@@ -2273,6 +2472,7 @@ static void throw_held(Mon *mo, int eat, float x, float y, float z)
             printf("  ate: health %+.0f -> %.0f, energy %+.0f -> %.0f\n", got.health, mo->hp, got.energy, mo->energy);
     } else {
         people_throw(v->scene.folk, mo->held, mo->heading);
+    if (scene_construction_stop(mo->v)) return;
     }
     mo->held = -1;
 }
@@ -2288,8 +2488,9 @@ static void throw_held(Mon *mo, int eat, float x, float y, float z)
  * ported: the matrix +0xBA58 made the identity and 0x2FF7A0 (each of the record +0x7D90's +0x14 vtable +0x10) */
 static void let_go(Mon *mo, int keep)
 {
+    if (scene_construction_stop(mo->v)) return;
     if (!keep)
-        throw_held(mo, 0, 0, 10, 10);
+        { throw_held(mo, 0, 0, 10, 10); if (scene_construction_stop(mo->v)) return; }
     for (int k = 0; k < MON_FX_SLOTS && mo->v->fxw; k++)
         if (mo->fx_used >> k & 1)
             fx_stop(mo->v->fxw, mo->fx_slot[k]);
@@ -2336,6 +2537,7 @@ static void foot_pose(Mon *mo, FootPose *m)
 /* doGrabObject("Helper R Hand") (0x2D99C0): the nearest object to pick up within 15 of the hand, in front */
 static void grab_nearest(Mon *mo)
 {
+    if (scene_construction_stop(mo->v)) return;
     Viewer *v = mo->v;
     Mat4 h;
     /* the hold (0x2DA4A0 -> 0x2DA310) takes nothing while the hand holds a valid object, of whatever kind [R] */
@@ -2368,17 +2570,24 @@ static void grab_nearest(Mon *mo)
     if (v->sobj && mo->held_sobj < 0 && (k = streetobj_nearest_pickup(v->sobj, hand, root, fwd, r)) >= 0)
         kind = 5, who = k, r = dist_to(streetobj_get(v->sobj, k)->world + 12, hand);
     switch (kind) {
-    case 0: people_grab(v->scene.folk, who, 0.1f); mo->held = who; break;
-    case 1: army_grab(v->army, who, mo->slot, 0.1f); mo->held_unit = who; break;
-    case 2: parade_grab(v->parade, who, mo->slot, 0.1f); mo->held_parade = who; break;
-    case 3: vehicle_grab(v->veh, who, mo->slot, 0.1f); mo->held_vehicle = who; break;
-    case 4: rail_grab(v->rail, who, mo->slot, 0.1f); mo->held_rail = who; break;
-    case 5: streetobj_grab(v->sobj, who, 0.1f); mo->held_sobj = who; break;   /* a parked car */
+    case 0: people_grab(v->scene.folk, who, 0.1f);
+    if (scene_construction_stop(mo->v)) return; mo->held = who; break;
+    case 1: army_grab(v->army, who, mo->slot, 0.1f);
+    if (scene_construction_stop(mo->v)) return; mo->held_unit = who; break;
+    case 2: parade_grab(v->parade, who, mo->slot, 0.1f);
+    if (scene_construction_stop(mo->v)) return; mo->held_parade = who; break;
+    case 3: vehicle_grab(v->veh, who, mo->slot, 0.1f);
+    if (scene_construction_stop(mo->v)) return; mo->held_vehicle = who; break;
+    case 4: rail_grab(v->rail, who, mo->slot, 0.1f);
+    if (scene_construction_stop(mo->v)) return; mo->held_rail = who; break;
+    case 5: streetobj_grab(v->sobj, who, 0.1f);
+    if (scene_construction_stop(mo->v)) return; mo->held_sobj = who; break;   /* a parked car */
     }
 }
 
 static void clip_event(Mon *mo, const MoveEvent *e)
 {
+    if (scene_construction_stop(mo->v)) return;
     Viewer *v = mo->v;
     float c = cosf(mo->heading / 57.2957795f), s = sinf(mo->heading / 57.2957795f);
     float mirror = mo->mirror ? -1.0f : 1.0f;        /* Monster.getMirrorState */
@@ -2462,10 +2671,13 @@ static void clip_event(Mon *mo, const MoveEvent *e)
         dst[0] = e->p[1]; dst[1] = e->p[2]; dst[2] = e->p[3];
         add = 1;
     }
-    else if (!strcmp(n, "Monsters::doFart"))     { mon_fart(mo); return; }
-    else if (!strcmp(n, "Monsters::doBarf"))     { mon_function(mo, "doBarf"); return; }   /* Expression_Barf's */
+    else if (!strcmp(n, "Monsters::doFart"))     { mon_fart(mo);
+    if (scene_construction_stop(mo->v)) return; return; }
+    else if (!strcmp(n, "Monsters::doBarf"))     { mon_function(mo, "doBarf");
+    if (scene_construction_stop(mo->v)) return; return; }   /* Expression_Barf's */
     else if (!strcmp(n, "Monsters::addPeople")) {   /* Ground_Hold_Shake: what pours out of the held vehicle */
         int k = held_shaker(mo);
+    if (scene_construction_stop(mo->v)) return;
         if (k == 1 || k == 2)
             mon_fx_named(mo, k == 1 ? "People_Pour" : "Garbage_Pour", "fxNode_Belch");
         return;
@@ -2473,14 +2685,19 @@ static void clip_event(Mon *mo, const MoveEvent *e)
     else if (!strcmp(n, "Monsters::gainHealth")) {  /* (amount, garbage, last): the garbage truck's last hurts 40,
                                                         * with the barf and React_Ground_Heavy_Back */
         if (held_shaker(mo) == 2 && (int)e->p[1] == 1) {
+    if (scene_construction_stop(mo->v)) return;
             mon_add_hp(mo, -40);
             if ((int)e->p[2] == 1) {                 /* at 0 HP too: addHitPoints fells it at its next state */
                 face_play(mo, "Expression_Barf", 0, 0, 1);
+    if (scene_construction_stop(mo->v)) return;
                 force_state(mo, "React_Ground_Heavy_Back");
+    if (scene_construction_stop(mo->v)) return;
             }
         } else {
+    if (scene_construction_stop(mo->v)) return;
             mon_add_hp(mo, e->p[0]);
         }
+    if (scene_construction_stop(mo->v)) return;
         return;
     }
     else if (!strcmp(n, "Monsters::disableGravity")) { mo->no_gravity = 1; return; }
@@ -2504,7 +2721,7 @@ static void clip_event(Mon *mo, const MoveEvent *e)
         int head, plays;                             /* (and a delay > 1: the belch that many seconds later) */
         const char *face = face_anim_event(&mo->faces, e->p, &head, &plays);
         if (face)
-            face_play(mo, face, head, 0, plays);
+            { face_play(mo, face, head, 0, plays); if (scene_construction_stop(mo->v)) return; }
         return;
     }
     else if (!strcmp(n, "Monsters::prepareToMount")) { climb_prepare(&mo->mount); return; }
@@ -2594,11 +2811,12 @@ static void clip_event(Mon *mo, const MoveEvent *e)
                          * time-0 events (mode 1, column 0) played */
                         mo->force_to = k + 1;
                         let_go(mo, 0);
+    if (scene_construction_stop(mo->v)) return;
                         break;
                     }
             }
             if (out.delete_streaker && v->scene.folk && mo->streaker >= 0)
-                people_remove(v->scene.folk, mo->streaker);
+                { people_remove(v->scene.folk, mo->streaker); if (scene_construction_stop(mo->v)) return; }
             if (getenv("RAMPAGE_TRACE"))
                 printf("  respawn at %.1f %.1f %.1f%s, %d lives\n", out.pos[0], out.pos[1], out.pos[2],
                        out.fall ? ", falling" : "", game_lives(v->game, mo->slot));
@@ -2621,43 +2839,52 @@ static void clip_event(Mon *mo, const MoveEvent *e)
         if (mo->nick)
             mo->nick = 3;
         Group t = city_template(v->city, monster_female(mo) ? "NakedFemale" : "NakedMale");
+    if (scene_construction_stop(mo->v)) return;
         float at[3] = { mo->mx, mo->my, mo->mz };
         if (t.at && (mo->streaker = people_add_streaker(v->scene.folk, t, at, v->view.pos[0])) >= 0) {
+    if (scene_construction_stop(mo->v)) return;
             mon_in(mo)->hidden = 1;
             mo->human = 1;
         }
+    if (scene_construction_stop(mo->v)) return;
         return;
     }
     else if (!strcmp(n, "Monsters::doGrabPerson")) { /* grabBuildingOccupant(loc, 1) (0x2B3350): 0.25 s blend */
         int free = mo->held < 0 && mo->held_unit < 0, who = free ? window_person(mo, e->p + 1) : -1;
         if (who >= 0) {
             people_grab(v->scene.folk, who, 0.25f);
+    if (scene_construction_stop(mo->v)) return;
             mo->held = who;
         } else if (free && v->army && (who = window_soldier(mo, e->p + 1)) >= 0) {   /* a window soldier or cop:
                                                       * held, its onPickup; eaten or smashed by throwObject */
             scene_window_soldier_take(&v->scene, who);
             army_grab(v->army, who, mo->slot, 0.25f);
+    if (scene_construction_stop(mo->v)) return;
             mo->held_unit = who;
         }
         return;
     }
     else if (!strcmp(n, "Monsters::doGrabObject")) {
         grab_nearest(mo);
+    if (scene_construction_stop(mo->v)) return;
         return;
     }
     else if (!strcmp(n, "Monsters::grabBoulder")) {  /* Monsters.bsf: createScriptObject("Boulder") 6.5 above the
                                                       * monster, every time, then doGrabObject's search [R] */
         float at[3] = { mo->mx, mo->my, mo->mz + 6.5f };
         if (v->veh && vehicle_spawn(v->veh, "Boulder", at, 0, -1) >= 0)
-            grab_nearest(mo);
+            { if (scene_construction_stop(mo->v)) return; { grab_nearest(mo);
+    if (scene_construction_stop(mo->v)) return; } if (scene_construction_stop(mo->v)) return; }
         return;
     }
     else if (!strcmp(n, "Monsters::throwObject")) {  /* (eat, x, y, z) (0x2D9DC0): eaten, or smashed away */
         throw_held(mo, e->p[0] != 0, e->p[1], e->p[2], e->p[3]);
+    if (scene_construction_stop(mo->v)) return;
         return;
     }
     else if (strstr(n, "::doGrabPowerup") || strstr(n, "::destroyPowerup") || strstr(n, "::checkForHazard")) {
-        int r = edible_call(mo, n, e->p + 1);         /* grabBuildingOccupant: the edible at that window */
+        int r = edible_call(mo, n, e->p + 1);
+    if (scene_construction_stop(mo->v)) return;         /* grabBuildingOccupant: the edible at that window */
         if (getenv("RAMPAGE_TRACE"))
             printf("  %s: %d\n", n, r);
         return;
@@ -2685,9 +2912,11 @@ static void clip_event(Mon *mo, const MoveEvent *e)
         return;
     }
     else if (!strcmp(n, "Monsters::transitionFromBuildingTop")) { mo->mount.from_top = 1; return; }
-    else if (strstr(n, "::hitBuildingFront")) { hit_building_front(mo, e->p, edible_power_hit_gain(n)); return; }
+    else if (strstr(n, "::hitBuildingFront")) { hit_building_front(mo, e->p, edible_power_hit_gain(n));
+    if (scene_construction_stop(mo->v)) return; return; }
     else if (strstr(n, "::damageRoof")) {            /* Monsters.bsf the foot, Cal.bsf's kin the spine */
         hit_building_roof(mo, !strncmp(n, "Monsters::", 10) ? "Bip01 R Foot" : "Bip01 Spine");
+    if (scene_construction_stop(mo->v)) return;
         return;
     }
     else return;
@@ -2702,10 +2931,11 @@ static void clip_event(Mon *mo, const MoveEvent *e)
 
 static void clip_events(Mon *mo, const MoveState *st, float from, float to)
 {
+    if (scene_construction_stop(mo->v)) return;
     const MoveEvent *e;
     int n = moves_events_between(st, from, to, &e);
-    for (int i = 0; i < n; i++)
-        clip_event(mo, &e[i]);
+    for (int i = 0; i < n && !scene_construction_stop(mo->v); i++)
+        { clip_event(mo, &e[i]); if (scene_construction_stop(mo->v)) return; }
 }
 
 /* the stick (x right, y down) as a direction on the ground, in the camera's frame the monster keeps (0x2E8410) */
@@ -2864,6 +3094,7 @@ static int monster_spheres(Mon *mo, float out[][4], int max)
  * flying objects ask it */
 static void world_build(Viewer *v)
 {
+    if (scene_construction_stop((Viewer *)v)) return;
     CollideWorld *w = &v->cw;
     collide_begin(w, -1);
     for (uint32_t i = 0; i < v->scene.nbuildings; i++) {
@@ -2890,15 +3121,15 @@ static void world_build(Viewer *v)
                 mo->nmsph++;
         }
     }
-    if (v->army) army_collide_add(v->army, w);
-    if (v->veh) vehicle_collide_add(v->veh, w);
-    if (v->rail) rail_collide_add(v->rail, w);
-    if (v->parade) parade_collide_add(v->parade, w);
+    if (v->army) { army_collide_add(v->army, w); if (scene_construction_stop((Viewer *)v)) return; }
+    if (v->veh) { vehicle_collide_add(v->veh, w); if (scene_construction_stop((Viewer *)v)) return; }
+    if (v->rail) { rail_collide_add(v->rail, w); if (scene_construction_stop((Viewer *)v)) return; }
+    if (v->parade) { parade_collide_add(v->parade, w); if (scene_construction_stop((Viewer *)v)) return; }
     if (v->sobj) streetobj_collide_add(v->sobj, w);
     if (v->boss) boss_collide_add(v->boss, w);
     scene_huts_collide_add(&v->scene, w);           /* the guards' huts (city.c) */
     if (v->scene.folk)                               /* the people, every one in the world (people.h) */
-        people_collide_add(v->scene.folk, w);
+        { people_collide_add(v->scene.folk, w); if (scene_construction_stop((Viewer *)v)) return; }
     collide_finish(w);
 }
 
@@ -2924,6 +3155,7 @@ static void world_monster_moved(Mon *mo, const float (*sp)[4], int ns)
  * the parade's and the bosses' scripts have none */
 static void impact_route(Viewer *v, int tag, int kind, const float at[3], float mass)
 {
+    if (scene_construction_stop((Viewer *)v)) return;
     int i = COLLIDE_TAG_INDEX(tag), hit = 0;
     switch (COLLIDE_TAG_OWNER(tag)) {
     case COLLIDE_OWN_BUILDING:
@@ -2934,8 +3166,8 @@ static void impact_route(Viewer *v, int tag, int kind, const float at[3], float 
         break;
     case COLLIDE_OWN_VEHICLE: if (v->veh) vehicle_impact(v->veh, i); break;
     case COLLIDE_OWN_RAIL: if (v->rail) rail_impact(v->rail, i); break;
-    case COLLIDE_OWN_STREET: if (v->sobj) hit = streetobj_take_impact(v->sobj, i); break;
-    case COLLIDE_OWN_ARMY: if (v->army) army_impact(v->army, i); break;
+    case COLLIDE_OWN_STREET: if (v->sobj) { hit = streetobj_take_impact(v->sobj, i); if (scene_construction_stop((Viewer *)v)) return; } break;
+    case COLLIDE_OWN_ARMY: if (v->army) { army_impact(v->army, i); if (scene_construction_stop((Viewer *)v)) return; } break;
     default: break;
     }
     if (getenv("RAMPAGE_TRACE"))
@@ -3190,19 +3422,22 @@ static int shape_part(const Mon *mo, int i)
  * Points (DefObjectProps' 10) for the monster whose blow sent it flying [R] */
 static void hut_stats(Mon *mo, const float c[3], float r)
 {
+    if (scene_construction_stop(mo->v)) return;
     Viewer *v = mo->v;
     Group hit[8];
     int n = scene_huts_hit(&v->scene, c, r, hit, 8);
+    if (scene_construction_stop(mo->v)) return;
     for (int i = 0; i < n; i++)
         if (v->army)
-            army_add_stats(v->army, mo->slot, hit[i], 0);
+            { army_add_stats(v->army, mo->slot, hit[i], 0); if (scene_construction_stop(mo->v)) return; }
         else
-            monster_stats(mo, hit[i].at ? group_num(hit[i], "Health", 0) : 0,
-                          hit[i].at ? group_num(hit[i], "Energy", 0) : 0);
+            { monster_stats(mo, hit[i].at ? group_num(hit[i], "Health", 0) : 0,
+                          hit[i].at ? group_num(hit[i], "Energy", 0) : 0); if (scene_construction_stop(mo->v)) return; }
 }
 
 static void hit_spheres(Mon *mo)
 {
+    if (scene_construction_stop(mo->v)) return;
     Viewer *v = mo->v;
     if (!mo->have_graph || !mo->armed || !mon_in(mo))
         return;
@@ -3227,25 +3462,28 @@ static void hit_spheres(Mon *mo)
         c[3] = sh->radius;
         scene_adornments_hit(&v->scene, c, c[3]);    /* 0x2D4390: it knocks adornments off */
         if (v->army)                                 /* and the army's units: the attack's damage, once an attack */
-            army_hit(v->army, mo->slot, c, c[3], atk->damage, atk->seq);
+            { army_hit(v->army, mo->slot, c, c[3], atk->damage, atk->seq); if (scene_construction_stop(mo->v)) return; }
         if (v->veh)                                  /* and the vehicles and rockets */
-            vehicle_hit(v->veh, mo->slot, c, c[3], atk->damage);
+            { vehicle_hit(v->veh, mo->slot, c, c[3], atk->damage); if (scene_construction_stop(mo->v)) return; }
         if (v->rail)                                 /* and the trains, cable cars and freighters */
-            rail_hit(v->rail, mo->slot, c, c[3], atk->damage);
+            { rail_hit(v->rail, mo->slot, c, c[3], atk->damage); if (scene_construction_stop(mo->v)) return; }
         if (v->boss)                                 /* and the bosses */
-            boss_hit(v->boss, mo->slot, c, c[3], atk->damage, atk->seq);   /* the record's damage, once a record */
+            { boss_hit(v->boss, mo->slot, c, c[3], atk->damage, atk->seq); if (scene_construction_stop(mo->v)) return; }   /* the record's damage, once a record */
         if (v->parade)                               /* and the balloons, bikers and food carts */
-            parade_hit(v->parade, mo->slot, c, c[3], atk->seq);
+            { parade_hit(v->parade, mo->slot, c, c[3], atk->seq); if (scene_construction_stop(mo->v)) return; }
         upgrade_touch(mo, c, c[3]);                   /* and the MonsterUpgrade object */
         if (v->sobj) {                               /* and the street and roof objects (TakeDamage, type 0) */
             StreetMonster me = { { mo->mx, mo->my, mo->mz }, mo->heading / 57.2957795f,
                                  mo->graph.states[mo->run.state].name };
-            streetobj_hit(v->sobj, mo->slot, &me, c, c[3], atk->damage, atk->seq);   /* the record's +0x2C (0x2E268C):
+            streetobj_hit(v->sobj, mo->slot, &me, c, c[3], atk->damage, atk->seq);
+    if (scene_construction_stop(mo->v)) return;   /* the record's +0x2C (0x2E268C):
                                                       * Crane.bsf's HitPoints 5 take it */
         }
         if (v->scene.folk) {                         /* and people (TakeDamage), and the guards' huts */
             people_hit(v->scene.folk, mo->slot, c, c[3], mo->heading, mo->graph.states[mo->run.state].name);
+    if (scene_construction_stop(mo->v)) return;
             hut_stats(mo, c, c[3]);
+    if (scene_construction_stop(mo->v)) return;
         }
     }
 }
@@ -3295,6 +3533,7 @@ static int mon_shape_spheres(const Mon *mo, float out[64][4])
  * and reaction by look.c monster_blow). No points, no team [R] */
 static void monsters_fight(Viewer *v)
 {
+    if (scene_construction_stop((Viewer *)v)) return;
     static float now[MONSTERS][64][4];
     int nnow[MONSTERS];
     for (int a = 0; a < v->nmon; a++)
@@ -3342,6 +3581,7 @@ static void monsters_fight(Viewer *v)
             char name[16];
             snprintf(name, sizeof name, "monster %d", a + 1);
             monster_blow_hit(vi, at, atk, name);
+    if (scene_construction_stop((Viewer *)v)) return;
         }
     }
     for (int a = 0; a < v->nmon; a++) {               /* this frame's places, for the next frame's sweep */
@@ -3373,6 +3613,7 @@ static int take_damage_level(const Mon *mo, float amount);
  *   round(10 / 2.5) dents and the cell's 2 HP. The roar cracks the buildings beside it */
 static void roar_burst(Viewer *v, Mon *mo, const ArmyMonWeapon *w, const float c[3])
 {
+    if (scene_construction_stop((Viewer *)v)) return;
     float r = w->radius, amount = w->dps, mc[3], mr;
     char name[16];
     snprintf(name, sizeof name, "monster %d", mo->slot + 1);
@@ -3391,6 +3632,7 @@ static void roar_burst(Viewer *v, Mon *mo, const ArmyMonWeapon *w, const float c
         float from[3] = { vi->mx - knock[0], vi->my - knock[1], vi->mz };   /* behind: the knock along its front
                                                                               * (0x2D6A50 without a point) */
         monster_hit(vi, name, amount, w->level >= 0 ? w->level : take_damage_level(vi, amount), knock, from);
+    if (scene_construction_stop((Viewer *)v)) return;
         hit++;
     }
     mon_shape(mo, mc, &mr);
@@ -3418,28 +3660,32 @@ static void roar_burst(Viewer *v, Mon *mo, const ArmyMonWeapon *w, const float c
         sb->hitter = mo->slot;
         hit += building_hit(b, at, amount);
         building_script(v, sb, amount);
+    if (scene_construction_stop((Viewer *)v)) return;
     }
     unsigned rec = ++mo->atk_seq;                    /* the rest: TakeDamage(monster, amount, type 0, the way) */
     if (v->army)
-        hit += army_hit(v->army, mo->slot, c, r, amount, rec);
+        { hit += army_hit(v->army, mo->slot, c, r, amount, rec); if (scene_construction_stop((Viewer *)v)) return; }
     if (v->veh)
-        hit += vehicle_hit(v->veh, mo->slot, c, r, amount);
+        { hit += vehicle_hit(v->veh, mo->slot, c, r, amount); if (scene_construction_stop((Viewer *)v)) return; }
     if (v->rail)
-        hit += rail_hit(v->rail, mo->slot, c, r, amount);
+        { hit += rail_hit(v->rail, mo->slot, c, r, amount); if (scene_construction_stop((Viewer *)v)) return; }
     if (v->boss)
-        hit += boss_hit(v->boss, mo->slot, c, r, amount, rec);
+        { hit += boss_hit(v->boss, mo->slot, c, r, amount, rec); if (scene_construction_stop((Viewer *)v)) return; }
     if (v->parade)
-        hit += parade_hit(v->parade, mo->slot, c, r, rec);
+        { hit += parade_hit(v->parade, mo->slot, c, r, rec); if (scene_construction_stop((Viewer *)v)) return; }
     upgrade_touch(mo, c, r);
     if (v->sobj) {
         StreetMonster me = { { mo->mx, mo->my, mo->mz }, mo->heading / 57.2957795f,   /* (getMoveName: the roar's
                                                       * state, "Ground..." for MerryGoRound / DamagingEffect) */
                              mo->graph.states[mo->run.state].name };
         hit += streetobj_hit(v->sobj, mo->slot, &me, c, r, amount, rec);
+    if (scene_construction_stop((Viewer *)v)) return;
     }
     if (v->scene.folk) {
         hit += people_hit(v->scene.folk, mo->slot, c, r, mo->heading, mo->graph.states[mo->run.state].name);
+    if (scene_construction_stop((Viewer *)v)) return;
         hut_stats(mo, c, r);
+    if (scene_construction_stop((Viewer *)v)) return;
     }
     if (getenv("RAMPAGE_TRACE"))
         printf("  %s's %s burst at %.1f %.1f %.1f (radius %g, %g): %d hit\n", name, w->key, c[0], c[1], c[2], r, amount,
@@ -3451,6 +3697,7 @@ static void roar_burst(Viewer *v, Mon *mo, const ArmyMonWeapon *w, const float c
  * burst's damage the frame it starts [R] */
 static void mon_weapons_step(Viewer *v, float dt)
 {
+    if (scene_construction_stop((Viewer *)v)) return;
     for (int k = 0; k < v->nmon; k++) {
         Mon *mo = &v->mon[k];
         if (!mo->have_graph || !mon_in(mo))
@@ -3490,7 +3737,7 @@ static void mon_weapons_step(Viewer *v, float dt)
                            w->duration);
             }
             if (what & AMW_BURST)
-                roar_burst(v, mo, w, at);
+                { roar_burst(v, mo, w, at); if (scene_construction_stop((Viewer *)v)) return; }
         }
     }
 }
@@ -3498,15 +3745,17 @@ static void mon_weapons_step(Viewer *v, float dt)
 /* every monster's armed spheres, after the frame's posing (drawn with H), and what they hit of each other */
 static void hit_spheres_all(Viewer *v)
 {
+    if (scene_construction_stop((Viewer *)v)) return;
     v->scene.nspheres = 0;
     for (int k = 0; k < v->nmon; k++) {
         Mon *mo = &v->mon[k];
         mo->sph0 = v->scene.nspheres;
         hit_spheres(mo);
+    if (scene_construction_stop((Viewer *)v)) return;
         mo->nsph = v->scene.nspheres - mo->sph0;
     }
     if (v->nmon > 1)
-        monsters_fight(v);
+        { monsters_fight(v); if (scene_construction_stop((Viewer *)v)) return; }
     if (!v->show_hits)
         v->scene.nspheres = 0;
 }
@@ -3556,6 +3805,7 @@ static void feet_step(Mon *mo, float dt)
  * template has ShadowData, the monster's blobs on the ground or roof and on the wall it climbs */
 static void shadow_frame(Viewer *v, float dt)
 {
+    if (scene_construction_stop((Viewer *)v)) return;
     if (!v->slight.monster_blob)
         shadow_lighting_default(&v->slight);
     shadow_list_clear(&v->shl);
@@ -3579,12 +3829,18 @@ static void shadow_frame(Viewer *v, float dt)
         shadow_data_default(&d);
         Group g = in->shadow;
         const char *tex = group_str(g, "Texture|TextureName");
+    if (scene_construction_stop((Viewer *)v)) return;
         if (tex) d.texture = tex;
         d.intensity = group_num(g, "Intensity", d.intensity);
+    if (scene_construction_stop((Viewer *)v)) return;
         d.max_height = group_num(g, "MaxHeight", d.max_height);
+    if (scene_construction_stop((Viewer *)v)) return;
         d.full_height = group_num(g, "FullHeight", d.full_height);
+    if (scene_construction_stop((Viewer *)v)) return;
         d.ex_proj_height = group_num(g, "ExProjHeight", d.ex_proj_height);
+    if (scene_construction_stop((Viewer *)v)) return;
         Group rc = group_sub(g, "ShadowRect");
+    if (scene_construction_stop((Viewer *)v)) return;
         Record r[4];
         if (rc.at && group_items(rc, r, 4) == 4)
             for (int k = 0; k < 4; k++)
@@ -3667,12 +3923,14 @@ static void fx_shake(void *ctx, const char *name, const float pos[3])
  * garbage truck's last shake (React_Ground_Heavy_Back) drops the truck */
 static void force_state(Mon *mo, const char *name)
 {
+    if (scene_construction_stop(mo->v)) return;
     if (mo->defeated || mo->scale < 0.3f)
         return;
     for (int k = 0; name && mo->have_graph && k < mo->graph.n; k++)
         if (!_stricmp(mo->graph.states[k].name, name)) {
             mo->force_to = k + 1;
             let_go(mo, 0);
+    if (scene_construction_stop(mo->v)) return;
             return;
         }
 }
@@ -3691,6 +3949,7 @@ static void force_state(Mon *mo, const char *name)
  * by the foot IK towards the old place, a foot off the street) */
 static void reset_monster_state(Mon *mo)
 {
+    if (scene_construction_stop(mo->v)) return;
     mo->scale = mo->scale_to = 1;
     mo->scale_left = 0;
     memset(mo->vel, 0, sizeof mo->vel);
@@ -3700,6 +3959,7 @@ static void reset_monster_state(Mon *mo)
     if (!mo->defeated && mo->have_graph && mo->graph.n > 0) {   /* (the scale was just set to 1: not below 0.3) */
         mo->force_to = 1;
         let_go(mo, 0);
+    if (scene_construction_stop(mo->v)) return;
     }
     if (mo->feet.links) {
         foot_step(&mo->feet, 0, 0);
@@ -3712,12 +3972,14 @@ static void reset_monster_state(Mon *mo)
 /* the bosses' host: the army's weapons */
 static int boss_weapon_make(void *ctx, ArmyWeapon *w, Group g)
 {
+    if (scene_construction_stop((Viewer *)ctx)) return 0;
     Viewer *v = ctx;
     return v->army ? army_weapon_make(v->army, w, g) : 0;
 }
 static void boss_weapon_tick(void *ctx, ArmyWeapon *w, int may, const float from[3], const float dir[3],
                              const float frame[3][3], int target, float dt, int part)
 {
+    if (scene_construction_stop((Viewer *)ctx)) return;
     Viewer *v = ctx;
     if (v->army)
         army_weapon_tick(v->army, w, may, from, dir, frame, target, dt, COLLIDE_TAG(COLLIDE_OWN_BOSS, part));
@@ -3732,6 +3994,7 @@ static Mon *ev_mon(Viewer *v, int slot)
 /* ChallengeDef.Points (or the boss's 5000) / players into each player's category 5 [R ChallengeStatus.scr] */
 static void challenge_points_all(Viewer *v, int points)
 {
+    if (scene_construction_stop((Viewer *)v)) return;
     for (int p = 0; v->game && p < v->nmon; p++)
         game_add_points(v->game, p, GPT_CHALLENGE, points / v->nmon);
 }
@@ -3777,6 +4040,7 @@ static int ny_centre_down(Viewer *v)
 
 static void boss_step(Viewer *v, float dt, const ArmyMonster *am, int nm)
 {
+    if (scene_construction_stop((Viewer *)v)) return;
     if (!v->boss)
         return;
     static BossMonster m[MONSTERS];                  /* (static: boss_hit reads it after the frame's update) */
@@ -3818,6 +4082,7 @@ static void boss_step(Viewer *v, float dt, const ArmyMonster *am, int nm)
     boss_set_view(v->boss, v->view.pos[0] - 45, v->view.pos[0] + 45);   /* the view's x range [G], as the army's */
     boss_set_city_destroyed(v->boss, game_city_destroyed(v->game));   /* gCommon.isCityDestroyed */
     boss_update(v->boss, dt, m, nm, bl, nb);
+    if (scene_construction_stop((Viewer *)v)) return;
     BossEvent ev[64];
     int ne;
     while ((ne = boss_events(v->boss, ev, 64)) > 0)
@@ -3882,12 +4147,12 @@ static void boss_step(Viewer *v, float dt, const ArmyMonster *am, int nm)
                         }
                 break;
             }
-            case BE_REACTION: if (mo->hp > 0) force_state(mo, e->name); break;
+            case BE_REACTION: if (mo->hp > 0) { force_state(mo, e->name); if (scene_construction_stop((Viewer *)v)) return; } break;
             case BE_VEL: memcpy(mo->vel, e->v, sizeof mo->vel); break;
             case BE_HP: if (mo->hp > 0) mo->hp = fmaxf(0, fminf(mon_hp_max(mo), mo->hp + e->amount)); break;
             case BE_FACING: mo->heading = e->amount * 57.2957795f; break;
             case BE_PUSH: mo->mx += e->v[0]; mo->my += e->v[1]; break;
-            case BE_STATS: if (v->army) army_add_stats(v->army, mo->slot, e->tmpl, e->level); break;
+            case BE_STATS: if (v->army) { army_add_stats(v->army, mo->slot, e->tmpl, e->level); if (scene_construction_stop((Viewer *)v)) return; } break;
             case BE_BOSS_HEALTH:                     /* the boss bar; at 0 the challenge is met: 5000 points */
                 if (v->hud && hud_boss_health_id(v->hud, e->level, e->amount))
                     challenge_points_all(v, 5000);
@@ -3910,9 +4175,15 @@ static void boss_step(Viewer *v, float dt, const ArmyMonster *am, int nm)
                 break;
             case BE_FORCE_DAMAGE:                    /* RoofItem.bsf's forceDamage: the roof item there is knocked
                                                       * off (the adornment nearest pos, within 2 units [G]) */
-                if (!v->sobj || streetobj_force_damage(v->sobj, e->name, e->pos) == -1)   /* (-2: it is gone) */
+            {
+                int hit = v->sobj ? streetobj_force_damage(v->sobj, e->name, e->pos) : -1;
+                if (scene_construction_stop(v)) return;
+                if (hit == -1) {                   /* (-2: it is gone) */
                     scene_adornments_hit(&v->scene, e->pos, 2);
+                    if (scene_construction_stop(v)) return;
+                }
                 break;
+            }
             case BE_CAMERA_RMH:                      /* Levels::changeTwoTiltCameraRMH: how tall the camera frames */
                 v->cam.s.rep_monster_height = e->amount;
                 break;
@@ -3957,6 +4228,7 @@ static void boss_step(Viewer *v, float dt, const ArmyMonster *am, int nm)
  * (dircam_game_event); a new block is built after the frame */
 static void game_step(Viewer *v, float dt)
 {
+    if (scene_construction_stop((Viewer *)v)) return;
     if (!v->game || game_left(v->game))
         return;
     GameInput in;
@@ -3969,6 +4241,7 @@ static void game_step(Viewer *v, float dt)
     }
     in.centre_down = ny_centre_down(v);
     game_update(v->game, dt, &in);
+    if (scene_construction_stop((Viewer *)v)) return;
     GameEvent ev[32];
     int ne;
     while ((ne = game_events(v->game, ev, 32)) > 0)
@@ -3990,12 +4263,13 @@ static void game_step(Viewer *v, float dt)
                 /* the reveal's tubes in this block (0x3235F0), now if it is the one built */
                 v->ntubes = reveal_block(&v->reveal, e->a, 1 << 30, v->tubes, REVEAL_LOCS);
                 if (k == (int)v->block)
-                    add_tubes(v);
+                    { add_tubes(v); if (scene_construction_stop((Viewer *)v)) return; }
                 if (k >= 0 && k != (int)v->block && e->b) {
                     /* [R 0x2B66C0, 0x302AF0] in the game the block left is torn down and the new one laid out at
                      * once, as the results start: built at slot 0 once this frame is over (the monsters and the
                      * cameras 41 back), the block left's ground and rubble at -41 */
                     block_left(v);
+    if (scene_construction_stop((Viewer *)v)) return;
                     v->next_block = -1;
                     v->block_shift = 41;
                     v->game_block = k;
@@ -4090,7 +4364,8 @@ static void game_step(Viewer *v, float dt)
             case GE_RESET:
                 if (e->type == GE_RESET) {
                     dir_ai_clear(&mo->ai);            /* clearAllGoals */
-                    reset_monster_state(mo);          /* resetMonsterState */
+                    reset_monster_state(mo);
+    if (scene_construction_stop((Viewer *)v)) return;          /* resetMonsterState */
                 }
                 /* fall through */
             case GE_PLACE:
@@ -4162,7 +4437,8 @@ static void game_step(Viewer *v, float dt)
                     r.par_score = game_par_score(v->game);
                     r.city_flags = game_city_flags(v->game) | (v->challenges_lost ? 0 : CITY_FLAG_CHALLENGES);
                     r.monster_revealed = reveal_was_revealed(&v->reveal);
-                    r.results_text = game_block_str(v->game, "ResultsNIText");   /* Results.scr:428 (NY10's
+                    r.results_text = game_block_str(v->game, "ResultsNIText");
+    if (scene_construction_stop((Viewer *)v)) return;   /* Results.scr:428 (NY10's
                                                       * ChallengeBossDefeat) */
                     r.show_victory = game_world_done(v->game);   /* LevelResults.scr:228: getShowVictory (0x2C3180,
                                                       * 0x4D7E4F) hides Change Monster and Quit */
@@ -4184,7 +4460,7 @@ static void game_step(Viewer *v, float dt)
                 if (mon_in(mo))
                     mon_in(mo)->hidden = 0;
                 if (mo->streaker >= 0 && v->scene.folk)
-                    people_remove(v->scene.folk, mo->streaker);
+                    { people_remove(v->scene.folk, mo->streaker); if (scene_construction_stop((Viewer *)v)) return; }
                 mo->streaker = -1;
                 if (e->a == 1)                       /* the continue: setEnergy(0) (0x325288 -> 0x2E5730) [R];
                                                       * a rage runs on till its clock and energy are out */
@@ -4241,6 +4517,7 @@ static void language_from_menu(Viewer *v, int language)
 /* after the screens ran: a results screen's answer to the game, the sounds they start and stop */
 static void hud_frame(Viewer *v, int after)
 {
+    if (scene_construction_stop((Viewer *)v)) return;
     if (!after || !v->hud)
         return;
     int r = hud_result(v->hud);
@@ -4257,7 +4534,7 @@ static void hud_frame(Viewer *v, int after)
     switch (hud_pause_result(v->hud)) {
     case HUD_PAUSE_QUIT:                             /* ConfirmQuit's Yes: gWorld.restartShell */
         if (v->game)
-            game_restart_shell(v->game);
+            { game_restart_shell(v->game); if (scene_construction_stop((Viewer *)v)) return; }
         else
             v->exit_game = 1;
         break;
@@ -4345,9 +4622,11 @@ static void rage_started(Mon *mo)
  * Monsters.bsf [R]) */
 static void monster_stats(Mon *mo, float health, float energy)
 {
+    if (scene_construction_stop(mo->v)) return;
     if (edible_power_add_stats(&mo->power, &mo->hp, mon_hp_max(mo), health, energy, others_full(mo))) {
         edible_power_start_rage(&mo->power, others_full(mo));
         set_reaction(mo, 54);
+    if (scene_construction_stop(mo->v)) return;
         rage_started(mo);
         if (getenv("RAMPAGE_TRACE"))
             printf("  rage\n");
@@ -4359,6 +4638,7 @@ static void monster_stats(Mon *mo, float health, float energy)
  * column, and whether a person is at its window; the edibles' answer to the call, -1 none */
 static int edible_call(Mon *mo, const char *call, const float *xyz)
 {
+    if (scene_construction_stop(mo->v)) return 0;
     Viewer *v = mo->v;
     if (!v->edibles)
         return -1;
@@ -4378,9 +4658,11 @@ static int edible_call(Mon *mo, const char *call, const float *xyz)
 /* the edibles' frame: their clocks, then what they did */
 static void edible_step(Viewer *v, float dt)
 {
+    if (scene_construction_stop((Viewer *)v)) return;
     if (!v->edibles)
         return;
     edible_update(v->edibles, dt);
+    if (scene_construction_stop((Viewer *)v)) return;
     for (int k = 0; k < v->nmon; k++) {              /* each monster's rage and speed */
         Mon *mo = &v->mon[k];
         if (edible_power_update(&mo->power, dt, mo->hp)) {   /* stopRage (0x2D4340): its effect released */
@@ -4423,20 +4705,23 @@ static void edible_step(Viewer *v, float dt)
                     }
                 break;
             case EE_SOUND: obj_sound(v, OS_EDIBLE, e->edible, e->name, 0, e->pos); break;   /* add3DSfx */
-            case EE_MONSTER_FUNCTION: mon_function(mo, e->name); break;
+            case EE_MONSTER_FUNCTION:
+                mon_function(mo, e->name);
+    if (scene_construction_stop((Viewer *)v)) return;
+                break;
             case EE_REACTION:                        /* playReaction: the state of that name, only while alive; at
                                                       * the next step, its clip with it (forced here, the runner went
                                                       * on in the old clip from 0: Face_Eat_Item twice, no Yum) */
                 if (mo->hp > 0)
-                    force_state(mo, e->name);
+                    { force_state(mo, e->name); if (scene_construction_stop((Viewer *)v)) return; }
                 break;
             case EE_SPEED: edible_power_speed(&mo->power, e->amount, e->v[0]); break;
             case EE_STATS:                           /* gCommon.addStats once (0x2C51A0): through the army (its
                                                       * AE_STATS_* give the HP and energy), else here */
                 if (v->army)
-                    army_add_stats(v->army, mo->slot, e->tmpl, e->level);
+                    { army_add_stats(v->army, mo->slot, e->tmpl, e->level); if (scene_construction_stop((Viewer *)v)) return; }
                 else
-                    monster_stats(mo, e->v[0], e->v[1]);
+                    { monster_stats(mo, e->v[0], e->v[1]); if (scene_construction_stop((Viewer *)v)) return; }
                 break;
             case EE_BANNER:
                 if (v->hud)
@@ -4479,6 +4764,7 @@ static void edible_step(Viewer *v, float dt)
 /* the edibles' host: a front cell's state and where its edible stands */
 static int edible_cell_state(void *ctx, int building, int storey, int column)
 {
+    if (scene_construction_stop((Viewer *)ctx)) return 0;
     const Viewer *v = ctx;
     if (building < 0 || (uint32_t)building >= v->scene.nbuildings)
         return -1;
@@ -4488,6 +4774,7 @@ static int edible_cell_state(void *ctx, int building, int storey, int column)
 }
 static int edible_cell_where(void *ctx, int building, int storey, int column, float out[3])
 {
+    if (scene_construction_stop((Viewer *)ctx)) return 0;
     const Viewer *v = ctx;
     if (building < 0 || (uint32_t)building >= v->scene.nbuildings)
         return 0;
@@ -4502,6 +4789,7 @@ static int edible_cell_where(void *ctx, int building, int storey, int column, fl
 }
 static int edible_cell_follow(void *ctx, int building, int storey, int column, float out[3])
 {
+    if (scene_construction_stop((Viewer *)ctx)) return 0;
     const Viewer *v = ctx;
     if (building < 0 || (uint32_t)building >= v->scene.nbuildings ||
         v->scene.buildings[building].b.shake_time <= 0 || !edible_cell_where(ctx, building, storey, column, out))
@@ -4575,15 +4863,17 @@ static void hit_turn(Mon *mo, int was, const float d[2], int behind)
 
 static void monster_take(Mon *mo, const char *name, float amount, int level, int slot, const float d[2], int behind)
 {
+    if (scene_construction_stop(mo->v)) return;
     int was = mo->pending_slot;
     if (slot >= 0)                                   /* (what it holds let go of: set_reaction) */
-        set_reaction(mo, slot);
+        { set_reaction(mo, slot); if (scene_construction_stop(mo->v)) return; }
     hit_turn(mo, was, d, behind);
     if (level == 1 || level == 2)
         mon_rumble(mo, level == 1 ? 400 : 800);
     mo->hp = fmaxf(0, mo->hp - amount);
     if (mo->hp <= 0 && mo->pending_slot < 0) {
         set_reaction(mo, 67);
+    if (scene_construction_stop(mo->v)) return;
         mo->defeated = 1;
         memset(mo->vel, 0, sizeof mo->vel);
     }
@@ -4595,6 +4885,7 @@ static void monster_take(Mon *mo, const char *name, float amount, int level, int
  * larger of knock and velocity), then the reaction by its level and the velocity it gave */
 static void monster_hit(Mon *mo, const char *name, float amount, int level, const float knock[3], const float from[3])
 {
+    if (scene_construction_stop(mo->v)) return;
     if (!monster_hittable(mo))
         return;
     float heading = mo->heading / 57.2957795f, at[3] = { mo->mx, mo->my, mo->mz };
@@ -4602,12 +4893,14 @@ static void monster_hit(Mon *mo, const char *name, float amount, int level, cons
     int behind = army_hit_behind(at, heading, from), slot = army_reaction_slot(level, mo->vel, mo->mode, behind);
     float d[2] = { level == 2 && knock ? knock[0] : 0, level == 2 && knock ? knock[1] : 0 };
     monster_take(mo, name, amount, level, slot, d, behind);
+    if (scene_construction_stop(mo->v)) return;
 }
 
 /* 0x2D6A50 with the attacker's attack record (the fight, 0x2E35D0): the knock and the reaction by look.c monster_blow
  * (the attacker's front and right are its +0x14 and +0x8 rows, its state's node its +0x10C), then the hit's end */
 static void monster_blow_hit(Mon *mo, const Mon *by, const struct MonAtk *atk, const char *name)
 {
+    if (scene_construction_stop(mo->v)) return;
     if (!monster_hittable(mo))
         return;
     float h = by->heading / 57.2957795f, vh = mo->heading / 57.2957795f;
@@ -4629,15 +4922,18 @@ static void monster_blow_hit(Mon *mo, const Mon *by, const struct MonAtk *atk, c
             d[1] = mo->my - by->my;
         }
         monster_take(mo, name, atk->damage, atk->level, slot, d, behind);
+    if (scene_construction_stop(mo->v)) return;
     }
 }
 
 /* the vehicles' frame (vehicle.c): what they see of the monster and the buildings, then what they did */
 static void vehicle_step(Viewer *v, float dt, const ArmyMonster *m, int nm, const ArmyBox *boxes, int nb)
 {
+    if (scene_construction_stop((Viewer *)v)) return;
     if (!v->veh)
         return;
     vehicle_update(v->veh, dt, m, nm, boxes, nb);
+    if (scene_construction_stop((Viewer *)v)) return;
     VehicleEvent ev[64];
     int ne;
     while ((ne = vehicle_events(v->veh, ev, 64)) > 0)
@@ -4678,20 +4974,23 @@ static void vehicle_step(Viewer *v, float dt, const ArmyMonster *m, int nm, cons
                     }
                 break;
             case VE_SOUND: obj_sound(v, OS_VEHICLE, e->obj, e->name, e->level, e->pos); break;   /* add3DSfx */
-            case VE_HIT: monster_hit(mo, e->name, e->amount, e->level, e->v, e->pos); break;
+            case VE_HIT: monster_hit(mo, e->name, e->amount, e->level, e->v, e->pos);
+    if (scene_construction_stop((Viewer *)v)) return; break;
             case VE_BUILDING_HIT:                    /* the fire truck's stream: Building::hit, no one's */
                 if ((uint32_t)e->obj < v->scene.nbuildings && v->scene.buildings[e->obj].b.state == BUILDING_STANDING) {
                     v->scene.buildings[e->obj].hitter = -1;
                     building_hit(&v->scene.buildings[e->obj].b, e->pos, e->amount);
                 }
                 break;
-            case VE_REACTION: set_reaction(mo, e->level); break;
+            case VE_REACTION: set_reaction(mo, e->level);
+    if (scene_construction_stop((Viewer *)v)) return; break;
             case VE_FART: mon_fart_later(mo, e->amount); break;
             case VE_SET_VEL: memcpy(mo->vel, e->v, sizeof mo->vel); break;
             case VE_HP: if (mo->hp > 0) mo->hp = fmaxf(0, fminf(mon_hp_max(mo), mo->hp + e->amount)); break;
             case VE_STATS:                           /* id 1: the army applied it (its events follow) */
                 if (e->id == 0) {
                     monster_stats(mo, e->v[0], e->v[1]);
+    if (scene_construction_stop((Viewer *)v)) return;
                     challenge_stats(v, e->name, (int)e->amount);
                 }
                 break;
@@ -4700,7 +4999,8 @@ static void vehicle_step(Viewer *v, float dt, const ArmyMonster *m, int nm, cons
                     if (e->obj == v->mon[k].held_vehicle)
                         v->mon[k].held_vehicle = -1;
                 break;
-            case VE_IMPACT: impact_route(v, e->id, e->level, e->pos, e->amount); break;
+            case VE_IMPACT: impact_route(v, e->id, e->level, e->pos, e->amount);
+    if (scene_construction_stop((Viewer *)v)) return; break;
             default: break;
             }
             if (getenv("RAMPAGE_TRACE") && e->type != VE_EFFECT && e->type != VE_EFFECT_STOP)
@@ -4710,7 +5010,7 @@ static void vehicle_step(Viewer *v, float dt, const ArmyMonster *m, int nm, cons
         Mon *mo = &v->mon[k];
         Mat4 h;
         if (mo->held_vehicle >= 0 && attach_world(mo, "Helper R Hand", &h) == 0)
-            vehicle_hold(v->veh, mo->held_vehicle, h.m, mo->mirror, dt);
+            { vehicle_hold(v->veh, mo->held_vehicle, h.m, mo->mirror, dt); if (scene_construction_stop((Viewer *)v)) return; }
     }
     for (int k = 0; k < v->nvfx; k++) {              /* the effects that follow their vehicle, while it is there */
         if (v->vfx[k].obj < 0) {
@@ -4741,6 +5041,7 @@ static void vehicle_step(Viewer *v, float dt, const ArmyMonster *m, int nm, cons
 /* the rail objects' frame (rail.c): what they see of the monster and the buildings, then what they did */
 static void rail_step(Viewer *v, float dt, const ArmyMonster *m, int nm)
 {
+    if (scene_construction_stop((Viewer *)v)) return;
     if (!v->rail)
         return;
     static RailBox rb[64];
@@ -4753,6 +5054,7 @@ static void rail_step(Viewer *v, float dt, const ArmyMonster *m, int nm)
         rb[nb].falling = b->collapse != -1;
     }
     rail_update(v->rail, dt, m, nm, rb, nb);
+    if (scene_construction_stop((Viewer *)v)) return;
     for (int k = 0; k < v->nmon; k++) {
         Mon *mo = &v->mon[k];
         if (mo->pending_slot < 0)
@@ -4816,14 +5118,23 @@ static void rail_step(Viewer *v, float dt, const ArmyMonster *m, int nm)
             /* a knock-down is asked again every frame until its slot starts (the viewer takes pending_slot at the
              * clip's next event): setReaction (0x2E1AD0) puts the slot's entry in +0x110 each time, the same one, so
              * one is enough [R] */
-            case RE_REACTION: if (mo->pending_slot < 0 && set_reaction(mo, e->level)) mo->rail_knock = 1; break;
+            case RE_REACTION:
+                if (mo->pending_slot < 0) {
+                    int reacted = set_reaction(mo, e->level);
+                    if (scene_construction_stop(v)) return;
+                    if (reacted)
+                        mo->rail_knock = 1;
+                }
+                break;
             case RE_SET_VEL: if (mo->rail_knock < 2) memcpy(mo->vel, e->v, sizeof mo->vel); break;
             case RE_HP: if (mo->hp > 0 && mo->rail_knock < 2) mo->hp = fmaxf(0, fminf(mon_hp_max(mo), mo->hp + e->amount)); break;
             case RE_PUSH: mo->mx += e->v[0]; mo->my += e->v[1]; break;
-            case RE_IMPACT: impact_route(v, e->id, e->level, e->pos, e->amount); break;
+            case RE_IMPACT: impact_route(v, e->id, e->level, e->pos, e->amount);
+    if (scene_construction_stop((Viewer *)v)) return; break;
             case RE_STATS:
                 if (e->id == 0) {
                     monster_stats(mo, e->v[0], e->v[1]);
+    if (scene_construction_stop((Viewer *)v)) return;
                     challenge_stats(v, e->name, (int)e->amount);
                 }
                 break;
@@ -4842,7 +5153,7 @@ static void rail_step(Viewer *v, float dt, const ArmyMonster *m, int nm)
         Mon *mo = &v->mon[k];
         Mat4 h;
         if (mo->held_rail >= 0 && attach_world(mo, "Helper R Hand", &h) == 0)
-            rail_hold(v->rail, mo->held_rail, h.m, mo->mirror, dt);
+            { rail_hold(v->rail, mo->held_rail, h.m, mo->mirror, dt); if (scene_construction_stop((Viewer *)v)) return; }
     }
     for (int k = 0; k < v->nrfx; k++) {              /* the effects that follow their object, while it is there */
         if (v->rfx[k].obj < 0) {
@@ -4888,10 +5199,12 @@ static void parade_fx_frame(const ParadeObj *o, float R[3][3])
  * they did; the one in the monster's hand follows it */
 static void parade_step(Viewer *v, float dt, const ArmyMonster *m, int nm)
 {
+    if (scene_construction_stop((Viewer *)v)) return;
     if (!v->parade)
         return;
     parade_set_world_state(v->parade, v->game ? game_state(v->game) : GS_PLAY);
     parade_update(v->parade, dt, m, m ? nm : 0, v->view.pos[0]);
+    if (scene_construction_stop((Viewer *)v)) return;
     ParadeEvent ev[64];
     int ne;
     while ((ne = parade_events(v->parade, ev, 64)) > 0)
@@ -4948,9 +5261,10 @@ static void parade_step(Viewer *v, float dt, const ArmyMonster *m, int nm)
             case PAE_STATS:                          /* gCommon.addStats: the score through the army (its AE_SCORE
                                                       * counts the challenge), HP and energy */
                 if (v->army)
-                    army_add_stats(v->army, mo->slot, e->tmpl, e->level);
+                    { army_add_stats(v->army, mo->slot, e->tmpl, e->level); if (scene_construction_stop((Viewer *)v)) return; }
                 else {
                     monster_stats(mo, e->v[0], e->v[1]);
+    if (scene_construction_stop((Viewer *)v)) return;
                     challenge_stats(v, e->name, (int)e->amount);
                 }
                 break;
@@ -4958,12 +5272,16 @@ static void parade_step(Viewer *v, float dt, const ArmyMonster *m, int nm)
                 if (v->game)
                     game_add_points(v->game, mo->slot, e->level, (int)e->amount);
                 break;
-            case PAE_FART: mon_fart(mo); break;      /* Monsters::timedDoFart -> doFart */
+            case PAE_FART:
+                mon_fart(mo);
+    if (scene_construction_stop((Viewer *)v)) return;
+                break;      /* Monsters::timedDoFart -> doFart */
             case PAE_WEAPON:                         /* the biker's bottle: the army's person weapons */
                 if (v->army) {
                     const ParadeObj *o = parade_obj(v->parade, e->obj);
                     army_person_weapon(v->army, 1000 + e->obj, e->name && o ? group_sub(o->tmpl, "Weapon|RifleWeapon")
                                        : (Group){ 0 }, o ? o->world : NULL, e->monster >= 0 ? e->monster : 0);
+    if (scene_construction_stop((Viewer *)v)) return;
                 }
                 break;
             case PAE_REMOVED:
@@ -4971,7 +5289,8 @@ static void parade_step(Viewer *v, float dt, const ArmyMonster *m, int nm)
                     if (e->obj == v->mon[k].held_parade)
                         v->mon[k].held_parade = -1;
                 break;
-            case PAE_IMPACT: impact_route(v, e->id, e->level, e->pos, e->amount); break;
+            case PAE_IMPACT: impact_route(v, e->id, e->level, e->pos, e->amount);
+    if (scene_construction_stop((Viewer *)v)) return; break;
             default: break;
             }
             if (getenv("RAMPAGE_TRACE"))
@@ -4981,7 +5300,7 @@ static void parade_step(Viewer *v, float dt, const ArmyMonster *m, int nm)
         Mon *mo = &v->mon[k];
         Mat4 h;
         if (mo->held_parade >= 0 && attach_world(mo, "Helper R Hand", &h) == 0)
-            parade_hold(v->parade, mo->held_parade, h.m, mo->mirror, dt);
+            { parade_hold(v->parade, mo->held_parade, h.m, mo->mirror, dt); if (scene_construction_stop((Viewer *)v)) return; }
     }
     for (int k = 0; k < v->npfx; k++) {              /* the effects that follow their object, while it is there */
         const ParadeObj *o = parade_obj(v->parade, v->pfx[k].obj);
@@ -5016,6 +5335,7 @@ static void street_fx_frame(const float rot[9], float R[3][3])
  * they see of it and of the buildings, then what they did; they are drawn where they are now */
 static void street_step(Viewer *v, float dt)
 {
+    if (scene_construction_stop((Viewer *)v)) return;
     if (!v->sobj)
         return;
     static StreetMonster me[MONSTERS];               /* (static: kept for the hits after the update) */
@@ -5028,7 +5348,7 @@ static void street_step(Viewer *v, float dt)
             float sp[32][4];
             int ns = mon_spheres(mo, sp, 32);
             for (int i = 0; i < ns; i++)
-                streetobj_touch(v->sobj, k, &me[k], sp[i], sp[i][3]);
+                { streetobj_touch(v->sobj, k, &me[k], sp[i], sp[i][3]); if (scene_construction_stop((Viewer *)v)) return; }
         }
     }
     static StreetBuilding sbs[64];
@@ -5039,6 +5359,7 @@ static void street_step(Viewer *v, float dt)
         sbs[nb].falling = v->scene.buildings[i].b.collapse >= 0;
     }
     streetobj_update(v->sobj, dt, nm ? me : NULL, nm, sbs, nb);
+    if (scene_construction_stop((Viewer *)v)) return;
     StreetEvent ev[64];
     int ne;
     while ((ne = streetobj_events(v->sobj, ev, 64)) > 0)
@@ -5082,8 +5403,13 @@ static void street_step(Viewer *v, float dt)
                 else
                     obj_sound(v, OS_STREET, e->obj, e->name, e->level, e->pos);
                 break;
-            case SE_SHAPE: scene_street_shape(&v->scene, k, e->name); break;
-            case SE_IMPACT: impact_route(v, e->id, e->level, e->pos, e->amount); break;   /* a thrown car met it */
+            case SE_SHAPE:
+                scene_street_shape(&v->scene, k, e->name);
+                if (scene_construction_stop(v))
+                    return;
+                break;
+            case SE_IMPACT: impact_route(v, e->id, e->level, e->pos, e->amount);
+    if (scene_construction_stop((Viewer *)v)) return; break;   /* a thrown car met it */
             case SE_MONSTER_FACING:                  /* the MerryGoRound's rider: queueFacingZRequest (0x2E97D0) */
             case SE_MONSTER_PUSH: {                  /* queuePushRequest (0x2E9860): taken [R 0x2DEB04] */
                 Mon *mo = ev_mon(v, e->monster);
@@ -5100,11 +5426,11 @@ static void street_step(Viewer *v, float dt)
             case SE_MONSTER_VEL: memcpy(ev_mon(v, e->monster)->vel, e->v, sizeof e->v); break;   /* setVel(v, 0) */
             case SE_MONSTER_REACTION:                /* playReaction, while alive */
                 if (ev_mon(v, e->monster)->hp > 0)
-                    force_state(ev_mon(v, e->monster), e->name);
+                    { force_state(ev_mon(v, e->monster), e->name); if (scene_construction_stop((Viewer *)v)) return; }
                 break;
             case SE_STATS:                           /* gCommon.addStats(obj, monster, 0) */
                 if (v->army)
-                    army_add_stats(v->army, e->monster, e->tmpl, 0);
+                    { army_add_stats(v->army, e->monster, e->tmpl, 0); if (scene_construction_stop((Viewer *)v)) return; }
                 else
                     challenge_stats(v, e->name, (int)e->amount);
                 break;
@@ -5139,7 +5465,7 @@ static void street_step(Viewer *v, float dt)
         Mon *mo = &v->mon[k];
         Mat4 h;
         if (mo->held_sobj >= 0 && attach_world(mo, "Helper R Hand", &h) == 0)
-            streetobj_hold(v->sobj, mo->held_sobj, h.m, mo->mirror, dt);
+            { streetobj_hold(v->sobj, mo->held_sobj, h.m, mo->mirror, dt); if (scene_construction_stop((Viewer *)v)) return; }
     }
     for (int i = 0, n = streetobj_count(v->sobj); i < n; i++) {   /* drawn where they are now */
         const StreetObj *o = streetobj_get(v->sobj, i);
@@ -5286,6 +5612,7 @@ static void shot_fx_frame(const float dir[3], float R[3][3])
 
 static void army_step(Viewer *v, float dt)
 {
+    if (scene_construction_stop((Viewer *)v)) return;
     if (!v->army || !have_monster(v) || !v->mon[0].have_graph || !mon_in(&v->mon[0]))
         return;
     static ArmyMonster m[MONSTERS];                  /* (static: the army's, vehicles', rail's and parade's hits read
@@ -5309,12 +5636,19 @@ static void army_step(Viewer *v, float dt)
                                                       * (gAIMgr 0x3320F0) */
     army_ai_cut(v->army, vehicle_ai_cut(v->veh));     /* (the traffic's release ends gAIMgr's update) */
     army_update(v->army, dt, m, nm, boxes, nb);
+    if (scene_construction_stop((Viewer *)v)) return;
     vehicle_step(v, dt, m, nm, boxes, nb);
+    if (scene_construction_stop((Viewer *)v)) return;
     parade_step(v, dt, m, nm);
+    if (scene_construction_stop((Viewer *)v)) return;
     rail_step(v, dt, m, nm);
+    if (scene_construction_stop((Viewer *)v)) return;
     edible_step(v, dt);
+    if (scene_construction_stop((Viewer *)v)) return;
     boss_step(v, dt, m, nm);
+    if (scene_construction_stop((Viewer *)v)) return;
     game_step(v, dt);
+    if (scene_construction_stop((Viewer *)v)) return;
     ArmyEvent ev[64];
     int ne;
     while ((ne = army_events(v->army, ev, 64)) > 0)
@@ -5402,17 +5736,21 @@ static void army_step(Viewer *v, float dt)
             case AE_HIT:                             /* ReactionLevel < 0: through TakeDamage */
                 monster_hit(mo, e->name, e->amount, e->level >= 0 ? e->level : take_damage_level(mo, e->amount), e->v,
                             e->pos);
+    if (scene_construction_stop((Viewer *)v)) return;
                 break;
-            case AE_REACTION: set_reaction(mo, e->level); break;
+            case AE_REACTION: set_reaction(mo, e->level);
+    if (scene_construction_stop((Viewer *)v)) return; break;
             case AE_FART: mon_fart_later(mo, e->amount); break;
             case AE_PUSH:
                 if (getenv("RAMPAGE_TRACE"))
                     printf("  army push: %.2f %.2f by %.2f %.2f\n", mo->mx, mo->my, e->v[0], e->v[1]);
                 mo->mx += e->v[0]; mo->my += e->v[1];
                 break;
-            case AE_IMPACT: impact_route(v, e->id, e->level, e->pos, e->amount); break;
+            case AE_IMPACT: impact_route(v, e->id, e->level, e->pos, e->amount);
+    if (scene_construction_stop((Viewer *)v)) return; break;
             case AE_STATS_HEALTH: mo->hp = mo->hp > 0 ? fmaxf(1, fminf(mon_hp_max(mo), mo->hp + e->amount)) : mo->hp; break;
-            case AE_STATS_ENERGY: monster_stats(mo, 0, e->amount); break;
+            case AE_STATS_ENERGY: monster_stats(mo, 0, e->amount);
+    if (scene_construction_stop((Viewer *)v)) return; break;
             case AE_FLOAT:                           /* a PointsBanner: 0.8 for the army's awards (0x2BAB2C) */
                 if (v->hud)
                     hud_float(v->hud, (int)e->amount, e->pos, e->level, 0.8f);
@@ -5421,9 +5759,9 @@ static void army_step(Viewer *v, float dt)
             case AE_OBJECT_HIT: {                    /* a shot's or beam's TakeDamage on another module's object */
                 int owner = COLLIDE_TAG_OWNER(e->id), idx = COLLIDE_TAG_INDEX(e->id);
                 if (owner == COLLIDE_OWN_VEHICLE && v->veh)
-                    vehicle_shot(v->veh, idx, e->dir);
+                    { vehicle_shot(v->veh, idx, e->dir); if (scene_construction_stop((Viewer *)v)) return; }
                 else if (owner == COLLIDE_OWN_STREET && v->sobj)
-                    streetobj_shot(v->sobj, idx, e->dir);
+                    { streetobj_shot(v->sobj, idx, e->dir); if (scene_construction_stop((Viewer *)v)) return; }
                 break;
             }
             case AE_BUILDING_HIT:                    /* a shot's or beam's Building::hit (0x2BC150), no one's */
@@ -5457,7 +5795,7 @@ static void army_step(Viewer *v, float dt)
         Mon *mo = &v->mon[k];
         Mat4 h;
         if (mo->held_unit >= 0 && attach_world(mo, "Helper R Hand", &h) == 0)
-            army_hold(v->army, mo->held_unit, h.m, mo->mirror, dt);
+            { army_hold(v->army, mo->held_unit, h.m, mo->mirror, dt); if (scene_construction_stop((Viewer *)v)) return; }
     }
     for (int k = 0; k < v->nfxa; k++) {              /* the effects that follow their unit or shot */
         float at[3];
@@ -5534,6 +5872,7 @@ static void weather_step(Viewer *v)
 /* the effects the scene and the people asked for, started; the world's particles moved on */
 static void fx_step(Viewer *v, float dt)
 {
+    if (scene_construction_stop((Viewer *)v)) return;
     weather_step(v);
     for (int i = 0; i < v->scene.nfxreq; i++)
         if (v->fxw) {
@@ -5551,6 +5890,7 @@ static void fx_step(Viewer *v, float dt)
             if (v->mon[k].fart_in[j] > 0 && (v->mon[k].fart_in[j] -= dt) <= 0) {
                 v->mon[k].fart_in[j] = 0;
                 mon_fart(&v->mon[k]);
+    if (scene_construction_stop((Viewer *)v)) return;
             }
     for (int k = 0; k < v->nmon; k++)                /* the monsters' effects on their nodes */
         mon_fx_follow(&v->mon[k]);
@@ -5654,6 +5994,7 @@ static int mon_fx_frame(Mon *mo, int node, float pos[3], float R[3][3])
  * query's mask found holds it (the shots' 4, 0x2000, 0x2040: 0x2953E0, 0x33B770); only a mask from a script could] */
 static void mon_fx_event(Mon *mo, const MoveEvent *e)
 {
+    if (scene_construction_stop(mo->v)) return;
     Viewer *v = mo->v;
     int k = (int)(int32_t)e->value;
     if (k < 0 || k >= MON_FX_SLOTS || !v->fxw)
@@ -5745,7 +6086,9 @@ static int mon_fx_named(Mon *mo, const char *name, const char *node)
  * on fxNode_Fart, a hop of 20 */
 static void mon_fart(Mon *mo)
 {
+    if (scene_construction_stop(mo->v)) return;
     face_play(mo, "Expression_Smile", 0, 0, 1);
+    if (scene_construction_stop(mo->v)) return;
     mon_fx_named(mo, "Fart", "fxNode_Fart");
     mo->vel[2] += 20;                                /* addVel((0, 0, 20), 1) */
 }
@@ -5782,6 +6125,7 @@ static int rage_fx_at(Mon *mo, float at[3])
  * it is handed straight back to the FxManager (0x207A40, no shutdown first): gone at once, its particles too */
 static void mon_rage_fx(Mon *mo, int on)
 {
+    if (scene_construction_stop(mo->v)) return;
     Viewer *v = mo->v;
     if (mo->rage_on && v->fxw)
         fx_kill(v->fxw, mo->rage_fx);
@@ -5799,6 +6143,7 @@ static void mon_rage_fx(Mon *mo, int on)
  * budget, shut down by becomeHuman (0x2D3ED0 -> 0x2F4F60) until the next world's setup */
 static void mon_nick_fx(Mon *mo)
 {
+    if (scene_construction_stop(mo->v)) return;
     static const char *const NODE[3] = { "FxFire", "FxFireEyeL", "FxFireEyeR" };
     static const char *const NAME[3] = { "Nick_Fire", "Glowing_Eyeball", "Glowing_Eyeball" };
     static const float I[3][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
@@ -5828,10 +6173,11 @@ static void mon_nick_fx(Mon *mo)
  * monster has its own of these. The books' MonsterFunction (Beans: doFart, the cats: doCatSound) */
 static void mon_function(Mon *mo, const char *name)
 {
+    if (scene_construction_stop(mo->v)) return;
     if (!name)
         return;
     if (!strcmp(name, "doFart"))
-        mon_fart(mo);
+        { mon_fart(mo); if (scene_construction_stop(mo->v)) return; }
     else if (!strcmp(name, "doBarf"))
         mon_fx_named(mo, "Barf", "fxNode_Belch");
     else if (!strcmp(name, "doCatSound"))           /* add3DSfx("Cat_1", 0): on the monster, following it */
@@ -6033,6 +6379,7 @@ static int cam_follows(const Mon *mo)
  * head, scale, hands and feet for the posing */
 static void mon_step(Mon *mo, float dt)
 {
+    if (scene_construction_stop(mo->v)) return;
     Viewer *v = mo->v;
     static const uint8_t none[MV_COUNT];
     float lx = mo->pad.lx, ly = mo->pad.ly;
@@ -6047,6 +6394,7 @@ static void mon_step(Mon *mo, float dt)
     if (mo->have_graph) {
         MoveInput *in = &mo->input;
         face_step(mo, dt);
+    if (scene_construction_stop(mo->v)) return;
         if (in->v[MV_LX] != lx) in->fresh[MV_LX] = 0.2f;
         if (in->v[MV_LY] != ly) in->fresh[MV_LY] = 0.2f;
         in->v[MV_LX] = lx;
@@ -6127,6 +6475,7 @@ static void mon_step(Mon *mo, float dt)
                 int to = mo->defeated || mo->scale < 0.3f ? -1 : moves_slot(&mo->graph, SLOT_LAND, mo->column);
                 if (to >= 0) {
                     let_go(mo, 0);
+    if (scene_construction_stop(mo->v)) return;
                     moves_force(&mo->run, to);
                     ev = 0;
                 }
@@ -6208,6 +6557,7 @@ static void mon_step(Mon *mo, float dt)
                 if (under >= 0 && v->scene.buildings[under].b.state >= BUILDING_FALLING &&
                     (k = moves_slot(&mo->graph, 73, mo->column)) >= 0 && k != mo->run.state) {
                     let_go(mo, 0);
+    if (scene_construction_stop(mo->v)) return;
                     moves_force(&mo->run, k);
                     ev = 0;
                 }
@@ -6221,6 +6571,7 @@ static void mon_step(Mon *mo, float dt)
                     dir_ai_avoid(&mo->ai, was, NULL);
                 if (!mo->defeated && mo->scale >= 0.3f) {
                     let_go(mo, 0);
+    if (scene_construction_stop(mo->v)) return;
                     moves_force(&mo->run, to);
                     ev = 0;
                 }
@@ -6257,7 +6608,9 @@ static void mon_step(Mon *mo, float dt)
             if (st->flags & NODE_ROOT_TURN)
                 mo->heading += m * root_turn(mo, clip_at(mo, st, t0), clip_at(mo, st, t1));
         }
-        clip_events(mo, st, t0, t1);                  /* the old clip's events up to now */
+        clip_events(mo, st, t0, t1);
+    if (scene_construction_stop(mo->v)) return;                  /* the old clip's events up to now */
+        if (scene_construction_stop(v)) return;
         if (mo->mode == MODE_BUILDING && mo->mount.at.building >= 0) {   /* held on the face (0x2D5870) */
             float pos[3] = { mo->mx, mo->my, mo->mz }, delta[3] = { mo->mx - before[0], mo->my - before[1], mo->mz - before[2] };
             float h = mo->heading;
@@ -6302,6 +6655,7 @@ static void mon_step(Mon *mo, float dt)
             scene_monster_blend(&v->scene, mo->slot, blend == BLEND_IN ? to->blend : 0);
             foot_command(&mo->feet, st->flags);      /* 0x33CCA0: the foot object keeps the state left */
             play_state(mo);
+            if (scene_construction_stop(v)) return;
             if (bake && root_at(mo, mo->entry_t, b, q) == 0) {
                 /* 0x2E6580: the monster moves and turns so that the new clip's root, where it starts, is where the old
                  * one's was: the old root's place and turn become the monster's */
@@ -6329,6 +6683,7 @@ static void mon_step(Mon *mo, float dt)
              * event and fires, in order, every one at or before the start, so a state entered part-way (phase
              * kept) still gets its set-up (mode, column) */
             clip_events(mo, to, -1, mo->run.time);
+    if (scene_construction_stop(mo->v)) return;
             if (ev != 0 && !mo->defeated && mo->hp <= 0 && mo->pending_slot < 0 && mo->mode != MODE_AIRBORNE) {
                 /* [R 0x2E68A0 .. 0x2E6A4C] the state command's own test, as a state starts that is not a reaction
                  * (the command's +0xC; a forced start, ev 0 here) with none asked (+0x110): at 0 HP, not in the air
@@ -6338,6 +6693,7 @@ static void mon_step(Mon *mo, float dt)
                  * (addHitPoints 0x2DA530: the bosses, the trains, the rockets) fells it too at its next state */
                 memset(mo->vel, 0, sizeof mo->vel);
                 set_reaction(mo, 67);
+    if (scene_construction_stop(mo->v)) return;
                 mo->defeated = 1;
             }
         }
@@ -6446,13 +6802,17 @@ static void soak_step(Viewer *v)
  * go before the army in the port's frame [G: the game's object order] */
 static void people_drop(void *ctx, const char *name, const float pos[3])
 {
+    if (scene_construction_stop((Viewer *)ctx)) return;
     Viewer *v = ctx;
     if (v->army && name)
-        army_drop(v->army, name, pos);
+        { army_drop(v->army, name, pos); if (scene_construction_stop((Viewer *)ctx)) return; }
 }
 
 static void play_step(Viewer *v, float dt, float aspect)
 {
+    if (scene_construction_stop((Viewer *)v)) return;
+    if (scene_construction_stop(v) || v->exit_game)
+        return;
     soak_step(v);
     if (v->hud && hud_paused(v->hud)) {              /* GameOver's pauseGame(1): only the screen runs */
         hud_update(v->hud, dt);
@@ -6462,12 +6822,14 @@ static void play_step(Viewer *v, float dt, float aspect)
             if (v->mon[k].hud && v->mon[k].hud != v->hud)
                 hud_update(v->mon[k].hud, dt);
         hud_frame(v, 1);
+    if (scene_construction_stop((Viewer *)v)) return;
         popup_step(v, dt);
         return;
     }
     v->play_now += dt;
     foot_set_ni(game_ni_on(v->game));                /* the feet's 0x4D6A9A gates */
-    world_build(v);                                  /* the collision world as the frame begins */
+    world_build(v);
+    if (scene_construction_stop((Viewer *)v)) return;                                  /* the collision world as the frame begins */
     scene_cloth_step(&v->scene, dt);                 /* the cloths' time, simulated at the next posing */
     fx_budget(v->fxw, v->nmon + (v->extra >= 0));    /* the effects budget, by the monsters in the world (0x2B72B0) */
     v->mid_x = players_mid_x(v);                     /* 0x336360, once a frame (0x2B6CE0) */
@@ -6479,8 +6841,10 @@ static void play_step(Viewer *v, float dt, float aspect)
         reveal_walk_update(&v->rwalk, dt, v->mon[v->extra].mx, v->view.pos[0]);
         reveal_events(v);
     }
-    for (int k = 0; k < mon_world(v); k++)
+    for (int k = 0; k < mon_world(v); k++) {
         mon_step(&v->mon[k], dt);
+    if (scene_construction_stop((Viewer *)v)) return;
+    }
     if (v->extra >= 0)                               /* (it arrived: hidden) */
         reveal_events(v);
     if (v->scene.folk) {                             /* the people, the ones in their hands, what they make happen */
@@ -6507,17 +6871,20 @@ static void play_step(Viewer *v, float dt, float aspect)
             v->scene.spawn_left = v->game ? game_clock(v->game, NULL) : v->scene.military_range;
         }
         scene_people_spawn(&v->scene, dt);
+    if (scene_construction_stop((Viewer *)v)) return;
         people_set_world_state(v->scene.folk, v->game ? game_state(v->game) : GS_PLAY);   /* (the chains in play) */
         people_set_drop(v->scene.folk, people_drop, v);
         people_update(v->scene.folk, dt, pm, v->nmon);
-        scene_huts_update(&v->scene, dt);           /* (no touch flies them: OnlyHitWithEffNodes, scene_huts_hit) */
+    if (scene_construction_stop((Viewer *)v)) return;
+        scene_huts_update(&v->scene, dt);
+    if (scene_construction_stop((Viewer *)v)) return;           /* (no touch flies them: OnlyHitWithEffNodes, scene_huts_hit) */
         for (int k = 0; k < v->nmon; k++) {
             Mon *mo = &v->mon[k];
             Mat4 h;
             if (mo->held >= 0 && people_get(v->scene.folk, mo->held)->phase != PP_HELD)
                 mo->held = -1;
             if (mo->held >= 0 && attach_world(mo, "Helper R Hand", &h) == 0)
-                people_hold(v->scene.folk, mo->held, h.m, mo->mirror, dt);
+                { people_hold(v->scene.folk, mo->held, h.m, mo->mirror, dt); if (scene_construction_stop((Viewer *)v)) return; }
         }
         PeopleEvent ev[32];
         int ne = people_events(v->scene.folk, ev, 32);
@@ -6529,6 +6896,7 @@ static void play_step(Viewer *v, float dt, float aspect)
                 int on = ev[i].on && ev[i].name, k;
                 army_person_weapon(v->army, ev[i].who, on ? group_sub(p->tmpl, "Weapon|RifleWeapon") : (Group){ 0 },
                                    p->world, 0);
+    if (scene_construction_stop((Viewer *)v)) return;
                 for (k = 0; k < v->narmed_people && v->armed_people[k] != ev[i].who; k++)
                     ;
                 if (on && k == v->narmed_people && v->narmed_people < 32)
@@ -6566,6 +6934,7 @@ static void play_step(Viewer *v, float dt, float aspect)
                 Mat4 n;
                 float pos[3], R[3][3];
                 int on = scene_person_node(&v->scene, ev[i].who, ev[i].node, n.m) == 0;
+    if (scene_construction_stop((Viewer *)v)) return;
                 if (on) {
                     frame_of(&n, pos, R);
                     fx_spawn_frame(v->fxw, ev[i].name, pos, (const float (*)[3])R, 1);
@@ -6578,7 +6947,7 @@ static void play_step(Viewer *v, float dt, float aspect)
             if (ev[i].type == PE_WINDOW_CLOSE)       /* back in: its window shuts */
                 scene_window_close_at(&v->scene, ev[i].v);
             if (ev[i].type == PE_IMPACT)             /* a flying person met an object: its TakeImpact */
-                impact_route(v, ev[i].object, ev[i].on, ev[i].v, ev[i].amount);
+                { impact_route(v, ev[i].object, ev[i].on, ev[i].v, ev[i].amount); if (scene_construction_stop((Viewer *)v)) return; }
             if (ev[i].type == PE_MESSAGE && v->hud && ev[i].name) {   /* ActorSwarm's RECESS (createAndStartText) */
                 float rgba[4] = { ev[i].v[0], ev[i].v[1], ev[i].v[2], ev[i].amount };
                 hud_banner_text(v->hud, ev[i].name, rgba, 0.5f, "");
@@ -6624,6 +6993,7 @@ static void play_step(Viewer *v, float dt, float aspect)
                                                           * Monsters.bsf doPriestReaction) [R] */
                 memcpy(mo->vel, ev[i].v, sizeof mo->vel);   /* (setVel 0x2E74F0 leaves the mode: the reaction's) */
                 set_reaction(mo, 2);
+    if (scene_construction_stop((Viewer *)v)) return;
             }
             if (getenv("RAMPAGE_TRACE"))
                 printf("  people event %d (%s) from %d\n", ev[i].type, ev[i].name ? ev[i].name : "-", ev[i].who);
@@ -6649,6 +7019,7 @@ static void play_step(Viewer *v, float dt, float aspect)
     for (uint32_t i = 0; i < nbw; i++)
         was[i] = (uint8_t)v->scene.buildings[i].b.state;
     scene_buildings_update(&v->scene, dt);
+    if (scene_construction_stop(v)) return;
     for (uint32_t i = 0; i < nbw; i++)               /* the front has cracked (0x2BD7D0: state 5, Building_Pre_Collapse):
                                                       * 2 s on the pads of the monsters on it, or on its face [R 0x2BD9A0] */
         if (was[i] == BUILDING_CRACKING && v->scene.buildings[i].b.state == BUILDING_SHAKING)
@@ -6658,11 +7029,19 @@ static void play_step(Viewer *v, float dt, float aspect)
                                                  (mo->mount.mounted && mo->mount.at.building == (int)i)))
                     mon_rumble(mo, 2000);
             }
-    mon_weapons_step(v, dt);                         /* the roar (army.c's monster weapons) */
+    mon_weapons_step(v, dt);
+    if (scene_construction_stop((Viewer *)v)) return;                         /* the roar (army.c's monster weapons) */
     street_step(v, dt);
+    if (scene_construction_stop((Viewer *)v)) return;
+    if (scene_construction_stop(v) || v->exit_game)
+        return;
     army_step(v, dt);
+    if (scene_construction_stop((Viewer *)v)) return;
+    if (scene_construction_stop(v) || v->exit_game)
+        return;
     obj_sounds_step(v);                              /* the objects' sounds follow them, or go with them */
     fx_step(v, dt);
+    if (scene_construction_stop((Viewer *)v)) return;
     shake_step(v->shakes, 8 + MONSTERS - 1, dt);
     for (int k = v->nmon - 1; k >= 0; k--) {         /* Hud.bsf: health, rage, the score (ArmyStats points[6]); player
                                                       * 1's last, as it has the screens */
@@ -6677,10 +7056,10 @@ static void play_step(Viewer *v, float dt, float aspect)
                 game_blocks_won(v->game, k) : -1);   /* (the King modes: the blocks won by the block icon) */
         hud_set_clock(mo->hud, k == 0 && vis, clock);   /* one Clock for the screen (WorldGuiDriver's) [R] */
         if (k == 0 && hud_challenge_items(mo->hud, challenge_collected(&v->challenge), challenge_required(&v->challenge)))
-            challenge_points_all(v, challenge_points(&v->challenge));   /* CHALLENGE MET!: ChallengeDef.Points / players */
+            { challenge_points_all(v, challenge_points(&v->challenge)); if (scene_construction_stop((Viewer *)v)) return; }   /* CHALLENGE MET!: ChallengeDef.Points / players */
         hud_update(mo->hud, dt);
         if (k == 0)
-            hud_frame(v, 1);
+            { hud_frame(v, 1); if (scene_construction_stop((Viewer *)v)) return; }
     }
     popup_step(v, dt);                               /* the SaveGame popup over the screens */
     for (int k = 0; k < v->nmon && v->challenge.up_state == CU_WAITING; k++) {   /* a monster's touch (TakeDamage,
@@ -6928,6 +7307,7 @@ static int pose_monsters(Viewer *v, double t)
  * to the blocks behind) [G: the game reloads them with those blocks] */
 static void block_left(Viewer *v)
 {
+    if (scene_construction_stop((Viewer *)v)) return;
     for (int k = 0; k < v->nmon; k++) {
         Mon *mo = &v->mon[k];
         mo->held = mo->held_unit = mo->held_vehicle = mo->held_parade = mo->held_rail = mo->held_sobj = -1;
@@ -6950,8 +7330,9 @@ static void block_left(Viewer *v)
         vehicle_clear(v->veh);
         for (int k = 1; k < 3; k++)
             if (v->scene.traffic_def[k].at)
-                vehicle_load_traffic(v->veh, k, v->scene.traffic_def[k]);
+                { vehicle_load_traffic(v->veh, k, v->scene.traffic_def[k]); if (scene_construction_stop((Viewer *)v)) return; }
         vehicle_level_start(v->veh, v->hidden_x, &v->hidden);
+    if (scene_construction_stop((Viewer *)v)) return;
     }
     if (v->army) {                                   /* its units and shots; the army stays, the scores' way */
         army_clear(v->army);
@@ -6971,13 +7352,14 @@ static void block_left(Viewer *v)
     if (v->scene.folk) {
         people_set_world_state(v->scene.folk, -1);   /* (no chains from the teardown) */
         for (int i = 0; i < people_count(v->scene.folk); i++)
-            people_remove(v->scene.folk, i);
+            { people_remove(v->scene.folk, i); if (scene_construction_stop((Viewer *)v)) return; }
     }
     scene_block_left(&v->scene);
 }
 
 static void game_next_block(Viewer *v)
 {
+    if (scene_construction_stop((Viewer *)v)) return;
     if (v->game_block < 0)
         return;
     for (int k = 0; k < v->nmon; k++)
@@ -6990,6 +7372,7 @@ static void game_next_block(Viewer *v)
     v->game_block = -1;
     v->game_built = 1;
     build(v);
+    if (scene_construction_stop((Viewer *)v)) return;
     v->game_built = 0;
     v->left_block = -1;
 }
@@ -7010,6 +7393,9 @@ static void game_next_block(Viewer *v)
 static void attract_press(Viewer *v);
 static const char *play_script(Viewer *v, const char *script, float aspect)
 {
+    if (scene_construction_stop((Viewer *)v)) return NULL;
+    if (scene_construction_stop(v) || v->exit_game)
+        return *script ? script : NULL;
     Mon *mo = &v->mon[0];                            /* the monster the words play */
     static const struct { const char *name; int button; float x, y; } WORDS[] = {
         { "left", -1, -1, 0 }, { "right", -1, 1, 0 }, { "up", -1, 0, -1 }, { "down", -1, 0, 1 }, { "wait", -1, 0, 0 },
@@ -7084,6 +7470,7 @@ static const char *play_script(Viewer *v, const char *script, float aspect)
         }
         if (_stricmp(word, "rage") == 0) {           /* the energy full through addStats: the rage starts */
             monster_stats(mo, 0, 100);
+    if (scene_construction_stop((Viewer *)v)) return NULL;
             continue;
         }
         if (_stricmp(word, "eatperson") == 0) {      /* eatperson name: the first living person of that template
@@ -7097,8 +7484,10 @@ static const char *play_script(Viewer *v, const char *script, float aspect)
                 const Person *q = people_get(v->scene.folk, who);
                 if (q->phase != PP_GONE && q->name && _stricmp(q->name, name) == 0) {
                     people_grab(v->scene.folk, who, 0.1f);
+    if (scene_construction_stop((Viewer *)v)) return NULL;
                     mo->held = who;
                     throw_held(mo, 1, 0, 0, 0);
+    if (scene_construction_stop((Viewer *)v)) return NULL;
                 }
             }
             continue;
@@ -7107,6 +7496,7 @@ static const char *play_script(Viewer *v, const char *script, float aspect)
                                                       * by the amount */
             float knock[3] = { 0, 0, 0 }, from[3] = { mo->mx, mo->my - 5, mo->mz };
             monster_hit(mo, "hurt", seconds, take_damage_level(mo, seconds), knock, from);
+    if (scene_construction_stop((Viewer *)v)) return NULL;
             continue;
         }
         if (_stricmp(word, "monfn") == 0) {          /* monfn name: callMonsterFunction (doFart, doBarf) */
@@ -7116,6 +7506,8 @@ static const char *play_script(Viewer *v, const char *script, float aspect)
             while (*p && *p != ' ' && *p != ',' && k < 63) name[k++] = *p++;
             name[k] = 0;
             mon_function(mo, name);
+    if (scene_construction_stop((Viewer *)v)) return NULL;
+            if (scene_construction_stop(v)) return *p ? p : NULL;
             continue;
         }
         if (_stricmp(word, "award") == 0) {          /* award name: gCommon.addStats of an object of that template */
@@ -7135,7 +7527,9 @@ static const char *play_script(Viewer *v, const char *script, float aspect)
             while (*p && *p != ' ' && *p != ',' && k < 63) name[k++] = *p++;
             name[k] = 0;
             float h = mo->heading / 57.2957795f, at[3] = { mo->mx - sinf(h) * 6, mo->my + cosf(h) * 6, 0 };
-            if (!v->veh || vehicle_spawn(v->veh, name, at, h, -1) < 0)
+            int spawned = v->veh ? vehicle_spawn(v->veh, name, at, h, -1) : -1;
+            if (scene_construction_stop(v)) return NULL;
+            if (spawned < 0)
                 printf("no vehicle %s\n", name);
             continue;
         }
@@ -7150,6 +7544,7 @@ static const char *play_script(Viewer *v, const char *script, float aspect)
                 for (int k = 0; k < 3; k++)
                     c[k] = o->world[12 + k] + (o->box_min[k] + o->box_max[k]) / 2;
                 streetobj_hit(v->sobj, mo->slot, &me, c, 0.5f, 20, rec++);
+    if (scene_construction_stop((Viewer *)v)) return NULL;
             } else
                 printf("no street object %d\n", (int)seconds);
             continue;
@@ -7162,7 +7557,9 @@ static const char *play_script(Viewer *v, const char *script, float aspect)
             while (*p && *p != ' ' && *p != ',' && k < 63) uname[k++] = *p++;
             uname[k] = 0;
             float h = mo->heading / 57.2957795f, at[3] = { mo->mx - sinf(h) * 2.5f, mo->my + cosf(h) * 2.5f, 0 };
-            if (!v->army || army_spawn(v->army, uname, at, h + 3.14159265f) < 0)
+            int spawned = v->army ? army_spawn(v->army, uname, at, h + 3.14159265f) : -1;
+            if (scene_construction_stop(v)) return NULL;
+            if (spawned < 0)
                 printf("no unit %s\n", uname);
             continue;
         }
@@ -7182,6 +7579,7 @@ static const char *play_script(Viewer *v, const char *script, float aspect)
             }
             float at[3] = { mo->mx, front ? front->min[1] : 0, 9 };
             int u = front && v->army ? army_spawn_window(v->army, name, at) : -1;
+    if (scene_construction_stop((Viewer *)v)) return NULL;
             if (u < 0)
                 printf("no soldier %s\n", name);
             else if (getenv("RAMPAGE_TRACE"))
@@ -7226,7 +7624,7 @@ static const char *play_script(Viewer *v, const char *script, float aspect)
             const BossPart *bp = v->boss ? boss_part(v->boss, part) : NULL;
             static unsigned record = 0x40000000u;    /* a record of its own each time (one blow a record) */
             if (bp && bp->alive)
-                boss_hit(v->boss, mo->slot, bp->pos, 1, seconds > 0 ? seconds : 1, record++);
+                { boss_hit(v->boss, mo->slot, bp->pos, 1, seconds > 0 ? seconds : 1, record++); if (scene_construction_stop((Viewer *)v)) return NULL; }
             else
                 printf("no boss to hit\n");
             continue;
@@ -7256,6 +7654,7 @@ static const char *play_script(Viewer *v, const char *script, float aspect)
                     sb->hitter = 0;
                 int hit = building_hit(&sb->b, at, amount);   /* (a monster attack's radius) */
                 building_script(v, sb, amount);
+    if (scene_construction_stop((Viewer *)v)) return NULL;
                 if (getenv("RAMPAGE_TRACE"))
                     printf("  hitcell %d %d %d at %.1f %.1f %.1f: %s (%d storeys, %.1f .. %.1f)\n", bi, o, col, at[0],
                            at[1], at[2], hit ? "hit" : "no damage", sb->b.n, sb->b.min[2], sb->b.max[2]);
@@ -7313,16 +7712,24 @@ static const char *play_script(Viewer *v, const char *script, float aspect)
                 memcpy(mo->pad.pressed, pressed, sizeof pressed);
                 memcpy(mo->pad.held, held, sizeof held);
                 play_step(v, 1.0f / 60, aspect);
+    if (scene_construction_stop((Viewer *)v)) return NULL;
+                if (scene_construction_stop(v) || v->exit_game)
+                    return *p ? p : NULL;
                 if (pose_monsters(v, 0)) {          /* posed each frame, as the main loop does */
                     scene_update(&v->scene, 0);
+    if (scene_construction_stop((Viewer *)v)) return NULL;
+                    if (scene_construction_stop(v))
+                        return *p ? p : NULL;
                     hit_spheres_all(v);
+    if (scene_construction_stop((Viewer *)v)) return NULL;
                 }
                 if (WORDS[i].button >= 0)
                     held[WORDS[i].button] = 1;
                 if (also >= 0)
                     held[also] = 1;
                 memset(pressed, 0, sizeof pressed);
-                game_next_block(v);                  /* the game moved on, as the main loop does */
+                game_next_block(v);
+    if (scene_construction_stop((Viewer *)v)) return NULL;                  /* the game moved on, as the main loop does */
             }
         }
     }
@@ -7690,6 +8097,16 @@ static void shell_enter(Viewer *v, const ShellStart *st)
     gui3d_free(v);
     world_release(v);                              /* never retain an entire city underneath the menus */
     city_activate(NULL);
+#else
+    /* A failed ordinary-memory world cannot remain beneath the shell: callbacks
+     * would still borrow its poisoned books on the next Start. Healthy retention
+     * is unchanged. Release only at this established exit ownership boundary. */
+    if (v->scene.construction_failed || city_load_failed(v->city)) {
+        if (v->rnd) rnd_scene(v->rnd, NULL);
+        gui3d_free(v);
+        world_release(v);
+        city_activate(NULL);
+    }
 #endif
     v->shell = shell_open(&v->vol, st, &sp);
     v->card_poll = 0;
@@ -7860,6 +8277,7 @@ static int card_job(Viewer *v, Shell *sh, const ShellEvent *e)
  * (opened over the screens once, kept for the game), which writes only with autosave on [R 0x345950] */
 static void save_profile(Viewer *v)
 {
+    if (scene_construction_stop((Viewer *)v)) return;
     if (!profile_needs_save(&v->prof) || !v->prof.allow_save || !v->prof_write)
         return;
     ShellProfile sp;
@@ -8029,6 +8447,7 @@ static void setup_players(Viewer *v, int n, int bots, const int *monster)
  * traced code writes +0x1C; a Park-Miller state of 0 would stay 0): 1 here [G] */
 static void shell_start_game(Viewer *v)
 {
+    if (scene_construction_stop((Viewer *)v)) return;
     const ShellGame *g = shell_game(v->shell);
     int city = v->city_index;
     for (int i = 0; i < ncities; i++)
@@ -8087,10 +8506,12 @@ static void shell_start_game(Viewer *v)
      * list keeps the repeated first block once, so taken as their index it began one block on, the block after the
      * one to play again skipped */
     if (open_city(v, city, 0, v->last_game.start_block > 0 ? v->last_game.start_block : 0) != 0) {
+    if (scene_construction_stop((Viewer *)v)) return;
         v->play = 0;
         v->exit_game = 1;                          /* retry from the menus instead of entering an empty world */
         return;
-    }                                               /* (g is gone) */
+    }
+    if (scene_construction_stop((Viewer *)v)) return;                                               /* (g is gone) */
     const ShellGame *lg = &v->last_game;
     ap_event(v->ap, "what=game_start city=%s type=%d players=%d bots=%d start_block=%d night=%d monsters=%s,%s,%s,%s",
              CITIES[city], lg->play_type, lg->num_players, lg->num_bots, lg->start_block, lg->night, lg->monster_name[0],
@@ -8502,6 +8923,7 @@ static void autopilot_shell(Viewer *v, float dt)
  * screen answered, the shell's screen left with Back; the popup over the game's screens answered */
 static int autoplay_watch(Viewer *v)
 {
+    if (scene_construction_stop((Viewer *)v)) return 0;
     static ApFrame f;
     memset(&f, 0, sizeof f);
     f.t = v->ap_t;
@@ -8571,7 +8993,7 @@ static int autoplay_watch(Viewer *v)
                 building_destroy(&v->scene.buildings[i].b);
         const BossPart *bp = v->boss ? boss_part(v->boss, boss_main(v->boss)) : NULL;
         if (bp && bp->alive)
-            boss_hit(v->boss, 0, bp->pos, 1, 1e6f, 0x7F000000u);
+            { boss_hit(v->boss, 0, bp->pos, 1, 1e6f, 0x7F000000u); if (scene_construction_stop((Viewer *)v)) return 0; }
     }
     if ((r & AP_FORCE_RESULT) && v->game) {
         if (v->hud)
@@ -8872,7 +9294,8 @@ static int viewer_main(int argc, char **argv)
             ncities = NCITIES + 1;
         uint32_t size = 0;
         uint8_t *sd = n ? vol_read(&v.vol, "ShellData.bdg", &size) : NULL;
-        if (sd && bdp_load(&v.wii_shelldata, sd, size) == 0 && book_open(&v.wii_shellbook, &v.wii_shelldata) == 0) {
+        int have_sd = sd && bdp_load(&v.wii_shelldata, sd, size) == 0;
+        if (have_sd && book_open(&v.wii_shellbook, &v.wii_shelldata) == 0) {
             reveal_roster_load(&v.wii_roster, book_group(&v.wii_shellbook, "MonsterData"));
             Group cd = book_group(&v.wii_shellbook, "CityData");
             for (int i = 0; i < PROFILE_CITIES && cd.at; i++) {   /* City0 .. : the campaign's order */
@@ -8883,7 +9306,9 @@ static int viewer_main(int argc, char **argv)
                     break;
                 v.wii_cities[v.nwii_cities++] = c;
             }
-        } else
+        } else if (have_sd)
+            bdp_free(&v.wii_shelldata);
+        else
             free(sd);
         if (v.wii_roster.n)
             printf("wii data: the roster of %d monsters, %d cities\n", v.wii_roster.n, v.nwii_cities);
@@ -8928,7 +9353,15 @@ static int viewer_main(int argc, char **argv)
         uint8_t *data = vol_read(&v.vol, "fx.bdp", &size);
         uint32_t gsize = 0, csize = 0;                /* the HUD's: WorldGui.bdp and CommonGUI.bdp */
         uint8_t *gui = vol_read(&v.vol, "WorldGui.bdp", &gsize), *common = vol_read(&v.vol, "CommonGUI.bdp", &csize);
-        v.have_gui = gui && common && bdp_load(&v.gui_world, gui, gsize) == 0 && bdp_load(&v.gui_common, common, csize) == 0;
+        int have_world = gui && bdp_load(&v.gui_world, gui, gsize) == 0;
+        int have_common = common && bdp_load(&v.gui_common, common, csize) == 0;
+        v.have_gui = have_world && have_common;
+        if (!have_world) free(gui);
+        if (!have_common) free(common);
+        if (!v.have_gui) {
+            bdp_free(&v.gui_world);
+            bdp_free(&v.gui_common);
+        }
         v.gui_world.scope = v.gui_common.scope = "GUI";   /* texture packs: the dump folders (texpack.c) */
         static const char *const wii_names[3] = { "fx.bdg", "WorldGui.bdg", "CommonGUI.bdg" };
         Bundle *wii_b[3] = { &v.wii_fx, &v.wii_world, &v.wii_common };
@@ -9071,6 +9504,7 @@ static int viewer_main(int argc, char **argv)
         setup_players(&v, players, bots, pick);
     }
     v.play = have_monster(&v) && clip < 0;
+    int exit_status = 0;
     if (v.shell_mode) {                              /* the front end first: the city once a game starts */
         shell_enter(&v, NULL);
         if (!v.shell) {
@@ -9087,8 +9521,11 @@ static int viewer_main(int argc, char **argv)
             shell_start_game(&v);
         }
     } else if (open_city(&v, city, block, -1) != 0) {
-        plat_message("The city's bundles are not in RAMPAGE.VOL.", 1);
-        return 1;
+        if (!v.exit_game) {
+            plat_message("The city's bundles are not in RAMPAGE.VOL.", 1);
+            return 1;
+        }                                           /* a failed partial world takes the normal exit path */
+        exit_status = 1;                            /* retain the direct startup error result after cleanup */
     } else if (v.ap) {                               /* --autoplay straight into a city: the shell takes over after it,
                                                       * with this game as the one it chose */
         ShellGame *g = &v.last_game;
@@ -9102,16 +9539,17 @@ static int viewer_main(int argc, char **argv)
         }
         g->city_index = campaign_index(&v, CITIES[city]);
         snprintf(g->city, sizeof g->city, "%s", CITIES[city]);
-        g->start_block = city_block_index(v.city, v.blocks[v.block]);   /* (a BlockList index, as the profile's) */
+        g->start_block = city_block_index(v.city, v.blocks[v.block]);
+        (void)scene_construction_stop(&v);   /* (a BlockList index, as the profile's) */
         g->night = night;
         v.kept.idle = SHELL_IDLE_SECONDS;            /* (no shell before it: not the attract mode after it) */
     }
-    for (uint32_t i = 0; getenv("RAMPAGE_TRACE") && i < v.scene.nbuildings; i++) {
+    for (uint32_t i = 0; !v.exit_game && getenv("RAMPAGE_TRACE") && i < v.scene.nbuildings; i++) {
         const Building *b = &v.scene.buildings[i].b;
         printf("building %u: x %.0f .. %.0f, y %.0f .. %.0f, top %.1f, row %d, %d wide\n", i, b->min[0], b->max[0],
                b->min[1], b->max[1], b->max[2], b->row, b->width);
     }
-    for (uint32_t i = 0; getenv("RAMPAGE_TRACE") && i < v.scene.nobstacles; i++) {
+    for (uint32_t i = 0; !v.exit_game && getenv("RAMPAGE_TRACE") && i < v.scene.nobstacles; i++) {
         const float *o = v.scene.obstacles[i];
         printf("obstacle %u: %.1f %.1f %.1f .. %.1f %.1f %.1f\n", i, o[0], o[1], o[2], o[3], o[4], o[5]);
     }
@@ -9135,7 +9573,7 @@ static int viewer_main(int argc, char **argv)
         const char *c = getenv("RAMPAGE_CAPTURE");
         double from, secs;
         int at = 0;
-        if (c && v.ap && sscanf(c, "%lf %lf %n", &from, &secs, &at) == 2 && at) {
+        if (!v.exit_game && c && v.ap && sscanf(c, "%lf %lf %n", &from, &secs, &at) == 2 && at) {
             char path[1024];
             cap_from = lround(from * 60);
             cap_to = cap_from + 2 * lround(secs * 30);
@@ -9145,13 +9583,18 @@ static int viewer_main(int argc, char **argv)
             cap_a = fopen(path, "wb");
             if (!cap_v || !cap_a) {
                 printf("capture: cannot write into %s\n", c + at);
-                return 1;
+                if (cap_v) fclose(cap_v);
+                if (cap_a) fclose(cap_a);
+                exit_status = 1;
+                goto shutdown;                    /* the world and its monster graphs may already be live */
             }
             sound_volume(0.5f, 0.5f);                /* 6 dB of room: the mix at the game's volumes clips */
             printf("capture: %dx%d, steps %ld .. %ld\n", w.width, w.height, cap_from, cap_to);
         }
     }
     while (!w.quit) {
+        if (!v.shell && (scene_construction_stop(&v) || v.exit_game))
+            goto leave_world;                       /* no capture/audio or game callbacks before failed-world teardown */
 #ifdef RAMPAGE_XBOX
         plat_xbox_memory_tick();
 #endif
@@ -9306,6 +9749,7 @@ static int viewer_main(int argc, char **argv)
                     break;
         if (v.attract && attract_buttons(&v, &w))     /* the demo: a button ends it */
             attract_press(&v);
+leave_world:
         if (v.exit_game) {                           /* back to the shell (--shell), or the viewer ends */
             v.exit_game = 0;
             /* [R 0x2B7CB0, RWorldPackage's vtable 0x44A820 +0x18] the world package's end: every 3D sound killed
@@ -9317,11 +9761,14 @@ static int viewer_main(int argc, char **argv)
                 ap_game_left(v.ap, v.attract);
                 st.from = SHELL_FROM_GAME;           /* and the flags the world left in gCommon [R] (no game: the
                                                       * main menu) */
-                st.quit = v.game ? game_quitting(v.game) : 1;
-                st.choose_monster = game_choose_monster(v.game);
-                st.city_destroyed = game_city_destroyed(v.game);
-                st.show_victory = game_world_done(v.game);
-                st.king_of_world = game_king(v.game, 2);
+                /* A failed operation's manager-local progress is discarded, not
+                 * exported as completed progress or victory to the shell. */
+                int failed_world = v.scene.construction_failed || city_load_failed(v.city);
+                st.quit = failed_world || !v.game ? 1 : game_quitting(v.game);
+                st.choose_monster = failed_world ? 0 : game_choose_monster(v.game);
+                st.city_destroyed = failed_world ? 0 : game_city_destroyed(v.game);
+                st.show_victory = failed_world ? 0 : game_world_done(v.game);
+                st.king_of_world = failed_world ? -1 : game_king(v.game, 2);
                 st.game = v.last_game;
                 if (v.attract)
                     attract_end(&v, &st);
@@ -9338,11 +9785,24 @@ static int viewer_main(int argc, char **argv)
                 continue;
             }
             w.quit = 1;
+#ifdef RAMPAGE_LOW_MEMORY
+            if (v.rnd)
+                rnd_scene(v.rnd, NULL);             /* drop keys before their world bundles */
+            popup_free(&v);
+            gui3d_free(&v);
+            world_release(&v);
+            city_activate(NULL);
+#endif
+            continue;
         }
         game_next_block(&v);                         /* the game moved on to the next block */
+        if (v.exit_game) continue;
         if (w.pressed[VK_NEXT] && v.nblocks) { v.block = (v.block + 1) % v.nblocks; build(&v); }
+        if (v.exit_game) continue;
         if (w.pressed[VK_PRIOR] && v.nblocks) { v.block = (v.block + v.nblocks - 1) % v.nblocks; build(&v); }
+        if (v.exit_game) continue;
         if (w.pressed['N']) { v.night = !v.night; build(&v); }
+        if (v.exit_game) continue;
         if (w.pressed['F']) v.fog = !v.fog;
         if (w.pressed['H']) v.show_hits = !v.show_hits;
         if (w.pressed['M']) {                        /* player 1's monster: the next one */
@@ -9352,6 +9812,7 @@ static int viewer_main(int argc, char **argv)
                     v.mon[k].monster = v.mon[0].monster;
             v.clip = -1;
             build(&v);
+            if (v.exit_game) continue;
         }
         if (w.pressed['G'] && have_monster(&v)) {
             v.play = !v.play;
@@ -9361,14 +9822,17 @@ static int viewer_main(int argc, char **argv)
             for (int k = 0; v.play && k < v.nmon; k++)
                 if (v.mon[k].have_graph)
                     play_state(&v.mon[k]);
+            if (scene_construction_stop(&v)) continue;
         }
         if (have_monster(&v) && !v.play && (w.pressed['K'] || w.pressed['L'])) {
             v.clip = w.pressed['L'] ? v.clip + 1 : (v.clip > 0 ? v.clip - 1 : 0);
             build(&v);
+            if (v.exit_game) continue;
         }
-        for (int i = 0; i < ncities; i++)
+        for (int i = 0; i < ncities && !v.exit_game; i++)
             if (w.pressed['1' + i] && i != v.city_index)
                 open_city(&v, i, 0, -1);
+        if (v.exit_game) continue;
         if (w.wheel) speed *= powf(1.25f, (float)w.wheel);
         cam.yaw -= w.mouse_dx * 0.005f;
         cam.pitch -= w.mouse_dy * 0.005f;
@@ -9380,6 +9844,8 @@ static int viewer_main(int argc, char **argv)
             if (shot && !settled) {                     /* a shot: the camera settles, then the script */
                 if (!v.ap)                           /* (--autoplay: its words first, then it plays on) */
                     play_script(&v, "wait 2", aspect);
+                if (scene_construction_stop(&v) || v.exit_game)
+                    continue;
                 if (script)
                     script = play_script(&v, script, aspect);
             }
@@ -9397,6 +9863,8 @@ static int viewer_main(int argc, char **argv)
                         memset(v.mon[k].pad.pressed, 0, sizeof v.mon[k].pad.pressed);
                 }
             play_step(&v, shot && !v.ap ? 0 : (dt > 0.1f ? 0.1f : dt), aspect);
+            if (scene_construction_stop(&v) || v.exit_game)
+                continue;
             pose_monsters(&v, shot && !v.ap ? shot_time : world_t);   /* the clips at the states' times (clip_at),
                                                       * against the clock the scene poses by (scene_update's t) */
             memcpy(cam.pos, v.view.pos, sizeof cam.pos);
@@ -9407,12 +9875,15 @@ static int viewer_main(int argc, char **argv)
         } else {
             if (v.have_scene) {
                 world_build(&v);                     /* the traffic's and the parade's world */
+                if (scene_construction_stop(&v)) continue;
                 scene_buildings_update(&v.scene, dt > 0.1f ? 0.1f : dt);
+                if (scene_construction_stop(&v)) continue;
                 v.scene.cloth_dt += dt > 0.1f ? 0.1f : dt;   /* the flags fly in the free camera too */
                 if (v.veh)                           /* and the traffic drives on, with no monster about */
                     vehicle_update(v.veh, dt > 0.1f ? 0.1f : dt, NULL, 0, NULL, 0);
                 if (v.parade)                        /* and the balloons drift, the bikers ride */
                     parade_update(v.parade, dt > 0.1f ? 0.1f : dt, NULL, 0, cam.pos[0]);
+                if (scene_construction_stop(&v)) continue;
             }
             if (cam.use_rows) {                        /* back to the free camera where the game camera was */
                 cam.use_rows = 0;
@@ -9435,11 +9906,14 @@ static int viewer_main(int argc, char **argv)
         sound_update(shot && !cap_v ? 0 : (dt > 0.1f ? 0.1f : dt));
         if (v.have_scene) {
             scene_update(&v.scene, t);
+            if (scene_construction_stop(&v))
+                continue;
             if (playing)
                 hit_spheres_all(&v);
             else
                 v.scene.nspheres = 0;
         }
+        if (scene_construction_stop(&v)) continue;
         if (v.ap && !v.shell && !((apf = autoplay_watch(&v)) & (AP_SHOT | AP_STOP)) && !cap_draw)
             continue;                                /* --autoplay: nothing to draw */
         {                                            /* this frame's particles */
@@ -9447,6 +9921,7 @@ static int viewer_main(int argc, char **argv)
             v.scene.fx = quads;
             v.scene.nfx = v.fxw ? fx_quads(v.fxw, quads, 8192) : 0;
             shadow_frame(&v, cap_v ? 2.0f / 60 : shot ? 1.0f : (dt > 0.1f ? 0.1f : dt));
+            if (scene_construction_stop(&v)) continue;
             if (shot && getenv("RAMPAGE_TRACE")) {
                 int np[3] = { 0, 0, 0 };
                 for (int k = 0; k < v.shl.nb; k++)
@@ -9544,20 +10019,28 @@ static int viewer_main(int argc, char **argv)
             frames = 0;
         }
     }
+shutdown:
     popup_free(&v);
     rnd_free(v.rnd);
-    for (int k = 0; k < MONSTERS; k++)
+    for (int k = 0; k < MONSTERS; k++) {
         if (v.mon[k].have_graph) {
             moves_stop(&v.mon[k].run);
             moves_free(&v.mon[k].graph);
+            v.mon[k].have_graph = 0;
         }
+        if (v.mon[k].have_ag) {                     /* independent: a move graph replacement can be absent */
+            dir_graph_free(&v.mon[k].ag);
+            v.mon[k].have_ag = 0;
+        }
+    }
     if (v.have_scene)
         scene_free(&v.scene);
     city_close(v.city);
     sound_end();
     sound_free();
     win_close(&w);
-    return v.ap ? ap_close(v.ap, NULL) : 0;          /* --autoplay: 3 when it saw problems */
+    int ap_status = v.ap ? ap_close(v.ap, NULL) : 0; /* --autoplay: 3 when it saw problems */
+    return exit_status ? exit_status : ap_status;
 }
 
 int main(int argc, char **argv)                      /* (Android: SDL_main, android/app/CMakeLists.txt) */

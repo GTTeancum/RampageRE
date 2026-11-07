@@ -7,6 +7,42 @@
 #include "parade.h"
 #include "wrand.h"
 
+/* Callback arguments are evaluated before this boundary, including inherited reads. */
+static int host_stopped(const ParadeHost *h)
+{
+    return h && h->failed && h->failed(h->ctx);
+}
+static Group host_find(const ParadeHost *h, const char *book, const char *name)
+{
+    if (host_stopped(h) || !h->find) return (Group){ 0 };
+    Group result = h->find(h->ctx, book, name);
+    return host_stopped(h) ? (Group){ 0 } : result;
+}
+static int host_shape_box(const ParadeHost *h, const char *shape, float min[3], float max[3])
+{
+    if (host_stopped(h) || !h->shape_box) return 0;
+    int result = h->shape_box(h->ctx, shape, min, max);
+    return host_stopped(h) ? 0 : result;
+}
+static int host_shape_sphere(const ParadeHost *h, const char *shape, float centre[3], float *radius)
+{
+    if (host_stopped(h) || !h->shape_sphere) return 0;
+    int result = h->shape_sphere(h->ctx, shape, centre, radius);
+    return host_stopped(h) ? 0 : result;
+}
+static int host_shape_node(const ParadeHost *h, const char *shape, int node, float out[3])
+{
+    if (host_stopped(h) || !h->shape_node) return 0;
+    int result = h->shape_node(h->ctx, shape, node, out);
+    return host_stopped(h) ? 0 : result;
+}
+static float host_clip_seconds(const ParadeHost *h, const char *anim, const char *shape)
+{
+    if (host_stopped(h) || !h->clip_seconds) return 0;
+    float result = h->clip_seconds(h->ctx, anim, shape);
+    return host_stopped(h) ? 0 : result;
+}
+
 #define PI 3.14159265f
 #define TIMESTEP (1.0f / 30.0f)                      /* gWorld.getTimeStep(): its step, 1/30 [R 0x2B7800] */
 #define MAX_OBJS 256
@@ -63,13 +99,13 @@ static int same_prefix(const char *s, const char *prefix)   /* any case, as the 
 static Group template_of(Parade *p, const char *name)
 {
     Group none = { NULL, 0 };
-    return name && p->host.find ? p->host.find(p->host.ctx, "Objects1_Props", name) : none;
+    return name && p->host.find ? host_find(&p->host, "Objects1_Props", name) : none;
 }
 
 static ParadeEvent *emit(Parade *p, int type, int obj, const char *name, const float pos[3])
 {
     static ParadeEvent spare;
-    if (p->nev >= MAX_EVENTS) {
+    if (host_stopped(&p->host) || p->nev >= MAX_EVENTS) {
         memset(&spare, 0, sizeof spare);
         return &spare;
     }
@@ -249,7 +285,7 @@ static void start_anim(Parade *p, ParadeObj *o, const char *name, int random_off
     o->anim_loop = look.at && group_num(look, "AnimRepeat", 0) != 0;
     float len = look.at ? fabsf(group_num(look, "Duration", 0)) : 0;
     if (len <= 0 && p->host.clip_seconds)
-        len = p->host.clip_seconds(p->host.ctx, o->clip, shape);
+        len = host_clip_seconds(&p->host, o->clip, shape);
     if (len <= 0)
         len = known_length(o->clip, shape);
     o->anim_len = len;
@@ -348,7 +384,7 @@ static const float *book_box(Group g, float b[6])
 static void obj_shape_read(const Parade *p, const ParadeObj *o, CollideShape *s)
 {
     float tb[6], mb[6], c[3] = { 0, 0, 0 }, r = 1;
-    int have = o->shape && p->host.shape_box && p->host.shape_box(p->host.ctx, o->shape, mb, mb + 3);
+    int have = o->shape && p->host.shape_box && host_shape_box(&p->host, o->shape, mb, mb + 3);
     if (have) {
         float h[3];
         for (int k = 0; k < 3; k++) {
@@ -359,7 +395,7 @@ static void obj_shape_read(const Parade *p, const ParadeObj *o, CollideShape *s)
     }
     /* [R 0x28FD70 -> 0x184CB0] the sphere the model keeps, the union of its parts' spheres (0x185AA0) */
     if (have && p->host.shape_sphere)
-        p->host.shape_sphere(p->host.ctx, o->shape, c, &r);
+        host_shape_sphere(&p->host, o->shape, c, &r);
     collide_shape_pick(s, have ? c : NULL, r, o->tmpl.at ? book_box(o->tmpl, tb) : NULL, tnum(o, "CollisionRadius", -1),
                        tnum(o, "AutoCollisionBox", 0) != 0, NULL, -1, 0, have ? mb : NULL);
 }
@@ -837,7 +873,7 @@ static void cart_construct(Parade *p, int self)
     base->partner = self;
     o->partner = b;
     float node[3];
-    int ok = base->shape && p->host.shape_node && p->host.shape_node(p->host.ctx, base->shape, 1, node);
+    int ok = base->shape && p->host.shape_node && host_shape_node(&p->host, base->shape, 1, node);
     if (!ok)
         ok = known_node(base->shape, node);
     if (!ok) {
@@ -993,6 +1029,7 @@ static void obj_step(Parade *p, ParadeObj *o, float dt)
 
 void parade_update(Parade *p, float dt, const ArmyMonster *m, int nm, float camera_x)
 {
+    if (p && host_stopped(&p->host)) return;
     p->m = m;
     p->nm = m ? nm : 0;
     p->camera_x = camera_x;
@@ -1022,6 +1059,7 @@ void parade_update(Parade *p, float dt, const ArmyMonster *m, int nm, float came
 
 int parade_spawn(Parade *p, const char *tmpl_name, const float pos[3], float facing)
 {
+    if (p && host_stopped(&p->host)) return -1;
     Group t = template_of(p, tmpl_name);
     int kind = kind_of_script(t.at ? group_str(t, "Script|ScriptName") : NULL);
     if (kind < 0)
@@ -1042,6 +1080,7 @@ int parade_spawn(Parade *p, const char *tmpl_name, const float pos[3], float fac
 
 int parade_load_block(Parade *p, Group block)
 {
+    if (p && host_stopped(&p->host)) return 0;
     parade_clear(p);
     p->block = block;
     if (!block.at)
@@ -1094,6 +1133,7 @@ int parade_load_block(Parade *p, Group block)
 
 int parade_hit(Parade *p, int monster_i, const float c[3], float radius, unsigned record)
 {
+    if (p && host_stopped(&p->host)) return 0;
     if (!monster(p, monster_i))
         return 0;
     int n = 0;
@@ -1154,6 +1194,7 @@ int parade_nearest_pickup(const Parade *p, const float hand[3], const float root
 /* [R] the hold (0x2DA310): BeingHeld, neither Pickupable nor PushOutMonsters, its mover replaced, onPickup */
 void parade_grab(Parade *p, int obj, int monster_i, float blend)
 {
+    if (p && host_stopped(&p->host)) return;
     (void)monster_i;
     if (!alive(p, obj) || p->o[obj].phase == PAP_HELD)
         return;
@@ -1181,6 +1222,7 @@ void parade_grab(Parade *p, int obj, int monster_i, float blend)
  * a x b of row matrices, the rest in the place's frame). Made relative at the first hold */
 void parade_hold(Parade *p, int obj, const float hand[16], int mirrored, float dt)
 {
+    if (p && host_stopped(&p->host)) return;
     if (!alive(p, obj) || p->o[obj].phase != PAP_HELD)
         return;
     ParadeObj *o = &p->o[obj];
@@ -1261,6 +1303,7 @@ void parade_hold(Parade *p, int obj, const float hand[16], int mirrored, float d
  * object in the same call, smashObject's velocity replacing it [R] */
 void parade_throw(Parade *p, int obj, int monster_i, int eat, float monster_heading)
 {
+    if (p && host_stopped(&p->host)) return;
     if (!alive(p, obj) || p->o[obj].phase != PAP_HELD)
         return;
     ParadeObj *o = &p->o[obj];
@@ -1322,6 +1365,7 @@ void parade_set_world_state(Parade *p, int state) { if (p) p->not_in_play = stat
 
 void parade_collide_add(Parade *p, CollideWorld *w)
 {
+    if (p && host_stopped(&p->host)) return;
     for (int i = 0; i < p->n; i++) {
         ParadeObj *o = &p->o[i];
         o->cobj = -1;
@@ -1354,6 +1398,7 @@ const ParadeObj *parade_obj(const Parade *p, int i) { return i >= 0 && i < p->n 
 
 int parade_events(Parade *p, ParadeEvent *out, int max)
 {
+    if (p && host_stopped(&p->host)) return 0;
     int n = p->nev < max ? p->nev : max;
     memcpy(out, p->ev, sizeof *out * (size_t)n);
     memmove(p->ev, p->ev + n, sizeof *p->ev * (size_t)(p->nev - n));

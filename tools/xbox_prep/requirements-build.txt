@@ -1,0 +1,3 @@
+# End users need no installed Python, Rust, or third-party software.
+# Engine and GUI runtime are Python's standard library.
+pyinstaller==6.16.0

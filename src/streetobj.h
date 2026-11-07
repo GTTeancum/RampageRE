@@ -61,6 +61,8 @@ typedef struct {
     int (*shape_sphere)(void *ctx, const char *shape, float centre[3], float *radius);   /* the sphere the model keeps (0x184CB0); nonzero = found */
     Group (*find)(void *ctx, const char *name);      /* optional: a template by name (gWorld.createScriptObject) */
     void *ctx;
+    /* Sticky owner failure: once set, callbacks and event publication stop until teardown. */
+    int (*failed)(void *ctx);
 } StreetHost;
 
 /* a monster as the objects see it (the TakeDamage's `who`, getNearestMonster) */

@@ -9,6 +9,30 @@
 #include "streetobj.h"
 #include "wrand.h"
 
+/* Callback arguments are evaluated before this boundary, including inherited reads. */
+static int host_stopped(const StreetHost *h)
+{
+    return h && h->failed && h->failed(h->ctx);
+}
+static int host_shape_box(const StreetHost *h, const char *shape, float min[3], float max[3])
+{
+    if (host_stopped(h) || !h->shape_box) return 0;
+    int result = h->shape_box(h->ctx, shape, min, max);
+    return host_stopped(h) ? 0 : result;
+}
+static int host_shape_sphere(const StreetHost *h, const char *shape, float centre[3], float *radius)
+{
+    if (host_stopped(h) || !h->shape_sphere) return 0;
+    int result = h->shape_sphere(h->ctx, shape, centre, radius);
+    return host_stopped(h) ? 0 : result;
+}
+static Group host_find(const StreetHost *h, const char *name)
+{
+    if (host_stopped(h) || !h->find) return (Group){ 0 };
+    Group result = h->find(h->ctx, name);
+    return host_stopped(h) ? (Group){ 0 } : result;
+}
+
 #define PI 3.14159265f
 #define TIMESTEP (1.0f / 30.0f)                      /* gWorld.getTimeStep(): its step, 1/30 [R 0x2B7800] */
 #define MAX_OBJS 256
@@ -271,7 +295,7 @@ static int idx(const StreetObjs *s, const StreetObj *o) { return o ? (int)(o - s
 static StreetEvent *emit(StreetObjs *s, int type, const StreetObj *o, const char *name, const float pos[3])
 {
     static StreetEvent spare;
-    StreetEvent *e = s->nev < MAX_EVENTS ? &s->ev[s->nev++] : &spare;
+    StreetEvent *e = !host_stopped(&s->host) && s->nev < MAX_EVENTS ? &s->ev[s->nev++] : &spare;
     memset(e, 0, sizeof *e);
     e->type = type;
     e->obj = idx(s, o);
@@ -915,7 +939,7 @@ static void billboard_construct(StreetObj *o, const char *type)
 static float shape_top(StreetObjs *s, const StreetObj *o)
 {
     float mn[3], mx[3];
-    if (o->shape && s->host.shape_box && s->host.shape_box(s->host.ctx, o->shape, mn, mx))
+    if (o->shape && s->host.shape_box && host_shape_box(&s->host, o->shape, mn, mx))
         return mx[2];
     return o->box_max[2];
 }
@@ -1445,7 +1469,7 @@ static void fountain_break(StreetObjs *s, StreetObj *o, int mi, const float dir[
         return;
     o->state = 1;
     const char *g = ostr(o, "Geyser");
-    Group gt = g && s->host.find ? s->host.find(s->host.ctx, g) : (Group){ 0 };
+    Group gt = g && s->host.find ? host_find(&s->host, g) : (Group){ 0 };
     if (gt.at) {
         float w[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, o->world[12], o->world[13], o->world[14], 1 };
         int k = add_kind(s, streetobj_kind_of(gt), gt, (Group){ 0 }, w, -1, 0);
@@ -1587,7 +1611,7 @@ static void tower_pulse(StreetObjs *s, StreetObj *o)
             p[1] += onum(o, "SudsYOffset", 0);
             o->hit_fx = effect(s, o, fx, p, 0, NULL, NULL, 0, 0);
             const char *slip = ostr(o, "SlipObject");
-            Group gt = slip && s->host.find ? s->host.find(s->host.ctx, slip) : (Group){ 0 };
+            Group gt = slip && s->host.find ? host_find(&s->host, slip) : (Group){ 0 };
             if (gt.at) {
                 float w[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, p[0], -2, 0, 1 };
                 int k = add_kind(s, streetobj_kind_of(gt), gt, (Group){ 0 }, w, -1, 0);
@@ -2056,7 +2080,7 @@ static const float *book_box(Group g, float b[6])
 static void object_box(StreetObjs *s, StreetObj *o)
 {
     float tb[6], ib[6], mb[6], c[3] = { 0, 0, 0 }, r = 1;
-    int have = o->shape && s->host.shape_box && s->host.shape_box(s->host.ctx, o->shape, mb, mb + 3);
+    int have = o->shape && s->host.shape_box && host_shape_box(&s->host, o->shape, mb, mb + 3);
     if (have) {
         float h[3];
         for (int k = 0; k < 3; k++) {
@@ -2067,7 +2091,7 @@ static void object_box(StreetObjs *s, StreetObj *o)
     }
     /* [R 0x28FD70 -> 0x184CB0] the sphere the model keeps, the union of its parts' spheres (0x185AA0) */
     if (have && s->host.shape_sphere)
-        s->host.shape_sphere(s->host.ctx, o->shape, c, &r);
+        host_shape_sphere(&s->host, o->shape, c, &r);
     Group t = o->tmpl, in = o->inst;
     collide_shape_pick(&o->cshape, have ? c : NULL, r, t.at ? book_box(t, tb) : NULL,
                        t.at ? group_num(t, "CollisionRadius", -1) : -1, t.at && group_num(t, "AutoCollisionBox", 0) != 0,
@@ -2141,6 +2165,7 @@ static int add_kind(StreetObjs *s, int kind, Group tmpl, Group inst, const float
 
 int streetobj_add(StreetObjs *s, Group tmpl, Group inst, const float world[16], int building, int attack)
 {
+    if (s && host_stopped(&s->host)) return -1;
     return add_kind(s, tmpl.at ? streetobj_kind_of(tmpl) : -1, tmpl, inst, world, building, attack);
 }
 
@@ -2155,6 +2180,7 @@ void streetobj_nodes(StreetObjs *s, int i, const float node[][3], int n)
 
 int streetobj_add_attachment(StreetObjs *s, int parent, Group tmpl, const float world[16])
 {
+    if (s && host_stopped(&s->host)) return -1;
     if (parent < 0 || parent >= s->n || s->o[parent].nattach >= 5)
         return -1;
     int kind = same_text(gstr(tmpl, "ScriptName"), "Billboard_2Part.bsf") ? SK_2PART :
@@ -2169,6 +2195,7 @@ int streetobj_add_attachment(StreetObjs *s, int parent, Group tmpl, const float 
 
 void streetobj_start(StreetObjs *s, const StreetBuilding *b, int nb)
 {
+    if (s && host_stopped(&s->host)) return;
     s->nb = b ? (nb < MAX_BUILDINGS ? nb : MAX_BUILDINGS) : 0;
     if (s->nb)
         memcpy(s->b, b, sizeof *s->b * (size_t)s->nb);
@@ -2350,6 +2377,7 @@ static void step(StreetObjs *s)
 
 void streetobj_update(StreetObjs *s, float dt, const StreetMonster *m, int nm, const StreetBuilding *b, int nb)
 {
+    if (s && host_stopped(&s->host)) return;
     s->m = m;
     s->nm = m ? nm : 0;
     if (b) {
@@ -2445,6 +2473,7 @@ static void take_damage(StreetObjs *s, StreetObj *o, int mi, const StreetMonster
 int streetobj_hit(StreetObjs *s, int monster, const StreetMonster *who, const float centre[3], float radius,
                   float amount, unsigned record)
 {
+    if (s && host_stopped(&s->host)) return 0;
     s->amount = amount;                              /* (Crane.bsf's TakeDamage reads it) */
     int n = 0;
     for (int i = 0; i < s->n; i++) {
@@ -2464,6 +2493,7 @@ int streetobj_hit(StreetObjs *s, int monster, const StreetMonster *who, const fl
 
 void streetobj_shot(StreetObjs *s, int i, const float dir[3])
 {
+    if (s && host_stopped(&s->host)) return;
     if (i < 0 || i >= s->n || !s->o[i].alive || s->o[i].kind != SK_FOUNTAIN || s->o[i].frame == s->frame)
         return;
     memcpy(s->dir, dir, sizeof s->dir);
@@ -2472,6 +2502,7 @@ void streetobj_shot(StreetObjs *s, int i, const float dir[3])
 
 int streetobj_touch(StreetObjs *s, int monster, const StreetMonster *who, const float centre[3], float radius)
 {
+    if (s && host_stopped(&s->host)) return 0;
     int n = 0;
     for (int i = 0; i < s->n; i++) {
         StreetObj *o = &s->o[i];
@@ -2488,6 +2519,7 @@ int streetobj_touch(StreetObjs *s, int monster, const StreetMonster *who, const 
 
 int streetobj_take_impact(StreetObjs *s, int i)
 {
+    if (s && host_stopped(&s->host)) return 0;
     if (i < 0 || i >= s->n)
         return 0;
     StreetObj *o = &s->o[i];                         /* TakeImpact [R] */
@@ -2544,6 +2576,7 @@ void streetobj_collide_add(StreetObjs *s, CollideWorld *w)
 
 int streetobj_impact(StreetObjs *s, const float centre[3], float radius)
 {
+    if (s && host_stopped(&s->host)) return 0;
     int n = 0;
     for (int i = 0; i < s->n; i++) {                 /* TakeImpact [R] */
         StreetObj *o = &s->o[i];
@@ -2558,6 +2591,7 @@ int streetobj_impact(StreetObjs *s, const float centre[3], float radius)
 
 int streetobj_force_damage(StreetObjs *s, const char *name, const float pos[3])
 {
+    if (s && host_stopped(&s->host)) return -1;
     /* gWorld.findWorldObject(name) (0x279E70 -> 0x2852A0 -> 0x284930) [R]: by name alone (h = h x 131 + c, case
      * folded, 127 buckets; the stored hash +0x8C and the name +0x88 compared case-blind), the first of its chain;
      * addObject puts a named object (flag 0x1000) at its chain's head (0x284A90), so the newest one wins */
@@ -2584,6 +2618,7 @@ int streetobj_force_damage(StreetObjs *s, const char *name, const float pos[3])
 
 void streetobj_pickup(StreetObjs *s, int i)          /* onPickup [R] */
 {
+    if (s && host_stopped(&s->host)) return;
     if (i < 0 || i >= s->n || !s->o[i].alive || s->o[i].kind != SK_STREET)
         return;
     StreetObj *o = &s->o[i];
@@ -2596,6 +2631,7 @@ void streetobj_pickup(StreetObjs *s, int i)          /* onPickup [R] */
 
 void streetobj_throw(StreetObjs *s, int i, int monster)   /* onThrow [R] */
 {
+    if (s && host_stopped(&s->host)) return;
     if (i < 0 || i >= s->n || !s->o[i].alive || s->o[i].kind != SK_STREET)
         return;
     StreetObj *o = &s->o[i];
@@ -2605,6 +2641,7 @@ void streetobj_throw(StreetObjs *s, int i, int monster)   /* onThrow [R] */
 
 void streetobj_hit_ground(StreetObjs *s, int i)      /* OnHitGround [R] */
 {
+    if (s && host_stopped(&s->host)) return;
     if (i < 0 || i >= s->n || !s->o[i].alive || s->o[i].kind != SK_STREET)
         return;
     StreetObj *o = &s->o[i];
@@ -2635,6 +2672,7 @@ int streetobj_nearest_pickup(const StreetObjs *s, const float hand[3], const flo
 
 void streetobj_grab(StreetObjs *s, int i, float blend)
 {
+    if (s && host_stopped(&s->host)) return;
     if (i < 0 || i >= s->n || !s->o[i].alive)
         return;
     StreetObj *o = &s->o[i];
@@ -2660,6 +2698,7 @@ void streetobj_grab(StreetObjs *s, int i, float blend)
  * where it was (army_hold_blend, 0x310B50: 0.1 s from doGrabObject) */
 void streetobj_hold(StreetObjs *s, int i, const float hand[16], int mirrored, float dt)
 {
+    if (s && host_stopped(&s->host)) return;
     if (i < 0 || i >= s->n || !s->o[i].alive || !(s->o[i].oflags & SF_HELD))
         return;
     StreetObj *o = &s->o[i];
@@ -2699,6 +2738,7 @@ void streetobj_hold(StreetObjs *s, int i, const float hand[16], int mirrored, fl
 
 void streetobj_fly(StreetObjs *s, int i, int monster, int eat, const float vel[3])
 {
+    if (s && host_stopped(&s->host)) return;
     if (i < 0 || i >= s->n || !s->o[i].alive)
         return;
     StreetObj *o = &s->o[i];
@@ -2757,6 +2797,7 @@ void streetobj_draw_world(const StreetObjs *s, int i, float out[16])
 
 int streetobj_events(StreetObjs *s, StreetEvent *out, int max)
 {
+    if (s && host_stopped(&s->host)) return 0;
     int n = s->nev < max ? s->nev : max;
     memcpy(out, s->ev, sizeof *out * (size_t)n);
     memmove(s->ev, s->ev + n, sizeof *s->ev * (size_t)(s->nev - n));

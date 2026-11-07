@@ -45,6 +45,8 @@ typedef struct {
      * MaxFiringRange stands in */
     int (*rod)(void *ctx, const char *effect, float dir[3], float *speed, float *length, float *cycle, int *loops);
     void *ctx;
+    /* Sticky owner failure: once set, callbacks and event publication stop until teardown. */
+    int (*failed)(void *ctx);
 } VehicleHost;
 
 /* ---- the objects */

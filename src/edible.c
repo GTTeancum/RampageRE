@@ -7,6 +7,42 @@
 #include "edible.h"
 #include "wrand.h"
 
+/* Callback arguments are evaluated before this boundary, including inherited reads. */
+static int host_stopped(const EdibleHost *h)
+{
+    return h && h->failed && h->failed(h->ctx);
+}
+static Group host_find(const EdibleHost *h, const char *book, const char *name)
+{
+    if (host_stopped(h) || !h->find) return (Group){ 0 };
+    Group result = h->find(h->ctx, book, name);
+    return host_stopped(h) ? (Group){ 0 } : result;
+}
+static int host_cell_state(const EdibleHost *h, int building, int storey, int column)
+{
+    if (host_stopped(h) || !h->cell_state) return 0;
+    int result = h->cell_state(h->ctx, building, storey, column);
+    return host_stopped(h) ? 0 : result;
+}
+static int host_cell_place(const EdibleHost *h, int building, int storey, int column, float out[3])
+{
+    if (host_stopped(h) || !h->cell_place) return 0;
+    int result = h->cell_place(h->ctx, building, storey, column, out);
+    return host_stopped(h) ? 0 : result;
+}
+static int host_cell_follow(const EdibleHost *h, int building, int storey, int column, float out[3])
+{
+    if (host_stopped(h) || !h->cell_follow) return 0;
+    int result = h->cell_follow(h->ctx, building, storey, column, out);
+    return host_stopped(h) ? 0 : result;
+}
+static int host_building_place(const EdibleHost *h, int building, float pos[3], int *size_z)
+{
+    if (host_stopped(h) || !h->building_place) return 0;
+    int result = h->building_place(h->ctx, building, pos, size_z);
+    return host_stopped(h) ? 0 : result;
+}
+
 #define PI 3.14159265f
 #define MAX_EVENTS 256
 #define MAX_CELLS 0x12C                              /* [R] 0x3196F0 asks 0x2BE750 for at most 300 cells */
@@ -90,13 +126,13 @@ static float gnum(Group g, const char *key, float def)
 static Group find_template(Edibles *e, const char *name)
 {
     Group none = { NULL, 0 };
-    return e->host.find && name ? e->host.find(e->host.ctx, "Objects1_Props", name) : none;
+    return e->host.find && name ? host_find(&e->host, "Objects1_Props", name) : none;
 }
 
 static EdibleEvent *emit(Edibles *e, int type, int edible, const char *name, const float pos[3])
 {
     static EdibleEvent spare;
-    if (e->nev >= MAX_EVENTS) {
+    if (host_stopped(&e->host) || e->nev >= MAX_EVENTS) {
         memset(&spare, 0, sizeof spare);
         return &spare;
     }
@@ -213,6 +249,7 @@ static int kind_of(const Edibles *e, const char *name)
 
 int edible_load_block(Edibles *e, Group block)
 {
+    if (e && host_stopped(&e->host)) return 0;
     edible_clear(e);
     /* [R] 0x31A540: the block's "Edibles" (0x3F5CB4) group, its "FillRate" (0x3F5CC4) into f20 */
     Group g = group_sub(block, "Edibles"), where;
@@ -282,6 +319,7 @@ static int pick_kind(Edibles *e)
 
 int edible_add_building(Edibles *e, int building, Group inst, Group props, int width, int storeys)
 {
+    if (e && host_stopped(&e->host)) return 0;
     int made = 0;
     /* [R] 0x2BE750 -> 0x2D01F0(grid, list, 300, from 1, to min(100, standing - 1), flags 6): storey by storey, column
      * by column, the front cells not damaged (cell +0 <= 0); flag 4: whether the cell has a window does not matter; a
@@ -289,7 +327,7 @@ int edible_add_building(Edibles *e, int building, Group inst, Group props, int w
     int cell[MAX_CELLS][3], n = 0, top = storeys - 1 < 100 ? storeys - 1 : 100;
     for (int s = 1; s <= top && n < MAX_CELLS; s++)
         for (int c = 0; c < width && n < MAX_CELLS; c++) {
-            if (e->host.cell_state && e->host.cell_state(e->host.ctx, building, s, c) > 0)
+            if (e->host.cell_state && host_cell_state(&e->host, building, s, c) > 0)
                 continue;
             cell[n][0] = s;
             cell[n][1] = c;
@@ -349,6 +387,7 @@ int edible_add_building(Edibles *e, int building, Group inst, Group props, int w
 
 int edible_add_fixed(Edibles *e, int building, int storey, int column, const char *name)
 {
+    if (e && host_stopped(&e->host)) return -1;
     if (!name)
         return -1;
     int k = kind_of(e, name);
@@ -367,6 +406,7 @@ int edible_add_fixed(Edibles *e, int building, int storey, int column, const cha
 
 int edible_add_cryotube(Edibles *e, int building, int storey, int column)
 {
+    if (e && host_stopped(&e->host)) return -1;
     static const char NAME[] = "Edible_Cryotube";
     int had = kind_of(e, NAME) >= 0;
     int s = edible_add_fixed(e, building, storey, column, NAME);
@@ -417,7 +457,7 @@ static void spawn(Edibles *e, int s)
         return;
     const EdibleKind *k = &e->kind[sl->kind];
     float pos[3];
-    if (!e->host.cell_place || !e->host.cell_place(e->host.ctx, sl->building, sl->storey, sl->column, pos))
+    if (!e->host.cell_place || !host_cell_place(&e->host, sl->building, sl->storey, sl->column, pos))
         return;                                      /* [G] the game places it anyway, where the storey would be */
     Edible *d = new_edible(e);
     if (!d)
@@ -562,7 +602,7 @@ static void edible_pickup(Edibles *e, Edible *d, int monster, int eat, const cha
             const EdibleSlot *sl = d->slot >= 0 ? &e->slot[d->slot] : NULL;
             float bp[3] = { at[0], at[1] - 2.5f, 0 };
             int size_z = 0;
-            if (!(sl && e->host.building_place && e->host.building_place(e->host.ctx, sl->building, bp, &size_z)))
+            if (!(sl && e->host.building_place && host_building_place(&e->host, sl->building, bp, &size_z)))
                 size_z = 0;                          /* [G] unknown: its front at the edible's x, the street */
             at[0] = bp[0];
             at[1] = bp[1] - 7.0f;
@@ -584,6 +624,7 @@ static void edible_pickup(Edibles *e, Edible *d, int monster, int eat, const cha
 
 void edible_cell_broken(Edibles *e, int building, int storey, int column, int state, int building_state)
 {
+    if (e && host_stopped(&e->host)) return;
     if (state < 2)                                   /* [R] 0x317DC0: 0x2CF7C0's state < 2: nothing */
         return;
     int s = find_slot(e, building, storey, column);
@@ -602,6 +643,7 @@ void edible_cell_broken(Edibles *e, int building, int storey, int column, int st
 
 void edible_floor_fell(Edibles *e, int building, int storey, int above, int below)
 {
+    if (e && host_stopped(&e->host)) return;
     for (int i = 0; i < e->nslots; i++) {
         EdibleSlot *s = &e->slot[i];
         if (s->building != building)
@@ -622,6 +664,7 @@ void edible_floor_fell(Edibles *e, int building, int storey, int above, int belo
 
 void edible_update(Edibles *e, float dt)
 {
+    if (e && host_stopped(&e->host)) return;
     for (int i = 0; i < e->n; i++) {
         Edible *d = &e->ed[i];
         if (d->phase == EP_GONE)
@@ -633,7 +676,7 @@ void edible_update(Edibles *e, float dt)
          * and, with its floor, comes down with the storeys below it */
         float now[3];
         if (d->slot >= 0 && e->slot[d->slot].item == i && e->host.cell_follow &&
-            e->host.cell_follow(e->host.ctx, e->slot[d->slot].building, e->slot[d->slot].storey,
+            host_cell_follow(&e->host, e->slot[d->slot].building, e->slot[d->slot].storey,
                                 e->slot[d->slot].column, now)) {
             memcpy(d->pos, now, sizeof d->pos);
             d->pos[2] += LIFT;
@@ -704,6 +747,7 @@ void edible_update(Edibles *e, float dt)
 
 int edible_events(Edibles *e, EdibleEvent *out, int max)
 {
+    if (e && host_stopped(&e->host)) return 0;
     int n = e->nev < max ? e->nev : max;
     memcpy(out, e->ev, sizeof *out * (size_t)n);
     if (n < e->nev)
@@ -718,11 +762,12 @@ static int cell_broken(const Edibles *e, const EdibleSlot *s)
 {
     if (!e->host.cell_state)
         return 1;                                    /* the edible appeared when it broke */
-    return e->host.cell_state(e->host.ctx, s->building, s->storey, s->column) >= 2;
+    return host_cell_state(&e->host, s->building, s->storey, s->column) >= 2;
 }
 
 int edible_occupant(const Edibles *e, int building, int storey, int column)
 {
+    if (e && host_stopped(&e->host)) return 0;
     int s = find_slot(e, building, storey, column);
     if (s < 0 || e->slot[s].item < 0 || e->slot[s].kind < 0)
         return EDIBLE_NONE;
@@ -733,6 +778,7 @@ int edible_occupant(const Edibles *e, int building, int storey, int column)
 
 int edible_hides(const Edibles *e, int building, int storey, int column)
 {
+    if (e && host_stopped(&e->host)) return 0;
     int s = find_slot(e, building, storey, column);
     return s >= 0 && e->slot[s].item >= 0 && !cell_broken(e, &e->slot[s]);
 }
@@ -748,6 +794,7 @@ const char *edible_occupant_name(const Edibles *e, int building, int storey, int
 int edible_grab(Edibles *e, int building, int storey, int column, int monster, const char *as_type, int eat,
                 const char *monster_move)
 {
+    if (e && host_stopped(&e->host)) return 0;
     int s = find_slot(e, building, storey, column);
     if (s < 0 || e->slot[s].item < 0 || !cell_broken(e, &e->slot[s]))
         return 0;
@@ -805,6 +852,7 @@ const char *edible_substitute(const char *ns, const char *func, const char *name
 int edible_monster_call(Edibles *e, const char *call, int building, int storey, int column, int person_there,
                         int monster, const char *monster_move)
 {
+    if (e && host_stopped(&e->host)) return -1;
     if (!call)
         return -1;
     const char *colon = strstr(call, "::"), *func = colon ? colon + 2 : call;

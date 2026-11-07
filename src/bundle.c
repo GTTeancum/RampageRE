@@ -128,15 +128,17 @@ static void map_cloth(Map *m, uint8_t *d)
 /* property book (tools/prb.py, prb.c): the header's count, size and group table, each group's five words and its
  * records {kind, name, value} 32-bit, but a record's kind is bytes on the Wii (u8 type, u8 form, u16 length of
  * "Type"), as the PS2's little endian u32 reads it; the groups found from the table and every group-valued record */
-static void map_book(Map *m, const uint8_t *d)
+static int map_book(Map *m, const uint8_t *d)
 {
     uint32_t count = be32_at(m, d, 0x1C), table = be32_at(m, d, 0x24);
     if (count > 65536)
-        return;
+        return 0;
     mark(m, 0x1C, 0x28, 4);
     mark(m, table, table + 4 * count, 4);
     uint32_t cap = count + 64, n = 0, *todo = malloc(sizeof *todo * cap);
     uint8_t *seen = calloc(m->n / 4 + 1, 1);
+    if (!todo || !seen)
+        goto failed;
     for (uint32_t i = 0; todo && i < count; i++)
         todo[n++] = be32_at(m, d, table + 4 * i);
     while (todo && seen && n) {
@@ -152,10 +154,14 @@ static void map_book(Map *m, const uint8_t *d)
             mark(m, at + 4, at + 12, 4);
             if (d[at] == PK_GROUP) {
                 if (n == cap) {
-                    uint32_t *grown = realloc(todo, sizeof *todo * (cap *= 2));
+                    if (cap > UINT32_MAX / 2 || (uint64_t)cap * 2 > SIZE_MAX / sizeof *todo)
+                        goto failed;
+                    uint32_t next = cap * 2;
+                    uint32_t *grown = realloc(todo, sizeof *todo * next);
                     if (!grown)
-                        break;
+                        goto failed;
                     todo = grown;
+                    cap = next;
                 }
                 todo[n++] = g + be32_at(m, d, at + 8);
             }
@@ -163,6 +169,11 @@ static void map_book(Map *m, const uint8_t *d)
     }
     free(todo);
     free(seen);
+    return 0;
+failed:
+    free(todo);
+    free(seen);
+    return -1;
 }
 
 /* string table (tools/loc.py, hud.c and shell.c loc_find): the header from 0x1C (u32 4, languages, count, the 11
@@ -247,28 +258,34 @@ static void map_monster(Map *m, const uint8_t *d)
     }
 }
 
-static void swap_entry(const Bundle *b, BdpEntry *e)
+static int swap_entry(const Bundle *b, BdpEntry *e)
 {
     const char *name = bdp_name(b, e->name);
     size_t len = strlen(name);
     int monster = e->type == ET_RAW && len >= 12 && strcmp(name + len - 12, "MONSTER_DATA") == 0;
     if (!e->data || (e->type != ET_TREE && e->type != ET_ANIM && e->type != ET_MATERIAL && e->type != ET_TEXTURE &&
                      e->type != ET_CLOTH && e->type != ET_BOOK && e->type != ET_LOC && !monster))
-        return;                                          /* raw files (scripts, fonts, .ifl) stay little endian */
+        return 0;                                        /* raw files (scripts, fonts, .ifl) stay little endian */
     uint8_t *d = (uint8_t *)e->data;
     Map m = { calloc(e->size ? e->size : 1, 1), e->size };
     if (!m.w)
-        return;
+        return -1;
     if (e->type == ET_TREE) map_tree(&m, d);
     else if (e->type == ET_ANIM) map_clip(&m, d);
     else if (e->type == ET_MATERIAL) map_material(&m, d);
     else if (e->type == ET_TEXTURE) map_texture(&m);
     else if (e->type == ET_CLOTH) map_cloth(&m, d);
-    else if (e->type == ET_BOOK) map_book(&m, d);
+    else if (e->type == ET_BOOK) {
+        if (map_book(&m, d) != 0) {
+            free(m.w);
+            return -1;
+        }
+    }
     else if (e->type == ET_LOC) map_loc(&m, d);
     else map_monster(&m, d);
     swap_marked(d, &m);
     free(m.w);
+    return 0;
 }
 
 int bdp_load(Bundle *b, uint8_t *file, uint32_t size)
@@ -277,15 +294,17 @@ int bdp_load(Bundle *b, uint8_t *file, uint32_t size)
     b->file = file;
     b->file_size = size;
     if (size < 0x60 || memcmp(file, MAGIC, sizeof MAGIC - 1) != 0)
-        return -1;
+        goto failed;
     b->wii = file[sizeof MAGIC - 1] == '4';
     uint32_t (*r32)(const uint8_t *) = b->wii ? rd32be : rd32;
     uint16_t (*r16)(const uint8_t *) = b->wii ? rd16be : rd16;
     if ((file[sizeof MAGIC - 1] != '3' && !b->wii) || r32(file + 0x30) != (b->wii ? 1400u : 1300u))
-        return -1;
+        goto failed;
     uint32_t names_at = r32(file + 0x34);                /* the name table: little endian on the Wii too */
     b->nnames = rd32(file + names_at);
     b->names = calloc(b->nnames ? b->nnames : 1, sizeof *b->names);
+    if (!b->names)
+        goto failed;
     for (uint32_t i = 0; i < b->nnames; i++)
         b->names[i] = (const char *)file + names_at + rd32(file + names_at + 4 + 4 * i);
     const uint8_t *seg = file + r32(file + 0x38);
@@ -294,6 +313,8 @@ int bdp_load(Bundle *b, uint8_t *file, uint32_t size)
     b->by_name = malloc(sizeof *b->by_name * (b->nnames ? b->nnames : 1));
     b->mat_by_name = malloc(sizeof *b->mat_by_name * (b->nnames ? b->nnames : 1));
     b->tex_by_name = malloc(sizeof *b->tex_by_name * (b->nnames ? b->nnames : 1));
+    if (!b->entries || !b->by_name || !b->mat_by_name || !b->tex_by_name)
+        goto failed;
     for (uint32_t i = 0; i < b->nnames; i++)
         b->by_name[i] = b->mat_by_name[i] = b->tex_by_name[i] = -1;
     for (uint32_t i = 0; i < count; i++) {
@@ -317,8 +338,15 @@ int bdp_load(Bundle *b, uint8_t *file, uint32_t size)
     b->nentries = count;
     if (b->wii)
         for (uint32_t i = 0; i < count; i++)
-            swap_entry(b, &b->entries[i]);
+            if (swap_entry(b, &b->entries[i]) != 0)
+                goto failed;
     return 0;
+failed:
+    /* The caller retains its input on failure, including a partially converted
+     * Wii buffer. Only metadata allocated by this call is released here. */
+    b->file = NULL;
+    bdp_free(b);
+    return -1;
 }
 
 void bdp_free(Bundle *b)

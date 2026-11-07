@@ -6,6 +6,24 @@
 #include <string.h>
 #include "reveal.h"
 
+/* Callback arguments are evaluated before this boundary, including inherited reads. */
+static int host_stopped(const RubbleHost *h)
+{
+    return h && h->failed && h->failed(h->ctx);
+}
+static Group host_tmpl(const RubbleHost *h, const char *name)
+{
+    if (host_stopped(h) || !h->tmpl) return (Group){ 0 };
+    Group result = h->tmpl(h->ctx, name);
+    return host_stopped(h) ? (Group){ 0 } : result;
+}
+static int host_shape_box(const RubbleHost *h, const char *shape, float min[3], float max[3])
+{
+    if (host_stopped(h) || !h->shape_box) return -1;
+    int result = h->shape_box(h->ctx, shape, min, max);
+    return host_stopped(h) ? -1 : result;
+}
+
 #define PI 3.14159265f
 #define MAX_REC 64
 
@@ -362,14 +380,15 @@ int rubble_load(Rubble *r, Group block_left, int had_previous, const RubbleHost 
         float left = group_num(inst, "LeftEdgeXPos", 0);
         if (left < -50.0f || !(left < 50.0f))        /* [R] 0x303EB4 .. 0x303EF0: -50 <= x < 50 */
             continue;
-        Group t = host && host->tmpl ? host->tmpl(host->ctx, group_str(inst, "TemplateName")) : (Group){ 0 };
+        Group t = host && host->tmpl ? host_tmpl(host, group_str(inst, "TemplateName")) : (Group){ 0 };
         if (!t.at)
             continue;
+        if (host_stopped(host)) { r->n = 0; return -1; }
         const char *shape = group_str(t, "Shape|RubbleShape");
         if (!shape)
             shape = group_str(t, "RubbleShape");
         float mn[3], mx[3];
-        if (!shape || !host->shape_box || host->shape_box(host->ctx, shape, mn, mx) != 0)
+        if (!shape || !host->shape_box || host_shape_box(host, shape, mn, mx) != 0)
             continue;                                /* [R] no RubbleShape: no slot */
         int width = (int)group_num(t, "Width", 0);   /* [R] the template's Width, the instance's Row */
         int row = (int)group_num(inst, "Row", 0);

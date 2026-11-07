@@ -8,6 +8,54 @@
 #include "army.h"
 #include "wrand.h"
 
+/* Callback arguments are evaluated before this boundary, including inherited reads. */
+static int host_stopped(const ArmyHost *h)
+{
+    return h && h->failed && h->failed(h->ctx);
+}
+static Group host_find(const ArmyHost *h, const char *book, const char *name)
+{
+    if (host_stopped(h) || !h->find) return (Group){ 0 };
+    Group result = h->find(h->ctx, book, name);
+    return host_stopped(h) ? (Group){ 0 } : result;
+}
+static float host_clip_seconds(const ArmyHost *h, const char *anim, const char *shape)
+{
+    if (host_stopped(h) || !h->clip_seconds) return 0;
+    float result = h->clip_seconds(h->ctx, anim, shape);
+    return host_stopped(h) ? 0 : result;
+}
+static int host_node_world(const ArmyHost *h, const ArmyUnit *u, const char *node, float out[16])
+{
+    if (host_stopped(h) || !h->node_world) return 0;
+    int result = h->node_world(h->ctx, u, node, out);
+    return host_stopped(h) ? 0 : result;
+}
+static int host_shape_box(const ArmyHost *h, const char *shape, float min[3], float max[3])
+{
+    if (host_stopped(h) || !h->shape_box) return 0;
+    int result = h->shape_box(h->ctx, shape, min, max);
+    return host_stopped(h) ? 0 : result;
+}
+static int host_shape_sphere(const ArmyHost *h, const char *shape, float centre[3], float *radius)
+{
+    if (host_stopped(h) || !h->shape_sphere) return 0;
+    int result = h->shape_sphere(h->ctx, shape, centre, radius);
+    return host_stopped(h) ? 0 : result;
+}
+static int host_visible(const ArmyHost *h, const float p[3], float r)
+{
+    if (host_stopped(h) || !h->visible) return 0;
+    int result = h->visible(h->ctx, p, r);
+    return host_stopped(h) ? 0 : result;
+}
+static int host_rod(const ArmyHost *h, const char *effect, float dir[3], float *speed, float *length, float *cycle, int *loops)
+{
+    if (host_stopped(h) || !h->rod) return 0;
+    int result = h->rod(h->ctx, effect, dir, speed, length, cycle, loops);
+    return host_stopped(h) ? 0 : result;
+}
+
 #define PI 3.14159265f
 #define TIMESTEP (1.0f / 30.0f)                      /* gWorld.getTimeStep(): its step, 1/30 [R 0x2B7800] */
 #define DELETE_ME (4 | 8 | 16)                       /* [R] what a script handler returns to have its object deleted */
@@ -233,7 +281,7 @@ static int who(const Army *a, const ArmyUnit *u) { return (int)(u - a->u); }
 static ArmyEvent *emit(Army *a, int type, int unit, const char *name, const float v[3])
 {
     static ArmyEvent spare;
-    if (a->nev >= MAX_EVENTS) {
+    if (host_stopped(&a->host) || a->nev >= MAX_EVENTS) {
         memset(&spare, 0, sizeof spare);
         return &spare;
     }
@@ -555,7 +603,7 @@ static void start_anim(Army *a, ArmyUnit *u, const char *name, int random_offset
             u->shape = shape;
         u->clip = group_str(look, "Anim|AnimName");
         if (len <= 0 && a->host.clip_seconds)
-            len = a->host.clip_seconds(a->host.ctx, u->clip, u->shape);
+            len = host_clip_seconds(&a->host, u->clip, u->shape);
     }
     u->anim_len = len;
     u->anim_time = 0;
@@ -642,7 +690,7 @@ static int weapon_make(Army *a, ArmyWeapon *w, Group g)
     w->name = group_str(g, "WeaponName");
     Group book = { 0 };
     if (w->name && a->host.find)
-        book = a->host.find(a->host.ctx, "Weapons", w->name);
+        book = host_find(&a->host, "Weapons", w->name);
     const char *type = group_str(g, "WeaponType");
     if (!type && book.at)
         type = group_str(book, "WeaponType");
@@ -1014,7 +1062,7 @@ static void beam_update(Army *a, ArmyUnit *u, ArmyWeapon *w, const float from[3]
      * MaxFiringRange only gates the firing */
     float head, tail;
     float speed, length, cycle, rd[3];
-    int loops, rod = a->host.rod && w->fire_fx && a->host.rod(a->host.ctx, w->fire_fx, rd, &speed, &length, &cycle,
+    int loops, rod = a->host.rod && w->fire_fx && host_rod(&a->host, w->fire_fx, rd, &speed, &length, &cycle,
                                                                &loops);
     if (frame)
         memcpy(s->R, frame, sizeof s->R);
@@ -1156,7 +1204,7 @@ static void weapon_step(Army *a, ArmyUnit *u, ArmyWeapon *w, int may, const floa
             /* [R 0x2975A4] its effect placed in the firing frame, the beam along the rod through it */
             float rd[3], speed, length, cycle;
             int loops, rod = a->host.rod && w->fire_fx &&
-                             a->host.rod(a->host.ctx, w->fire_fx, rd, &speed, &length, &cycle, &loops);
+                             host_rod(&a->host, w->fire_fx, rd, &speed, &length, &cycle, &loops);
             if (frame)
                 memcpy(s->R, frame, sizeof s->R);
             army_beam_axis(s->R, frame != NULL, dir, rod ? rd : NULL, s->dir);
@@ -1267,7 +1315,7 @@ static int weapon_aim(Army *a, ArmyUnit *u, ArmyWeapon *w, const float tp[3], in
                       float dir[3], float F[3][3], float dt)
 {
     float node[16];
-    int have_node = a->host.node_world && w->node && a->host.node_world(a->host.ctx, u, w->node, node);
+    int have_node = a->host.node_world && w->node && host_node_world(&a->host, u, w->node, node);
     if (have_node)
         memcpy(from, node + 12, 3 * sizeof(float));
     else {
@@ -1346,7 +1394,7 @@ static int weapon_aim(Army *a, ArmyUnit *u, ArmyWeapon *w, const float tp[3], in
      * both are known the drawn axis agrees with it within 0 deg on the tanks, 4 on the rocking PirateShip] */
     float cn[16];
     const char *ctl = w->rot_node ? w->rot_node : w->elev_node;
-    int drawn = have_node && ctl && a->host.node_world(a->host.ctx, u, ctl, cn);
+    int drawn = have_node && ctl && host_node_world(&a->host, u, ctl, cn);
     if (have_node && (drawn || (!w->rot_rate && !w->elev_rate))) {
         for (int k = 0; k < 3; k++)
             dir[k] = node[4 * w->axis + k] * (w->axis_neg ? -1.0f : 1.0f);
@@ -1497,6 +1545,7 @@ const ArmyStats *army_stats(const Army *a, int monster)
 
 void army_add_stats(Army *a, int monster, Group tmpl, int type)
 {
+    if (a && host_stopped(&a->host)) return;
     ArmyUnit tmp;
     memset(&tmp, 0, sizeof tmp);
     tmp.tmpl = tmpl;
@@ -1540,6 +1589,7 @@ float army_score_building(Army *a, int monster, int building, Group building_pro
                           const char *monster_move, int width, int storeys, const int *front_states, int nfront,
                           const float at[3])
 {
+    if (a && host_stopped(&a->host)) return 0;
     if (building < 0 || building >= MAX_BUILDINGS)
         return 0;
     Chain *c = &a->chain[building];
@@ -1632,7 +1682,7 @@ static void block_attack_objects(Army *a, Group block_def)
     for (uint32_t i = 0; i < n && a->host.find; i++) {
         Group g = record_group(where, r[i]);
         const char *name = group_str(g, "Name");
-        Group t = name ? a->host.find(a->host.ctx, "Objects1_Props", name) : (Group){ 0 };
+        Group t = name ? host_find(&a->host, "Objects1_Props", name) : (Group){ 0 };
         Record x;
         if (!t.at || kind_of(gstr(t, "ScriptName")) != AK_TURRET || group_get(g, "NoLoadOnActiveBlock", &x) ||
             group_get(t, "NoLoadOnActiveBlock", &x) || group_num(g, "SpawnDelay", group_num(t, "SpawnDelay", 0)) != 0)
@@ -1656,6 +1706,7 @@ static void block_attack_objects(Army *a, Group block_def)
  * MinDelay + OffsetDelay x rand seconds */
 int army_load_block(Army *a, Group block_def)
 {
+    if (a && host_stopped(&a->host)) return 0;
     a->nsp = 0;
     a->active = 0;
     block_attack_objects(a, block_def);
@@ -1673,7 +1724,7 @@ int army_load_block(Army *a, Group block_def)
         if (!s->name)
             continue;
         if (a->host.find) {                          /* a boss is boss.c's (Boss_*.bsf), not a unit */
-            Group t = a->host.find(a->host.ctx, "Objects1_Props", s->name);
+            Group t = host_find(&a->host, "Objects1_Props", s->name);
             const char *sc = t.at ? gstr(t, "ScriptName") : NULL;
             if (sc && (strncmp(sc, "Boss_", 5) == 0 || _stricmp(sc, "freighter.bsf") == 0))
                 continue;                            /* (and a freighter is rail.c's) */
@@ -1689,10 +1740,12 @@ int army_load_block(Army *a, Group block_def)
     return a->nsp;
 }
 
-int army_weapon_make(Army *a, ArmyWeapon *w, Group weapon_group) { return weapon_make(a, w, weapon_group); }
+int army_weapon_make(Army *a, ArmyWeapon *w, Group weapon_group) {
+    if (a && host_stopped(&a->host)) return 0; return weapon_make(a, w, weapon_group); }
 void army_weapon_tick(Army *a, ArmyWeapon *w, int may, const float from[3], const float dir[3],
                       const float frame[3][3], int target, float dt, uint32_t owner_tag)
 {
+    if (a && host_stopped(&a->host)) return;
     a->person_tag = owner_tag;                       /* its shots and beams pass its own body (0x293CD8) */
     weapon_tick(a, NULL, w, may, from, dir, frame, target, dt);
     a->person_tag = 0;
@@ -1736,7 +1789,7 @@ static void spawner_update(Army *a, float dt)
         s->timer = s->respawn + s->offset * frand(a);
         s->alive++;
         s->left--;
-        Group t = a->host.find ? a->host.find(a->host.ctx, "Objects1_Props", s->name) : (Group){ 0 };
+        Group t = a->host.find ? host_find(&a->host, "Objects1_Props", s->name) : (Group){ 0 };
         if (!t.at)
             continue;                                /* [R] alive stays 1: that record never spawns again */
         int k = unit_new(a, s->name, t, s->g);
@@ -1936,7 +1989,7 @@ static const float *book_box(Group g, float b[6])
 static void unit_shape_read(const Army *a, const ArmyUnit *u, CollideShape *s)
 {
     float tb[6], ib[6], mb[6], c[3] = { 0, 0, 0 }, r = 1;
-    int have = u->shape && a->host.shape_box && a->host.shape_box(a->host.ctx, u->shape, mb, mb + 3);
+    int have = u->shape && a->host.shape_box && host_shape_box(&a->host, u->shape, mb, mb + 3);
     if (have) {
         float h[3];
         for (int k = 0; k < 3; k++) {
@@ -1947,7 +2000,7 @@ static void unit_shape_read(const Army *a, const ArmyUnit *u, CollideShape *s)
     }
     /* [R 0x28FD70 -> 0x184CB0] the sphere the model keeps, the union of its parts' spheres (0x185AA0) */
     if (have && a->host.shape_sphere)
-        a->host.shape_sphere(a->host.ctx, u->shape, c, &r);
+        host_shape_sphere(&a->host, u->shape, c, &r);
     Group t = u->tmpl, in = u->inst;
     collide_shape_pick(s, have ? c : NULL, r, t.at ? book_box(t, tb) : NULL, t.at ? gnum(t, "CollisionRadius", -1) : -1,
                        t.at && gnum(t, "AutoCollisionBox", 0) != 0, in.at ? book_box(in, ib) : NULL,
@@ -2256,7 +2309,7 @@ static int tank_pulse(Army *a, ArmyUnit *u)
     if (u->state == 0) {                             /* not yet on screen */
         float x = u->pos[0] > 0 ? u->pos[0] + 10 : u->pos[0] - 10;
         float p[3] = { x, u->pos[1], u->pos[2] };
-        if (a->host.visible ? a->host.visible(a->host.ctx, p, 1) : x >= a->view[0] && x <= a->view[1]) {
+        if (a->host.visible ? host_visible(&a->host, p, 1) : x >= a->view[0] && x <= a->view[1]) {
                                                      /* gWorld.isSphereVisible(pos, 1) */
             u->state = 1;
             attack_init(a, u);                       /* createAttackMover */
@@ -2410,7 +2463,7 @@ static void heli_init(Army *a, ArmyUnit *u)          /* onInit (is_cop = bIsFrie
             const char *name = ustr(u, "Name");
             if (!name)
                 name = u->name;
-            Group t = a->host.find ? a->host.find(a->host.ctx, "Objects1_Props", name) : u->tmpl;
+            Group t = a->host.find ? host_find(&a->host, "Objects1_Props", name) : u->tmpl;
             int k = unit_new(a, name, t.at ? t : u->tmpl, (Group){ 0 });   /* gWorld.createAttackObject(name) */
             if (k >= 0) {
                 ArmyUnit *f = &a->u[k];
@@ -3588,6 +3641,7 @@ static void airstrike_update(Army *a)
     i = pick[i < 0 ? 0 : i >= n ? n - 1 : i];
     const ArmyBox *b = &a->b[i];
     float at[3] = { (b->min[0] + b->max[0]) / 2 + 5, (b->min[1] + b->max[1]) / 2, b->max[2] };
+    if (host_stopped(&a->host)) return;
     army_play(a)[0] = (int)(20 + top);               /* setPlayValue's slot 0 (0x332930) */
     int k = army_spawn(a, "FinalBomber", at, 0);
     if (getenv("RAMPAGE_TRACE"))
@@ -3855,7 +3909,7 @@ static void unit_init(Army *a, ArmyUnit *u)
 
 static int unit_spawn_actor(Army *a, const char *name, const float pos[3])   /* gWorld.createActor(name) */
 {
-    Group t = a->host.find ? a->host.find(a->host.ctx, "Objects1_Props", name) : (Group){ 0 };
+    Group t = a->host.find ? host_find(&a->host, "Objects1_Props", name) : (Group){ 0 };
     if (!t.at)
         return -1;
     int k = unit_new(a, name, t, (Group){ 0 });
@@ -4064,6 +4118,7 @@ void army_ai_cut(Army *a, float seconds) { if (a) a->ai_cut = seconds; }
 
 void army_collide_add(Army *a, CollideWorld *w)
 {
+    if (a && host_stopped(&a->host)) return;
     for (int i = 0; i < a->n; i++) {
         ArmyUnit *u = &a->u[i];
         u->cobj = -1;
@@ -4095,6 +4150,7 @@ static void unit_take_impact(Army *a, ArmyUnit *u)
 
 void army_impact(Army *a, int unit)
 {
+    if (a && host_stopped(&a->host)) return;
     if (unit >= 0 && unit < a->n)
         unit_take_impact(a, &a->u[unit]);
 }
@@ -4120,7 +4176,8 @@ static void frame_inputs(Army *a, const ArmyMonster *m, int nm, const ArmyBox *b
 
 int army_spawn(Army *a, const char *tmpl_name, const float pos[3], float facing)
 {
-    Group t = a->host.find ? a->host.find(a->host.ctx, "Objects1_Props", tmpl_name) : (Group){ 0 };
+    if (a && host_stopped(&a->host)) return -1;
+    Group t = a->host.find ? host_find(&a->host, "Objects1_Props", tmpl_name) : (Group){ 0 };
     if (!t.at)
         return -1;
     int k = unit_new(a, tmpl_name, t, (Group){ 0 });
@@ -4135,6 +4192,7 @@ int army_spawn(Army *a, const char *tmpl_name, const float pos[3], float facing)
 
 int army_spawn_window(Army *a, const char *tmpl_name, const float pos[3])
 {
+    if (a && host_stopped(&a->host)) return -1;
     /* [R 0x318A44 .. 0x318B14] the occupant's spawner, soldiers as people, sets only the place: no turn (the identity:
      * the person shapes face -y, the street, as they are made), so its WindowFiring<RM ..> clip points the gun +x for
      * R, the way getMonsterDirection counts */
@@ -4157,6 +4215,7 @@ void army_window_remove(Army *a, int unit)
 
 int army_drop(Army *a, const char *tmpl_name, const float from[3])
 {
+    if (a && host_stopped(&a->host)) return -1;
     return army_spawn(a, tmpl_name, from, 0);
 }
 
@@ -4195,6 +4254,7 @@ void army_person_forget(Army *a, int person)
 
 void army_person_weapon(Army *a, int person, Group weapon, const float person_world[16], int target_monster)
 {
+    if (a && host_stopped(&a->host)) return;
     const char *name = weapon.at ? group_str(weapon, "WeaponName") : NULL;
     if (person < 0)
         return;
@@ -4254,6 +4314,7 @@ static void persons_update(Army *a, float dt)
 
 void army_update(Army *a, float dt, const ArmyMonster *m, int nm, const ArmyBox *b, int nb)
 {
+    if (a && host_stopped(&a->host)) return;
     frame_inputs(a, m, nm, b, nb);
     a->dt = dt;
     a->now += dt;
@@ -4281,6 +4342,7 @@ const ArmyShot *army_shot(const Army *a, int i) { return i >= 0 && i < a->nshots
 
 int army_events(Army *a, ArmyEvent *out, int max)
 {
+    if (a && host_stopped(&a->host)) return 0;
     int n = a->nev < max ? a->nev : max;
     if (out && n > 0)
         memcpy(out, a->ev, (size_t)n * sizeof *out);
@@ -4297,6 +4359,7 @@ int army_events(Army *a, ArmyEvent *out, int max)
  * OnlyHitWithEffNodes (0x8000, set by its script) and goes on the attack's hit list, one blow an attack */
 int army_hit(Army *a, int monster, const float centre[3], float radius, float amount, unsigned record)
 {
+    if (a && host_stopped(&a->host)) return 0;
     if (monster < 0 || monster >= a->nm)
         return 0;
     int n = 0;
@@ -4429,6 +4492,7 @@ void army_hold_blend(ArmyHoldBlend *b, float rot[9], float pos[3], float dt)
 
 void army_grab(Army *a, int unit, int monster, float blend)
 {
+    if (a && host_stopped(&a->host)) return;
     (void)monster;
     if (unit < 0 || unit >= a->n || a->u[unit].phase != AU_ALIVE)
         return;
@@ -4458,6 +4522,7 @@ void army_grab(Army *a, int unit, int monster, float blend)
  * from doGrabObject) */
 void army_hold(Army *a, int unit, const float hand[16], int mirrored, float dt)
 {
+    if (a && host_stopped(&a->host)) return;
     if (unit < 0 || unit >= a->n || a->u[unit].phase != AU_HELD)
         return;
     ArmyUnit *u = &a->u[unit];
@@ -4465,12 +4530,13 @@ void army_hold(Army *a, int unit, const float hand[16], int mirrored, float dt)
     if (major < 0 || major > 2)
         major = 2;
     int i1 = (major + 1) % 3, i2 = (major + 2) % 3;
-    float axis[3][3];
-    memcpy(axis[major], hand + 8, sizeof axis[0]);
-    memcpy(axis[i1], hand + 4, sizeof axis[0]);
-    axis[i2][0] = axis[major][1] * axis[i1][2] - axis[major][2] * axis[i1][1];
-    axis[i2][1] = axis[major][2] * axis[i1][0] - axis[major][0] * axis[i1][2];
-    axis[i2][2] = axis[major][0] * axis[i1][1] - axis[major][1] * axis[i1][0];
+    float axis[9];
+    float *am = axis + 3 * major, *a1 = axis + 3 * i1, *a2 = axis + 3 * i2;
+    memcpy(am, hand + 8, 3 * sizeof(float));
+    memcpy(a1, hand + 4, 3 * sizeof(float));
+    a2[0] = am[1] * a1[2] - am[2] * a1[1];
+    a2[1] = am[2] * a1[0] - am[0] * a1[2];
+    a2[2] = am[0] * a1[1] - am[1] * a1[0];
     float off[3] = { 0, 0, 0 };
     Group og = group_sub(u->tmpl, mirrored ? "MirroredHoldOffset" : "HoldOffset");
     Record r[3];
@@ -4480,9 +4546,9 @@ void army_hold(Army *a, int unit, const float hand[16], int mirrored, float dt)
     float pos[3];
     for (int k = 0; k < 3; k++)
         pos[k] = hand[12 + k] + off[0] * hand[k] + off[1] * hand[4 + k] + off[2] * hand[8 + k];
-    army_hold_blend(&u->hold, axis[0], pos, dt);
+    army_hold_blend(&u->hold, axis, pos, dt);
     for (int c = 0; c < 3; c++) {
-        memcpy(u->world + 4 * c, axis[c], sizeof axis[c]);
+        memcpy(u->world + 4 * c, axis + 3 * c, 3 * sizeof(float));
         u->world[4 * c + 3] = 0;
     }
     for (int k = 0; k < 3; k++)
@@ -4494,6 +4560,7 @@ void army_hold(Army *a, int unit, const float hand[16], int mirrored, float dt)
  * time in five, 2 s later) and gone, an actor not eaten is smashed; an object gets the clip's velocity */
 void army_throw(Army *a, int unit, int monster, int eat, const float vel[3], float monster_heading)
 {
+    if (a && host_stopped(&a->host)) return;
     if (unit < 0 || unit >= a->n || a->u[unit].phase != AU_HELD)
         return;
     ArmyUnit *u = &a->u[unit];
@@ -4621,9 +4688,10 @@ static void mon_weapon_read(ArmyMonWeapon *w, Group g)
  * DamageType 11. Only RoarWeapon is a Shockwave; BreathWeapon (RBeamWeapon), FartWeapon and TankCannon (FireBall,
  * RProjectileWeapon) are made and updated but never fired: no clip asks for them (Monsters.bsf's fireWeapon fires
  * "fart" only for (p0 != 0, p1 == 1), and every monster's clips pass (0, 0, 0, 0)) */
-void army_mon_weapons_read(ArmyMonWeapons *ws, Group list, Group (*find)(void *ctx, const char *book, const char *name),
-                           void *ctx)
+void army_mon_weapons_read_checked(ArmyMonWeapons *ws, Group list, Group (*find)(void *ctx, const char *book, const char *name),
+                           void *ctx, int (*failed)(void *ctx))
 {
+    if (failed && failed(ctx)) return;
     memset(ws, 0, sizeof *ws);
     if (!list.at)
         return;
@@ -4633,7 +4701,9 @@ void army_mon_weapons_read(ArmyMonWeapons *ws, Group list, Group (*find)(void *c
                                                                        * every book has 4] */
         Group g = record_group(list, r[i]);
         const char *name = group_str(g, "WeaponName");
+        if (failed && failed(ctx)) return;
         Group book = name && find ? find(ctx, "Weapons", name) : (Group){ 0 };
+        if (failed && failed(ctx)) return;
         const char *type = group_str(g, "WeaponType");
         if (!type && book.at)
             type = group_str(book, "WeaponType");
@@ -4650,11 +4720,18 @@ void army_mon_weapons_read(ArmyMonWeapons *ws, Group list, Group (*find)(void *c
         w->radius = 10;
         mon_weapon_read(w, book);
         mon_weapon_read(w, g);
+        if (failed && failed(ctx)) return;
         w->timer = w->charge + w->offset;
         w->left = w->duration;
         w->state = 2;
         w->fx = -1;
     }
+}
+
+void army_mon_weapons_read(ArmyMonWeapons *ws, Group list,
+                           Group (*find)(void *ctx, const char *book, const char *name), void *ctx)
+{
+    army_mon_weapons_read_checked(ws, list, find, ctx, NULL);
 }
 
 /* [R] 0x2D4B80 fireWeapon(key): every weapon whose key matches (0x32C9C8, any case) to state 3; the monster's own

@@ -48,6 +48,8 @@ typedef struct {
      * (the front's middle, at the street, stands in) */
     int (*building_place)(void *ctx, int building, float pos[3], int *size_z);
     void *ctx;
+    /* Sticky owner failure: once set, callbacks and event publication stop until teardown. */
+    int (*failed)(void *ctx);
 } EdibleHost;
 
 /* [R] 0x317BC0: an edible stands in its cell, half a cell in from the front: x = the grid's min x + 5 x column + 2.5,

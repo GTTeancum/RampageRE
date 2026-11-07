@@ -12,6 +12,8 @@
 #include "data.h"
 
 enum { F_NORMAL = 0x010, F_COLOUR = 0x040, F_UV = 0x100 };
+/* Keep invalid-section skipping separate from a failed valid-asset allocation. */
+enum { SECTION_OUT_OF_MEMORY = -2 };
 
 static uint32_t align16(uint32_t n) { return (n + 15) & ~15u; }
 
@@ -28,6 +30,8 @@ static int read_section(const BdpEntry *e, const uint8_t *desc, int skinned, Mes
         p->bones = calloc(count, sizeof *p->bones);
         p->weights = calloc(count, sizeof *p->weights);
     }
+    if (!closes || !p->pos || (skinned && (!p->bones || !p->weights)))
+        goto out_of_memory;
     for (uint32_t i = 0; i < count; i++) {
         const uint8_t *v = s + 16 * i;
         p->pos[3 * i] = rdf(v); p->pos[3 * i + 1] = rdf(v + 4); p->pos[3 * i + 2] = rdf(v + 8);
@@ -44,6 +48,8 @@ static int read_section(const BdpEntry *e, const uint8_t *desc, int skinned, Mes
     s += align16(16 * count);
     if (fmt & F_NORMAL) {
         p->nrm = malloc(12u * count);
+        if (!p->nrm)
+            goto out_of_memory;
         for (uint32_t i = 0; i < count; i++) {
             p->nrm[3 * i] = (int8_t)s[4 * i] / 127.0f;
             p->nrm[3 * i + 1] = (int8_t)s[4 * i + 1] / 127.0f;
@@ -55,12 +61,16 @@ static int read_section(const BdpEntry *e, const uint8_t *desc, int skinned, Mes
     }
     if (fmt & F_COLOUR) {
         p->col = malloc(16u * count);
+        if (!p->col)
+            goto out_of_memory;
         for (uint32_t i = 0; i < 4 * count; i++)
             p->col[i] = s[i] >= 128 ? 1.0f : s[i] / 128.0f;
         s += align16(4 * count);
     }
     if (fmt & F_UV) {
         p->uv = malloc(8u * count);
+        if (!p->uv)
+            goto out_of_memory;
         for (uint32_t i = 0; i < count; i++) {
             p->uv[2 * i] = (int16_t)rd16(s + 4 * i) / 4096.0f;
             p->uv[2 * i + 1] = (int16_t)rd16(s + 4 * i + 2) / 4096.0f;
@@ -72,6 +82,8 @@ static int read_section(const BdpEntry *e, const uint8_t *desc, int skinned, Mes
         return -1;
     }
     p->tris = malloc(12u * count);
+    if (!p->tris)
+        goto out_of_memory;
     for (uint32_t i = 2; i < count; i++) {
         if (!closes[i])
             continue;
@@ -82,6 +94,9 @@ static int read_section(const BdpEntry *e, const uint8_t *desc, int skinned, Mes
     }
     free(closes);
     return 0;
+out_of_memory:
+    free(closes);
+    return SECTION_OUT_OF_MEMORY;                    /* the reader owns every partial MeshPart buffer */
 }
 
 /* ---- the Wii's meshes (tools/mesh.py, docs/FORMAT_BDP.md "The Wii's bundles"): the PS2's records, big endian, each
@@ -109,7 +124,7 @@ static int wii_triangles(const BdpEntry *e, const uint8_t *block, uint32_t count
         if (p->ntris + more > cap) {
             uint32_t *grown = realloc(p->tris, 12u * (cap = (p->ntris + more) * 2 + 16));
             if (!grown)
-                return -1;
+                return SECTION_OUT_OF_MEMORY;
             p->tris = grown;
         }
         for (uint32_t k = 0; k < n; k++) {                /* every index of a vertex is the same: they are interleaved */
@@ -169,6 +184,9 @@ static int wii_section(const BdpEntry *e, const uint8_t *block, const uint8_t *d
         p->bones = calloc(count, sizeof *p->bones);
         p->weights = calloc(count, sizeof *p->weights);
     }
+    if (!p->pos || (at[A_NRM] && !p->nrm) || (at[A_UV] && !p->uv) || (at[A_COL] && !p->col) ||
+        (skinned && (!p->bones || !p->weights)))
+        return SECTION_OUT_OF_MEMORY;
     for (uint32_t i = 0; i < count; i++) {
         const uint8_t *v = s + stride * i;
         for (int k = 0; k < 3; k++) p->pos[3 * i + k] = rdfbe(v + 4 * k);
@@ -204,6 +222,8 @@ static int wii_mesh_read(const BdpEntry *e, Mesh *m)
         return -1;
     }
     m->parts = calloc(count ? count : 1, sizeof *m->parts);
+    if (!m->parts)
+        return -1;
     for (uint32_t i = 0; i < count; i++) {
         const uint8_t *rec = d + first + stride * i;
         if (first + stride * (i + 1) > e->size)
@@ -214,11 +234,16 @@ static int wii_mesh_read(const BdpEntry *e, Mesh *m)
         MeshPart *p = &m->parts[m->nparts];
         memset(p, 0, sizeof *p);
         p->material = rd16be(rec + mat_at);
-        if (wii_section(e, rec + block, rec + desc, e->type == ET_SKINNED, p) == 0)
+        int result = wii_section(e, rec + block, rec + desc, e->type == ET_SKINNED, p);
+        if (result == 0)
             m->nparts++;
         else {
             free(p->pos); free(p->nrm); free(p->uv); free(p->col); free(p->bones); free(p->weights); free(p->tris);
             memset(p, 0, sizeof *p);
+            if (result == SECTION_OUT_OF_MEMORY) {
+                mesh_free(m);
+                return -1;
+            }
         }
     }
     return 0;
@@ -239,13 +264,24 @@ int mesh_read(const BdpEntry *e, Mesh *m)
         return -1;
     }
     m->parts = calloc(count ? count : 1, sizeof *m->parts);
+    if (!m->parts)
+        return -1;
     for (uint32_t i = 0; i < count; i++) {
         const uint8_t *rec = d + first + stride * i;
         MeshPart *p = &m->parts[m->nparts];
         memset(p, 0, sizeof *p);              /* a part that failed before leaves nothing behind for the next */
         p->material = rd16(rec + mat_at);
-        if (read_section(e, rec + rd32(rec + desc_at), e->type == ET_SKINNED, p) == 0)
+        int result = read_section(e, rec + rd32(rec + desc_at), e->type == ET_SKINNED, p);
+        if (result == 0)
             m->nparts++;
+        else {
+            free(p->pos); free(p->nrm); free(p->uv); free(p->col); free(p->bones); free(p->weights); free(p->tris);
+            memset(p, 0, sizeof *p);
+            if (result == SECTION_OUT_OF_MEMORY) {
+                mesh_free(m);
+                return -1;
+            }
+        }
     }
     return 0;
 }

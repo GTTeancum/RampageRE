@@ -133,10 +133,12 @@ typedef struct {
     int state; float time;
     int chosen;                                      /* transition picked and waiting for its switch window, -1 */
     int floor_any, floor_act;                        /* the AI's pick floors (the pad's +0x8, +0xC: pickByAction) */
-    uint8_t *in_window, *sw_window;                  /* per transition of the state */
+    uint8_t *in_window, *sw_window;                  /* one reservation; sw_window aliases its second half */
     int from, via;                                   /* after a switch: the old state, the transition (-1: clip end) */
 } MoveRunner;
-void moves_start(MoveRunner *r, const MoveGraph *g, int state);
+/* Stop an active runner before start/replacement; the graph stays immutable and live until stop.
+ * 0 = ready, -1 = allocation/invalid graph failure, leaving an empty stoppable runner. */
+int moves_start(MoveRunner *r, const MoveGraph *g, int state);
 /* one frame: dt seconds (times the monster's speed); 1 when it switched state (r->from, r->via say how) */
 int moves_step(MoveRunner *r, MoveInput *in, float dt, MoveCall call, void *ctx);
 /* switch to `to` now through the transition whose only condition is false == 0 (the game's own events: landing,

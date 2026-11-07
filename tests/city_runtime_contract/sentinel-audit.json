@@ -1,0 +1,875 @@
+[
+  {
+    "module": "army",
+    "function": "army_add_stats",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 1498,
+    "accepted_function_sha256": "28529d91146a051b1beca89b24f8bd7a3252d9a2ed764d46ef53f9de0661eccd"
+  },
+  {
+    "module": "army",
+    "function": "army_score_building",
+    "category": "score",
+    "failure_return": "0",
+    "justification": "No awarded points, matching the existing zero-score early exits.",
+    "accepted_source_line": 1539,
+    "accepted_function_sha256": "21fc363bd0fe7446e49dce35cc260d10374c923bf524986470866cfb61e87c07"
+  },
+  {
+    "module": "army",
+    "function": "army_load_block",
+    "category": "count",
+    "failure_return": "0",
+    "justification": "Zero objects/slots/kinds/hits created or processed. These APIs return nonnegative counts; sticky failure is reported separately, never encoded as a negative count.",
+    "accepted_source_line": 1657,
+    "accepted_function_sha256": "b16083ee9a6d8bdabf44db92a7dbf84f6d0eb3bd04b0c3a1c54fecf516c34307"
+  },
+  {
+    "module": "army",
+    "function": "army_weapon_make",
+    "category": "boolean",
+    "failure_return": "0",
+    "justification": "False: no weapon made, no visible occupant/hide/grab, or no impact accepted. Output parameters are not consumed on false.",
+    "accepted_source_line": 1692,
+    "accepted_function_sha256": "cdb5d197a95688187eee08fde1ade40fc4d35a43fb8f7f5888cb8fab65c4c943"
+  },
+  {
+    "module": "army",
+    "function": "army_weapon_tick",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 1693,
+    "accepted_function_sha256": "e341f28ceb305c333ed66ce6f4ff60610c4bf8fcdadde541f4ece525afcdcf8a"
+  },
+  {
+    "module": "army",
+    "function": "army_collide_add",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 4065,
+    "accepted_function_sha256": "c7a976a11d59005a032b0f6a545576a05368a6f64109ec823ed6c807313f9ec4"
+  },
+  {
+    "module": "army",
+    "function": "army_impact",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 4096,
+    "accepted_function_sha256": "5cfdef67a365f00a24c64767ff7bf86da7fb0c4e04ac9656d5048e679cb7ac98"
+  },
+  {
+    "module": "army",
+    "function": "army_spawn",
+    "category": "index",
+    "failure_return": "-1",
+    "justification": "No object/slot index. Matches existing -1 constructor/lookup failure and prevents valid index 0 from escaping.",
+    "accepted_source_line": 4121,
+    "accepted_function_sha256": "867c025cab98d92a7bcd0e1d194e659c02291f6fd8f3847795d35fd7b0627255"
+  },
+  {
+    "module": "army",
+    "function": "army_spawn_window",
+    "category": "index",
+    "failure_return": "-1",
+    "justification": "No object/slot index. Matches existing -1 constructor/lookup failure and prevents valid index 0 from escaping.",
+    "accepted_source_line": 4136,
+    "accepted_function_sha256": "e94612352cbcfc3956e0e30f325e0aeda65f0ad780a5d40a1edf18e2813be693"
+  },
+  {
+    "module": "army",
+    "function": "army_drop",
+    "category": "index",
+    "failure_return": "-1",
+    "justification": "No object/slot index. Matches existing -1 constructor/lookup failure and prevents valid index 0 from escaping.",
+    "accepted_source_line": 4158,
+    "accepted_function_sha256": "225f546a08c43e92203ebd4696451bfc79cf71fee681fdecc74ad46574d61136"
+  },
+  {
+    "module": "army",
+    "function": "army_person_weapon",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 4196,
+    "accepted_function_sha256": "2e29c9fd728a7a4285976d8d446ef9829bbccf2c60e36004a0133f53ce15401a"
+  },
+  {
+    "module": "army",
+    "function": "army_update",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 4255,
+    "accepted_function_sha256": "660e492011ac6f2bfaf77ffbe68225cf4f9bfa3694a7098b6b3a41839a03164c"
+  },
+  {
+    "module": "army",
+    "function": "army_hit",
+    "category": "count",
+    "failure_return": "0",
+    "justification": "Zero objects/slots/kinds/hits created or processed. These APIs return nonnegative counts; sticky failure is reported separately, never encoded as a negative count.",
+    "accepted_source_line": 4298,
+    "accepted_function_sha256": "832b22e77cbb94241ebeea24b69cdcbf38f734603d44e388058a33d70311ccaf"
+  },
+  {
+    "module": "army",
+    "function": "army_grab",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 4430,
+    "accepted_function_sha256": "298a9d169c4d82e0c80850281441532e28e3e8311d10d2c6e44d3da4711ff240"
+  },
+  {
+    "module": "army",
+    "function": "army_hold",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 4459,
+    "accepted_function_sha256": "6eda6febbbe5ac4821ccd5c30eb72508be043b7af799cccf1e6b5453e12537ff"
+  },
+  {
+    "module": "army",
+    "function": "army_throw",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 4496,
+    "accepted_function_sha256": "1299e6394f7b3b4c75efa0ef11c38e2eb4fb8743def2e01f97391c08150474e2"
+  },
+  {
+    "module": "vehicle",
+    "function": "vehicle_load_traffic",
+    "category": "count",
+    "failure_return": "0",
+    "justification": "Zero objects/slots/kinds/hits created or processed. These APIs return nonnegative counts; sticky failure is reported separately, never encoded as a negative count.",
+    "accepted_source_line": 635,
+    "accepted_function_sha256": "156be9488bcca36972904ce83221214e91fb7e84ce80b01d2726af0046af55cf"
+  },
+  {
+    "module": "vehicle",
+    "function": "vehicle_spawn",
+    "category": "index",
+    "failure_return": "-1",
+    "justification": "No object/slot index. Matches existing -1 constructor/lookup failure and prevents valid index 0 from escaping.",
+    "accepted_source_line": 1366,
+    "accepted_function_sha256": "95363490563af6c8da31eea298ee059a5444334157a845577f6d528380d09a0b"
+  },
+  {
+    "module": "vehicle",
+    "function": "vehicle_kind_of",
+    "category": "kind",
+    "failure_return": "-1",
+    "justification": "Unknown template/script kind, preserving kind_of_template failure rather than valid enum 0.",
+    "accepted_source_line": 1372,
+    "accepted_function_sha256": "c04d5a0b0a190e37140bfb801ae34053688710b85ee9cababc6da327b43020e3"
+  },
+  {
+    "module": "vehicle",
+    "function": "vehicle_level_start",
+    "category": "index",
+    "failure_return": "-1",
+    "justification": "No object/slot index. Matches existing -1 constructor/lookup failure and prevents valid index 0 from escaping.",
+    "accepted_source_line": 1398,
+    "accepted_function_sha256": "a71b415063f77a2a864839a879cbd3899ddd8ecad22077fe8537b059e619d3bf"
+  },
+  {
+    "module": "vehicle",
+    "function": "vehicle_building_gone",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 1419,
+    "accepted_function_sha256": "257895aba238b04086ba1037280c7e36a793c159baa6134fd464e6bf5f887f17"
+  },
+  {
+    "module": "vehicle",
+    "function": "vehicle_update",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 1476,
+    "accepted_function_sha256": "cf129f5748e31cddeab088aeb023bbf598ca0a551c6ba2a798913bcb14908289"
+  },
+  {
+    "module": "vehicle",
+    "function": "vehicle_shot",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 1500,
+    "accepted_function_sha256": "399939a6576256d12dfab8054b1056ceaf61c11033da7a4683a300ac174d9e37"
+  },
+  {
+    "module": "vehicle",
+    "function": "vehicle_hit",
+    "category": "count",
+    "failure_return": "0",
+    "justification": "Zero objects/slots/kinds/hits created or processed. These APIs return nonnegative counts; sticky failure is reported separately, never encoded as a negative count.",
+    "accepted_source_line": 1511,
+    "accepted_function_sha256": "7707a85efa6cb6efc90e3d4605f6657cabd39ac0f638836a427fda6733292e41"
+  },
+  {
+    "module": "vehicle",
+    "function": "vehicle_collide_add",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 1546,
+    "accepted_function_sha256": "4db20b538388822a9b49b85ce67a5d6b0b5510440941eb092d93d0e9ba26122e"
+  },
+  {
+    "module": "vehicle",
+    "function": "vehicle_grab",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 1604,
+    "accepted_function_sha256": "6e3f4cc4f81d0ea8557f8aa002d02a1b9c889b5808b8925a7ec266367f6eb500"
+  },
+  {
+    "module": "vehicle",
+    "function": "vehicle_hold",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 1621,
+    "accepted_function_sha256": "c6d6caa0e8124e26e92907dacc375b996b87b086d7e0da5e5ffe90ef43fa39f9"
+  },
+  {
+    "module": "vehicle",
+    "function": "vehicle_throw",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 1655,
+    "accepted_function_sha256": "cd9d08b8fe0df3e1b296c05212f2211ef637ce08f718ee2fb596a0947be61fcf"
+  },
+  {
+    "module": "rail",
+    "function": "rail_kind_of",
+    "category": "kind",
+    "failure_return": "-1",
+    "justification": "Unknown template/script kind, preserving kind_of_template failure rather than valid enum 0.",
+    "accepted_source_line": 1877,
+    "accepted_function_sha256": "2b21466768707146b87c2b4c42827c78535ecb43557fc2d044e1fbedab1ee9c0"
+  },
+  {
+    "module": "rail",
+    "function": "rail_spawn",
+    "category": "index",
+    "failure_return": "-1",
+    "justification": "No object/slot index. Matches existing -1 constructor/lookup failure and prevents valid index 0 from escaping.",
+    "accepted_source_line": 1879,
+    "accepted_function_sha256": "031e1efab641a6c1da70754bab73c62386da958a1a57fd9e157d20053405c59e"
+  },
+  {
+    "module": "rail",
+    "function": "rail_load_block",
+    "category": "count",
+    "failure_return": "0",
+    "justification": "Zero objects/slots/kinds/hits created or processed. These APIs return nonnegative counts; sticky failure is reported separately, never encoded as a negative count.",
+    "accepted_source_line": 1900,
+    "accepted_function_sha256": "f3ac0e48b3b8cf67ce06e91d1f7d181eea508930ad66cf5c526d1f206d8a24b0"
+  },
+  {
+    "module": "rail",
+    "function": "rail_update",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 2166,
+    "accepted_function_sha256": "457cd24622de2bfb0ae5181c1d112581467de5b4037230648d455699b7adcffe"
+  },
+  {
+    "module": "rail",
+    "function": "rail_hit",
+    "category": "count",
+    "failure_return": "0",
+    "justification": "Zero objects/slots/kinds/hits created or processed. These APIs return nonnegative counts; sticky failure is reported separately, never encoded as a negative count.",
+    "accepted_source_line": 2192,
+    "accepted_function_sha256": "cebf731548d29157f0256d21dc57f7aaeee4eae74106f03c67751f76279259b4"
+  },
+  {
+    "module": "rail",
+    "function": "rail_collide_add",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 2218,
+    "accepted_function_sha256": "67bc9c7279d676c4499988d23f539baac575b6334111f68c04d1f99e05f563df"
+  },
+  {
+    "module": "rail",
+    "function": "rail_grab",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 2271,
+    "accepted_function_sha256": "606471f495f867a32b444d4a62027db3a0a51962de6e706c842592d00b1f8b04"
+  },
+  {
+    "module": "rail",
+    "function": "rail_hold",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 2291,
+    "accepted_function_sha256": "3dc927f97917bd2641c52d308629ba2e1999a6f66ed2461652264bfa098a06bc"
+  },
+  {
+    "module": "rail",
+    "function": "rail_throw",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 2325,
+    "accepted_function_sha256": "edd77eb04af497afbd31799ce648d27c0c1b6d365f4ed647e7e71753535330eb"
+  },
+  {
+    "module": "parade",
+    "function": "parade_update",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 994,
+    "accepted_function_sha256": "49322f86b5acb8bc4af8ded52f76844cfd384321f8e4f7ac47ef872bd563ca8a"
+  },
+  {
+    "module": "parade",
+    "function": "parade_spawn",
+    "category": "index",
+    "failure_return": "-1",
+    "justification": "No object/slot index. Matches existing -1 constructor/lookup failure and prevents valid index 0 from escaping.",
+    "accepted_source_line": 1023,
+    "accepted_function_sha256": "9867325ae677cd3024a1087859af583a8e9a07f51090df65b61b202dc3c09c7a"
+  },
+  {
+    "module": "parade",
+    "function": "parade_load_block",
+    "category": "count",
+    "failure_return": "0",
+    "justification": "Zero objects/slots/kinds/hits created or processed. These APIs return nonnegative counts; sticky failure is reported separately, never encoded as a negative count.",
+    "accepted_source_line": 1043,
+    "accepted_function_sha256": "f959691c06fd14fb6c75f924217e8a18a0c63e73968c983858bcde1af59afddd"
+  },
+  {
+    "module": "parade",
+    "function": "parade_hit",
+    "category": "count",
+    "failure_return": "0",
+    "justification": "Zero objects/slots/kinds/hits created or processed. These APIs return nonnegative counts; sticky failure is reported separately, never encoded as a negative count.",
+    "accepted_source_line": 1095,
+    "accepted_function_sha256": "9ae3c90075f29bac2edfc7184ba4d1a738774b6dd4b6b2c70b3603929039cb3f"
+  },
+  {
+    "module": "parade",
+    "function": "parade_grab",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 1155,
+    "accepted_function_sha256": "827ec5052982eb92c1e99e5dc3d2ff888e45c55341411c3b39018771cc5173bb"
+  },
+  {
+    "module": "parade",
+    "function": "parade_hold",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 1182,
+    "accepted_function_sha256": "c07045eaf90719772e6e0cd381510bb3b4a3303674518456763855a8df1d80f5"
+  },
+  {
+    "module": "parade",
+    "function": "parade_throw",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 1262,
+    "accepted_function_sha256": "a0bd7fe184357d6d7ba400254566e079e7e4e6e2012ce71d42b2647bd84f3fa9"
+  },
+  {
+    "module": "parade",
+    "function": "parade_collide_add",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 1323,
+    "accepted_function_sha256": "e257b43c48fae6b086406705ffa0009e24e1561f3f21105798de4c52e148df8a"
+  },
+  {
+    "module": "edible",
+    "function": "edible_load_block",
+    "category": "count",
+    "failure_return": "0",
+    "justification": "Zero objects/slots/kinds/hits created or processed. These APIs return nonnegative counts; sticky failure is reported separately, never encoded as a negative count.",
+    "accepted_source_line": 214,
+    "accepted_function_sha256": "503b75d95a2e9b61be84496bd7a666734c551d92b138e50685ae9bcc1477a055"
+  },
+  {
+    "module": "edible",
+    "function": "edible_add_building",
+    "category": "count",
+    "failure_return": "0",
+    "justification": "Zero objects/slots/kinds/hits created or processed. These APIs return nonnegative counts; sticky failure is reported separately, never encoded as a negative count.",
+    "accepted_source_line": 283,
+    "accepted_function_sha256": "bb7859398ccc73c4de55f096f5e8cf11ccfa92e3c16e6b2c2aa127ebe34b9977"
+  },
+  {
+    "module": "edible",
+    "function": "edible_add_fixed",
+    "category": "index",
+    "failure_return": "-1",
+    "justification": "No object/slot index. Matches existing -1 constructor/lookup failure and prevents valid index 0 from escaping.",
+    "accepted_source_line": 350,
+    "accepted_function_sha256": "1f3d95cadeb9f728ac4e2a7fc851e9f5d2f6bec0816068fd4896e2e9626ebce1"
+  },
+  {
+    "module": "edible",
+    "function": "edible_add_cryotube",
+    "category": "index",
+    "failure_return": "-1",
+    "justification": "No object/slot index. Matches existing -1 constructor/lookup failure and prevents valid index 0 from escaping.",
+    "accepted_source_line": 368,
+    "accepted_function_sha256": "c82f711287cc3046c9208f7f53db2e473417395d267f195d100e13783f5b4370"
+  },
+  {
+    "module": "edible",
+    "function": "edible_cell_broken",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 585,
+    "accepted_function_sha256": "ac4a02fbee60443c2998f3df463ee1a5fdf4a039dee8ee0f49af48e7aee238f8"
+  },
+  {
+    "module": "edible",
+    "function": "edible_floor_fell",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 603,
+    "accepted_function_sha256": "789097b977bf226574108ebcd4d8b327e326f9f7d21e66165114f43d7745471a"
+  },
+  {
+    "module": "edible",
+    "function": "edible_update",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 623,
+    "accepted_function_sha256": "ede6489da52f151b7a90d29a7b07e3c72db25c0496bc8aef6dd3e723dff60374"
+  },
+  {
+    "module": "edible",
+    "function": "edible_occupant",
+    "category": "occupant",
+    "failure_return": "0",
+    "justification": "EDIBLE_NONE is explicitly 0; no actor, powerup or hazard exists for this failed query.",
+    "accepted_source_line": 724,
+    "accepted_function_sha256": "692706084311730c29431218826a31491f036b62539b7bc3ab96da1990f89e25"
+  },
+  {
+    "module": "edible",
+    "function": "edible_hides",
+    "category": "boolean",
+    "failure_return": "0",
+    "justification": "False: no weapon made, no visible occupant/hide/grab, or no impact accepted. Output parameters are not consumed on false.",
+    "accepted_source_line": 734,
+    "accepted_function_sha256": "92d8f1c924e0e7db398246f2933560ca128726e8b3dd9f45f1b4bf22b2e99e8c"
+  },
+  {
+    "module": "edible",
+    "function": "edible_grab",
+    "category": "boolean",
+    "failure_return": "0",
+    "justification": "False: no weapon made, no visible occupant/hide/grab, or no impact accepted. Output parameters are not consumed on false.",
+    "accepted_source_line": 748,
+    "accepted_function_sha256": "389c7263bd0d8d5901ac2f7505a6926a552a53bb0b20ea917e3090bc41532cb2"
+  },
+  {
+    "module": "edible",
+    "function": "edible_monster_call",
+    "category": "dispatch",
+    "failure_return": "-1",
+    "justification": "Existing unhandled/error sentinel. Main edible_call immediately checks world failure before interpreting or falling back on this value.",
+    "accepted_source_line": 805,
+    "accepted_function_sha256": "e3533534bf22e753c821ce1905252155ef8cc83ea32818ccbac90e7a6b0a5973"
+  },
+  {
+    "module": "boss",
+    "function": "boss_load_block",
+    "category": "count",
+    "failure_return": "0",
+    "justification": "Zero objects/slots/kinds/hits created or processed. These APIs return nonnegative counts; sticky failure is reported separately, never encoded as a negative count.",
+    "accepted_source_line": 3728,
+    "accepted_function_sha256": "baf4fb382560eb73e98977f44dcfebf1294a65ae81c6c6796ec0179e2a416815"
+  },
+  {
+    "module": "boss",
+    "function": "boss_load_waiting",
+    "category": "count",
+    "failure_return": "0",
+    "justification": "Zero objects/slots/kinds/hits created or processed. These APIs return nonnegative counts; sticky failure is reported separately, never encoded as a negative count.",
+    "accepted_source_line": 3778,
+    "accepted_function_sha256": "81c15adeb331363ef0164a67c9b212c58c4ffc1f34b4815b11a5b2ad7b5216ba"
+  },
+  {
+    "module": "boss",
+    "function": "boss_spawn",
+    "category": "index",
+    "failure_return": "-1",
+    "justification": "No object/slot index. Matches existing -1 constructor/lookup failure and prevents valid index 0 from escaping.",
+    "accepted_source_line": 3805,
+    "accepted_function_sha256": "e382d5a09b2ad7336388ac666350d8ac7988d73cd61c99bbce7e2f3b25c8b568"
+  },
+  {
+    "module": "boss",
+    "function": "boss_update",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 3817,
+    "accepted_function_sha256": "d706ecb4b0e22a2f6b71ba303e69c6e70b9b294be31222659d07539c9347ca26"
+  },
+  {
+    "module": "boss",
+    "function": "boss_hit",
+    "category": "count",
+    "failure_return": "0",
+    "justification": "Zero objects/slots/kinds/hits created or processed. These APIs return nonnegative counts; sticky failure is reported separately, never encoded as a negative count.",
+    "accepted_source_line": 3866,
+    "accepted_function_sha256": "e9d6e32adec675fe64f3357d2d5a10f610aed097a7b738a6dc7fef5ea62be8ec"
+  },
+  {
+    "module": "game",
+    "function": "game_load_city",
+    "category": "status",
+    "failure_return": "-1",
+    "justification": "Existing city-load error is -1; 0 exclusively denotes successful load.",
+    "accepted_source_line": 1116,
+    "accepted_function_sha256": "69b557a51ea9b312856e5a942ac7508c301a269dbcfe586b67a6a606f62ecbae"
+  },
+  {
+    "module": "game",
+    "function": "game_start",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 1148,
+    "accepted_function_sha256": "59a44ebf2cdb3ea95bb4bcfb8c6e58587ddcb5270481d69d1e990a2ec5a84200"
+  },
+  {
+    "module": "game",
+    "function": "game_update",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 1166,
+    "accepted_function_sha256": "c7c54a565f6564df616ca8c4d0c506e1adbf396a63aa5bbb2b0dfae5dd3815df"
+  },
+  {
+    "module": "game",
+    "function": "game_restart_shell",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 1205,
+    "accepted_function_sha256": "68ffe1411a507e6f418865b425f9287727ed3d07e46fd5ef6b74167912a6bc77"
+  },
+  {
+    "module": "game",
+    "function": "game_block_str",
+    "category": "nullable",
+    "failure_return": "NULL",
+    "justification": "Absent borrowed string, matching existing game_block_str failure. Main stops before publishing results.",
+    "accepted_source_line": 1331,
+    "accepted_function_sha256": "952109cbb69d1be08dffa219486e19820b18cabc692461ad674fa23a2004208a"
+  },
+  {
+    "module": "streetobj",
+    "function": "streetobj_add",
+    "category": "index",
+    "failure_return": "-1",
+    "justification": "No object/slot index. Matches existing -1 constructor/lookup failure and prevents valid index 0 from escaping.",
+    "accepted_source_line": 2142,
+    "accepted_function_sha256": "e13d6bd087cc370d81a67838790ee4c6f13b1bd90ceaf4eacd8940115792ef26"
+  },
+  {
+    "module": "streetobj",
+    "function": "streetobj_add_attachment",
+    "category": "index",
+    "failure_return": "-1",
+    "justification": "No object/slot index. Matches existing -1 constructor/lookup failure and prevents valid index 0 from escaping.",
+    "accepted_source_line": 2156,
+    "accepted_function_sha256": "8a0464c53d5a56de2479610017453c860937b1cf925a1fc3b3e841814ea8b092"
+  },
+  {
+    "module": "streetobj",
+    "function": "streetobj_start",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 2170,
+    "accepted_function_sha256": "d8f792458fe1da123cd1159d27731fc3d0b3c1c76c9df3792e9cc9ca6dc280b3"
+  },
+  {
+    "module": "streetobj",
+    "function": "streetobj_update",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 2351,
+    "accepted_function_sha256": "ec3cd1c05d25458a430ec694d9957f9cd23da662b7b3b8a86651b2c3fec10214"
+  },
+  {
+    "module": "streetobj",
+    "function": "streetobj_hit",
+    "category": "count",
+    "failure_return": "0",
+    "justification": "Zero objects/slots/kinds/hits created or processed. These APIs return nonnegative counts; sticky failure is reported separately, never encoded as a negative count.",
+    "accepted_source_line": 2445,
+    "accepted_function_sha256": "257d67a5b4be754dd3fdd74f1f10a60d6b0046e4ba486177337008de9026317e"
+  },
+  {
+    "module": "streetobj",
+    "function": "streetobj_shot",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 2465,
+    "accepted_function_sha256": "6e056c09ba9400ef6f5579ed69c4e704eba9e8c3cd4daff9c4d7bbb4f5b9b55d"
+  },
+  {
+    "module": "streetobj",
+    "function": "streetobj_touch",
+    "category": "count",
+    "failure_return": "0",
+    "justification": "Zero objects/slots/kinds/hits created or processed. These APIs return nonnegative counts; sticky failure is reported separately, never encoded as a negative count.",
+    "accepted_source_line": 2473,
+    "accepted_function_sha256": "e8b85241bb9c4208bc15aae36f6e5b82b9f925c8781ca1b88e4e60b1a839f5b0"
+  },
+  {
+    "module": "streetobj",
+    "function": "streetobj_take_impact",
+    "category": "boolean",
+    "failure_return": "0",
+    "justification": "False: no weapon made, no visible occupant/hide/grab, or no impact accepted. Output parameters are not consumed on false.",
+    "accepted_source_line": 2489,
+    "accepted_function_sha256": "e65ebe47bb8ac40e5f11b279aa4082980d10d81af94fdd460a6e2e8675172198"
+  },
+  {
+    "module": "streetobj",
+    "function": "streetobj_impact",
+    "category": "count",
+    "failure_return": "0",
+    "justification": "Zero objects/slots/kinds/hits created or processed. These APIs return nonnegative counts; sticky failure is reported separately, never encoded as a negative count.",
+    "accepted_source_line": 2545,
+    "accepted_function_sha256": "8d8f8bfc7b0966255b8f940605b9c19a3a8d5c4a8ef80ebc7e2fbed523670b29"
+  },
+  {
+    "module": "streetobj",
+    "function": "streetobj_force_damage",
+    "category": "index",
+    "failure_return": "-1",
+    "justification": "No object/slot index. Matches existing -1 constructor/lookup failure and prevents valid index 0 from escaping.",
+    "accepted_source_line": 2559,
+    "accepted_function_sha256": "52b596c19001285c07a91575401192ab023dd0d1fbbad9311c370c07b2b0db11"
+  },
+  {
+    "module": "streetobj",
+    "function": "streetobj_pickup",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 2585,
+    "accepted_function_sha256": "0fe5e4492f55c0ad38ab9cdf8172f24bfce5bc3cc549519f2a231d87a0b8cfb7"
+  },
+  {
+    "module": "streetobj",
+    "function": "streetobj_throw",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 2597,
+    "accepted_function_sha256": "c64f59a392a8de65384c029c7e0124475a406120a04b32a05fdf6ada384b110a"
+  },
+  {
+    "module": "streetobj",
+    "function": "streetobj_hit_ground",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 2606,
+    "accepted_function_sha256": "25bb5030da65f613e78a404f7a43d5f643b6d3ec864e573df817cbe6d6705564"
+  },
+  {
+    "module": "streetobj",
+    "function": "streetobj_grab",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 2636,
+    "accepted_function_sha256": "075bbd38c3a984abc2778552cfde521f518826100c7cfda70cb8e51cb6a9afd7"
+  },
+  {
+    "module": "streetobj",
+    "function": "streetobj_hold",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 2661,
+    "accepted_function_sha256": "5edd13f4bdc4c9f5e0fe9163aecac58cce363a3ac37dc5c227c717dcf256e59c"
+  },
+  {
+    "module": "streetobj",
+    "function": "streetobj_fly",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 2700,
+    "accepted_function_sha256": "36894cee8665d453d9acda371d22bb0f5842fe8b6193c3d1a478447d06c46a9f"
+  },
+  {
+    "module": "people",
+    "function": "people_add",
+    "category": "index",
+    "failure_return": "-1",
+    "justification": "No object/slot index. Matches existing -1 constructor/lookup failure and prevents valid index 0 from escaping.",
+    "accepted_source_line": 1319,
+    "accepted_function_sha256": "01b6678b9120a193298dfa7c2dcf78024e51a1071e763f9a04dacf5cbf9f4029"
+  },
+  {
+    "module": "people",
+    "function": "people_add_window",
+    "category": "index",
+    "failure_return": "-1",
+    "justification": "No object/slot index. Matches existing -1 constructor/lookup failure and prevents valid index 0 from escaping.",
+    "accepted_source_line": 1359,
+    "accepted_function_sha256": "4cf94361ef775c3b7f51799431d3516e4896a704942ef2a0337b2f1b5318ddcd"
+  },
+  {
+    "module": "people",
+    "function": "people_crowd",
+    "category": "count",
+    "failure_return": "0",
+    "justification": "Zero objects/slots/kinds/hits created or processed. These APIs return nonnegative counts; sticky failure is reported separately, never encoded as a negative count.",
+    "accepted_source_line": 1392,
+    "accepted_function_sha256": "c9cc5417dce377672aad013c03edc5126eefe4ba6356e9307ccaa5ade4e1d362"
+  },
+  {
+    "module": "people",
+    "function": "people_add_swarm",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 1655,
+    "accepted_function_sha256": "9e08e53e7adb67d0498a93d4c2f5848f93469d7245b569775bb895c4859c6491"
+  },
+  {
+    "module": "people",
+    "function": "people_hut_hit",
+    "category": "stats",
+    "failure_return": "(PeopleEaten){ 0 }",
+    "justification": "No health, energy, points, priest effect, fart or borrowed effect name; caller checks failure before applying returned statistics.",
+    "accepted_source_line": 1690,
+    "accepted_function_sha256": "f310127e7890abc60223ae6adad542678cb71adb9f819c49a66f8af9d3ce41c1"
+  },
+  {
+    "module": "people",
+    "function": "people_add_streaker",
+    "category": "index",
+    "failure_return": "-1",
+    "justification": "No object/slot index. Matches existing -1 constructor/lookup failure and prevents valid index 0 from escaping.",
+    "accepted_source_line": 1718,
+    "accepted_function_sha256": "94bbb63231ac09cfe0b187c13282cdf3d757f912dbd6f5210643730fe464f710"
+  },
+  {
+    "module": "people",
+    "function": "people_remove",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 1855,
+    "accepted_function_sha256": "80345b2f86e038f11d1b5708e84a93e6dbf2a5a809d40755cd7a1ed24060d98b"
+  },
+  {
+    "module": "people",
+    "function": "people_collide_add",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 1879,
+    "accepted_function_sha256": "72f8033f13e3874984ba4bc7a94805d62ce53e0249e909824ca5684bcc2d3816"
+  },
+  {
+    "module": "people",
+    "function": "people_update",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 1905,
+    "accepted_function_sha256": "59e8672bfd298c06896eb7ecf99cb080653cec03eecefa3999b0c781ca447211"
+  },
+  {
+    "module": "people",
+    "function": "people_window_fall",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 1972,
+    "accepted_function_sha256": "f857b170834a56170c282efac653f9a4b55adc595542ab9dd1a88c8712901e8e"
+  },
+  {
+    "module": "people",
+    "function": "people_grab",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 2063,
+    "accepted_function_sha256": "a41e6ce4849f1ae0bbac8a3c90afba9ea48f46f904f6eef6e8b3a385e71f7bc3"
+  },
+  {
+    "module": "people",
+    "function": "people_hold",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 2092,
+    "accepted_function_sha256": "50bee92104e9be9bacbffe1d0ca3d90066d7217ffb6ecbef12ea4de05414e60f"
+  },
+  {
+    "module": "people",
+    "function": "people_eat",
+    "category": "stats",
+    "failure_return": "(PeopleEaten){ 0 }",
+    "justification": "No health, energy, points, priest effect, fart or borrowed effect name; caller checks failure before applying returned statistics.",
+    "accepted_source_line": 2151,
+    "accepted_function_sha256": "04787f5348112fc243e02531b319ba845c430969f95905eb4c0be50d2afd0487"
+  },
+  {
+    "module": "people",
+    "function": "people_throw",
+    "category": "void",
+    "failure_return": "void",
+    "justification": "No return value. Refuse the operation before changing state; existing owners remain owned until the normal teardown. Destructors are not guarded.",
+    "accepted_source_line": 2201,
+    "accepted_function_sha256": "ac0e397286d8f8f42fa0a16b64a2a6e638a9741803f34aa6aa465310160d796e"
+  },
+  {
+    "module": "people",
+    "function": "people_hit",
+    "category": "count",
+    "failure_return": "0",
+    "justification": "Zero objects/slots/kinds/hits created or processed. These APIs return nonnegative counts; sticky failure is reported separately, never encoded as a negative count.",
+    "accepted_source_line": 2218,
+    "accepted_function_sha256": "c99c641ab4369cbcb084c74937328bb31af83fa1a35b49a128075fdb76cdfe89"
+  }
+]

@@ -474,24 +474,44 @@ static void enter(MoveRunner *r, int state, float time)
     r->state = state;
     r->time = time;
     r->chosen = -1;
-    free(r->in_window);
-    free(r->sw_window);
-    r->in_window = calloc(s->ntrans ? s->ntrans : 1, 1);
-    r->sw_window = calloc(s->ntrans ? s->ntrans : 1, 1);
+    /* moves_start reserved the maximum for this immutable graph. */
+    if (s->ntrans > 0) {
+        memset(r->in_window, 0, (size_t)s->ntrans);
+        memset(r->sw_window, 0, (size_t)s->ntrans);
+    }
 }
 
-void moves_start(MoveRunner *r, const MoveGraph *g, int state)
+int moves_start(MoveRunner *r, const MoveGraph *g, int state)
 {
+    /* Same ownership contract: stop an active runner before starting/replacing it.
+     * Failure leaves an empty, stoppable runner; the caller must report/unwind it. */
     memset(r, 0, sizeof *r);
+    if (!g || g->n <= 0 || !g->states)
+        return -1;
+    size_t capacity = 0;
+    for (int k = 0; k < g->n; k++) {
+        int n = g->states[k].ntrans;
+        if (n < 0 || (size_t)n > SIZE_MAX / 2)
+            return -1;
+        if ((size_t)n > capacity)
+            capacity = (size_t)n;
+    }
+    if (capacity) {
+        uint8_t *windows = calloc(capacity, 2);
+        if (!windows)
+            return -1;
+        r->in_window = windows;
+        r->sw_window = windows + capacity;
+    }
     r->g = g;
     r->from = r->via = -1;
     enter(r, state >= 0 && state < g->n ? state : 0, 0);
+    return 0;
 }
 
 void moves_stop(MoveRunner *r)
 {
-    free(r->in_window);
-    free(r->sw_window);
+    free(r->in_window); /* sw_window aliases the same reservation. */
     memset(r, 0, sizeof *r);
 }
 

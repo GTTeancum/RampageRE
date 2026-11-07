@@ -1,0 +1,15 @@
+RampageRE is GPL-3.0. Corresponding source for the prepared executable is
+identified by BUILD-INFO.json and source-snapshot.json in the repository.
+https://github.com/GTTeancum/RampageRE
+
+Xbox dependencies:
+- nxdk: https://github.com/XboxDev/nxdk/tree/004fefbfe8fd93a5ea8ee9a95ff187b0f58ec8ed
+  Individual files use MIT, CC0, NCSA and other licenses; see upstream SPDX
+  headers and LICENSES. This package does not include NVIDIA Cg tools.
+- nxdk-gles11: https://github.com/Ryzee119/nxdk-gles11/tree/5a726e61f1af5c3e9682af2c833c9703cab5022e
+- gl4es: https://github.com/ptitSeb/gl4es/tree/81547d986798e876de8b434193920b606a72363f
+- SDL2: zlib license, included.
+
+The modifications to these dependencies are in platform/xbox/patches of the
+source repository. These libraries do not include the original game's data.
+Additional notices for the Windows preparation tool accompany its source.

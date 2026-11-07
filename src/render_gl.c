@@ -264,6 +264,7 @@ struct Renderer {
     MeshBound *bound; uint32_t nbound;               /* by Scene.meshes index, made at its first draw */
     MeshBuf *mbuf; uint32_t nmbuf;                   /* by Scene.meshes index, made at its first draw (part_buffers) */
     float *stage; size_t nstage;                     /* a part's arrays laid out for its buffer */
+    float *water_uv; size_t nwater_uv;              /* shared water draw scratch; renderer-owned high-water capacity */
 };
 
 /* ---- texture settings (port extra, docs/NATIVE.md "Graphics settings") */
@@ -509,6 +510,11 @@ static const PartBuf *part_buffers(Renderer *r, const SceneMesh *sm, uint32_t i)
         if (!pb->vbo) {
             GLuint id[2] = { 0, 0 };
             g_buf.gen(2, id);
+            if (!id[0] || !id[1]) {
+                if (id[0] || id[1])
+                    g_buf.del(2, id);
+                return NULL;            /* client arrays this draw; never publish an incomplete pair */
+            }
             pb->vbo = id[0];
             pb->ibo = id[1];
         }
@@ -543,6 +549,7 @@ void rnd_free(Renderer *r)
     free(r->held);
     free(r->bound);
     free(r->stage);
+    free(r->water_uv);
     free(r);
 }
 
@@ -608,11 +615,14 @@ static BundleTex *bundle_tex(Renderer *r, const Bundle *b)
             return &r->cache[k];
     if (r->ncache == 16)
         return NULL;
-    BundleTex *bt = &r->cache[r->ncache++];
+    BundleTex *bt = &r->cache[r->ncache];
     memset(bt, 0, sizeof *bt);
     bt->b = b;
     bt->n = b->nnames;
     bt->tex = calloc(bt->n ? bt->n : 1, sizeof *bt->tex);
+    if (!bt->tex)
+        return NULL;
+    r->ncache++;                         /* publish only a usable table; allocation failure can retry */
     return bt;
 }
 
@@ -658,9 +668,19 @@ static GLuint texture_at(Renderer *r, const Bundle *b, uint32_t name, int zero_o
         uint8_t *rgba;
         int w, h;
         slots[name] = ~0u;
-        if (tex_decode(b, bdp_entry_of(b, name, ET_TEXTURE), &rgba, &w, &h) == 0) {
-            GLuint id;
+        int decoded = tex_decode(b, bdp_entry_of(b, name, ET_TEXTURE), &rgba, &w, &h);
+        if (decoded == TEX_DECODE_NOMEM) {
+            slots[name] = 0;             /* missing/invalid images stay negative-cached; OOM can retry */
+            return 0;
+        }
+        if (decoded == TEX_DECODE_OK) {
+            GLuint id = 0;
             glGenTextures(1, &id);
+            if (!id) {
+                free(rgba);
+                slots[name] = 0;         /* no GL object: retry rather than cache a failed upload */
+                return 0;
+            }
             glBindTexture(GL_TEXTURE_2D, id);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -757,8 +777,12 @@ static GLuint region_texture(Renderer *r, const Bundle *b, uint32_t name, const 
         rt->scale[0] = rt->scale[1] = 1;
         uint8_t *rgba;
         int w, h, rc[4];
-        if (tex_decode(b, bdp_entry_of(b, name, ET_TEXTURE), &rgba, &w, &h) != 0)
+        int decoded = tex_decode(b, bdp_entry_of(b, name, ET_TEXTURE), &rgba, &w, &h);
+        if (decoded != TEX_DECODE_OK) {
+            if (decoded == TEX_DECODE_NOMEM)
+                bt->nreg--;             /* do not negative-cache a transient decoder allocation failure */
             return 0;
+        }
         if (region_rect(reg, w, h, rc)) {
             uint64_t hash = tp_active() ? tp_hash('T', rgba, (uint32_t)w * (uint32_t)h * 4, w, h) : 0;
             int pw = w, ph = h;
@@ -771,8 +795,15 @@ static GLuint region_texture(Renderer *r, const Bundle *b, uint32_t name, const 
             if (cut) {
                 for (int y = 0; y < ch; y++)
                     memcpy(cut + (size_t)y * cw * 4, src + ((size_t)(y0 + y) * pw + x0) * 4, (size_t)cw * 4);
-                GLuint id;
+                GLuint id = 0;
                 glGenTextures(1, &id);
+                if (!id) {
+                    free(cut);
+                    free(pack);
+                    free(rgba);
+                    bt->nreg--;         /* keep earlier entries, retry this tile on a later draw */
+                    return 0;
+                }
                 glBindTexture(GL_TEXTURE_2D, id);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -792,6 +823,11 @@ static GLuint region_texture(Renderer *r, const Bundle *b, uint32_t name, const 
                 rt->scale[0] = (float)w / rc[2];
                 rt->scale[1] = (float)h / rc[3];
                 free(cut);
+            } else {
+                free(pack);
+                free(rgba);
+                bt->nreg--;             /* scratch OOM is not a permanent whole-texture fallback */
+                return 0;
             }
             if (hash) {                              /* --dumptex: the whole texture, as texture() writes it */
                 tp_scope(b->scope);
@@ -1075,7 +1111,11 @@ static void draw_part(Renderer *r, const SceneMesh *sm, const Skin *skin, uint32
         glDisable(GL_TEXTURE_2D);
     }
     int scroll = s->cloud_material && sm->b == s->city && p->material == s->cloud_material;
-    float drift[2] = { (float)fmod(s->cloud_rate[0] * t, 1.0), (float)fmod(s->cloud_rate[1] * t, 1.0) };
+    float drift[2] = { 0, 0 };
+    if (scroll) {
+        drift[0] = (float)fmod(s->cloud_rate[0] * t, 1.0);
+        drift[1] = (float)fmod(s->cloud_rate[1] * t, 1.0);
+    }
     if (scroll || rid) {                                 /* the drifting cloud band (AnimatingSkyData); the tile's
                                                           * scale, after the drift as the GS wraps the UVs it is sent */
         glMatrixMode(GL_TEXTURE);
@@ -1248,8 +1288,7 @@ static void draw_part(Renderer *r, const SceneMesh *sm, const Skin *skin, uint32
  * 0x50002), texture flags 0x11 (bit 0: CLAMP_1 REPEAT on S and T, 0x26AA20) */
 static void draw_water(Renderer *r, const Scene *s, const Camera *cam)
 {
-    static float *uv;
-    static int nuv;
+    float *uv = r->water_uv;
     glDisable(GL_LIGHTING);
     glDisable(GL_CULL_FACE);
     glDisable(GL_BLEND);
@@ -1263,9 +1302,14 @@ static void draw_water(Renderer *r, const Scene *s, const Camera *cam)
     for (int k = 0; k < s->nwater; k++) {
         const Water *w = s->water[k];
         int nv = water_vertex_count(w), ntris = 0;
-        if (nv > nuv) {
-            uv = realloc(uv, sizeof(float) * 2 * (size_t)nv);
-            nuv = nv;
+        if (nv <= 0 || (size_t)nv > SIZE_MAX / (2 * sizeof(float)))
+            continue;
+        if ((size_t)nv > r->nwater_uv) {
+            float *grown = realloc(r->water_uv, sizeof(float) * 2 * (size_t)nv);
+            if (!grown)
+                continue;
+            r->water_uv = uv = grown;
+            r->nwater_uv = (size_t)nv;
         }
         water_env_uv(w, cam->pos, uv);
         int name = water_texture(w) ? bdp_find_name(s->city, water_texture(w)) : -1;
@@ -1476,6 +1520,11 @@ static void draw_shadows(Renderer *r, int pass)
 {
     const Scene *s = r->scene;
     const ShadowList *l = s->shadows;
+    int first = 0;
+    while (first < l->nb && l->b[first].pass != pass)
+        first++;
+    if (first == l->nb)
+        return;                                      /* no draws: no state stack or its temporary allocations */
     glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_POLYGON_BIT | GL_CURRENT_BIT |
                  GL_TEXTURE_BIT | GL_LIGHTING_BIT);
     glPushClientAttrib(GL_CLIENT_VERTEX_ARRAY_BIT);
@@ -1489,7 +1538,7 @@ static void draw_shadows(Renderer *r, int pass)
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDepthMask(GL_FALSE);
     glShadeModel(GL_SMOOTH);
-    for (int i = 0; i < l->nb; i++) {
+    for (int i = first; i < l->nb; i++) {
         const ShadowBatch *b = &l->b[i];
         if (b->pass != pass)
             continue;

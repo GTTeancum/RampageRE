@@ -3,6 +3,7 @@
  * index of the palette at 0x20. Pixels (mip 0 first) are the entry's data2. Palettes (type 13): 256 RGBA in GS CSM1 order,
  * alpha 0x80 = opaque; "_Alpha8" and "_Intensity8" are the engine's own. The Wii's (Bundle.wii) are GX: gx_decode. */
 #include <stdlib.h>
+#include <limits.h>
 #include <string.h>
 #include "plat.h"
 #include "data.h"
@@ -104,11 +105,13 @@ static int gx_decode(const BdpEntry *e, uint8_t **rgba, int *w_out, int *h_out)
         w <= 0 || h <= 0)
         return -1;
     int tiles_x = (w + tw - 1) / tw, tiles_y = (h + th - 1) / th, tile_bytes = tw * th * bits / 8;
-    if (e->size2 < (uint32_t)(tiles_x * tiles_y * tile_bytes))
-        return -1;
-    uint8_t *out = malloc((size_t)w * h * 4), tile[8 * 8 * 4];
+    size_t pixels = (size_t)w * h;
+    if (pixels > SIZE_MAX / 4 ||
+        (size_t)tiles_x * tiles_y > e->size2 / (size_t)tile_bytes)
+        return TEX_DECODE_ERROR;
+    uint8_t *out = malloc(pixels * 4), tile[8 * 8 * 4];
     if (!out)
-        return -1;
+        return TEX_DECODE_NOMEM;
     const uint8_t *p = e->data2;
     for (int ty = 0; ty < tiles_y; ty++)
         for (int tx = 0; tx < tiles_x; tx++, p += tile_bytes) {
@@ -132,11 +135,16 @@ int tex_decode(const Bundle *b, const BdpEntry *e, uint8_t **rgba, int *w_out, i
         return -1;
     const uint8_t *d = e->data, *px = e->data2;
     int psm = d[4], flags = d[7], w = rd16(d + 8), h = rd16(d + 10);
-    uint8_t *out = malloc((size_t)w * h * 4);
+    size_t pixels = (size_t)w * h;
+    /* The swizzle offsets and pixel loops use int; byte counts must also fit size_t. */
+    if (w <= 0 || h <= 0 || pixels > INT_MAX / 4 || pixels > SIZE_MAX / 4 ||
+        (psm == 0x13 ? pixels > e->size2 : psm == 0x00 ? pixels > e->size2 / 4 :
+         psm == 0x02 ? pixels > e->size2 / 2 : 1))
+        return TEX_DECODE_ERROR;
+    uint8_t *out = malloc(pixels * 4);
     if (!out)
-        return -1;
+        return TEX_DECODE_NOMEM;
     if (psm == 0x13) {
-        if (e->size2 < (uint32_t)(w * h)) { free(out); return -1; }
         uint8_t pal[256][4];
         uint32_t pal_name = rd32(d + 0x20);
         const char *pn = bdp_name(b, pal_name);
@@ -156,7 +164,11 @@ int tex_decode(const Bundle *b, const BdpEntry *e, uint8_t **rgba, int *w_out, i
             free(out);
             return -1;
         }
-        uint8_t *index = malloc((size_t)w * h);
+        uint8_t *index = malloc(pixels);
+        if (!index) {
+            free(out);
+            return TEX_DECODE_NOMEM;
+        }
         if (flags & 0x40)
             unswizzle8(px, index, w, h);
         else
@@ -165,13 +177,11 @@ int tex_decode(const Bundle *b, const BdpEntry *e, uint8_t **rgba, int *w_out, i
             memcpy(out + 4 * i, pal[index[i]], 4);
         free(index);
     } else if (psm == 0x00) {
-        if (e->size2 < (uint32_t)(w * h * 4)) { free(out); return -1; }
         for (int i = 0; i < w * h; i++) {
             memcpy(out + 4 * i, px + 4 * i, 3);
             out[4 * i + 3] = alpha2(px[4 * i + 3]);
         }
     } else if (psm == 0x02) {
-        if (e->size2 < (uint32_t)(w * h * 2)) { free(out); return -1; }
         for (int i = 0; i < w * h; i++) {
             uint16_t p = rd16(px + 2 * i);
             out[4 * i] = (uint8_t)((p & 31) << 3);

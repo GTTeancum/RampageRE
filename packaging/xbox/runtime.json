@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "file": "default.xbe",
+  "sha256": "e7208769c1ebac39ba34e56fd89021ef8040fd982180651d0b347e436853e1a1",
+  "bytes": 3518464,
+  "source_snapshot": "source-snapshot.json",
+  "source_snapshot_sha256": "5b9ec6b3988f602f8c8399e1e778cf91d35e38f934efcb99ac70bde1498c3bee",
+  "build_type": "ordinary non-fixture Xbox executable, exact validated build retained",
+  "cpu": "original Xbox x86",
+  "game_source_units": 52,
+  "game_objects_reused": 0,
+  "original_game_assets_embedded": false,
+  "nxdk_commit": "004fefbfe8fd93a5ea8ee9a95ff187b0f58ec8ed",
+  "gles_commit": "5a726e61f1af5c3e9682af2c833c9703cab5022e",
+  "gl4es_commit": "81547d986798e876de8b434193920b606a72363f",
+  "compiler": "LLVM 18.1.8",
+  "physical_xbox_tested": false,
+  "notes": "This artifact is packaged unchanged. Actions builds the Windows asset-preparation tool, not this prevalidated XBE. See platform/xbox for dependency patches and reproduction limits."
+}

@@ -83,7 +83,8 @@ typedef struct {
 } ClothMeshPart;
 int cloth_mesh_parts(const uint8_t *mesh_data, uint32_t size);   /* parts of a type 0 mesh entry, -1 if bad */
 /* mesh part `part` of the model's type 0 mesh entry (its data and data2) for cloth part `part`: 0 = ok, -1 if it
- * does not parse or does not fit the cloth. Free with cloth_mesh_part_free */
+ * does not parse or does not fit the cloth, -2 on allocation failure. Both failures
+ * clear out; only -1 permits a mapping fallback. Free with cloth_mesh_part_free */
 int cloth_mesh_part(const Cloth *c, int part, const uint8_t *mesh_data, uint32_t size, const uint8_t *data2,
                     uint32_t size2, ClothMeshPart *out);
 void cloth_mesh_part_free(ClothMeshPart *p);

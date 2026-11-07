@@ -273,7 +273,13 @@ static Sample *wii_sample(Bank *b, int idx, Sample *s)
         coef[k] = (int16_t)rd16be(e + 16 + 2 * k);
     if (start == 0xFFFFFFFFu || ((uint64_t)start + count + 15) / 16 * 8 > b->samp_size)
         return NULL;
-    if (count > INT32_MAX || sample_alloc(s, sizeof(int16_t) * (size_t)count) != 0)
+    /* Nibble addresses include each frame's two header nibbles, which the
+     * decoder below skips. Allocate only the PCM payload, including partial
+     * first/last frames; keep 64-bit endpoints for start + count. */
+    uint64_t end = (uint64_t)start + count;
+    uint64_t before = (uint64_t)start / 16 * 14 + (start % 16 > 2 ? start % 16 - 2 : 0);
+    uint64_t after = end / 16 * 14 + (end % 16 > 2 ? end % 16 - 2 : 0);
+    if (count > INT32_MAX || sample_alloc(s, sizeof(int16_t) * (size_t)(after - before)) != 0)
         return NULL;
     uint8_t chunk[AUDIO_READ_BYTES];
     uint32_t chunk_at = UINT32_MAX, chunk_size = 0;

@@ -58,7 +58,9 @@ typedef struct {
      * u32 GX format, u16 width, height, mips: tex_decode reads their GX pixels) */
     int wii;
 } Bundle;
-int bdp_load(Bundle *b, uint8_t *file, uint32_t size);   /* takes the buffer; 0 = ok */
+/* 0 takes ownership of file. On failure b is cleared and the caller still owns
+ * file; Wii conversion may have modified its bytes, so discard rather than retry. */
+int bdp_load(Bundle *b, uint8_t *file, uint32_t size);
 void bdp_free(Bundle *b);
 const char *bdp_name(const Bundle *b, uint32_t i);        /* name i without its leading 0x13 */
 const BdpEntry *bdp_entry(const Bundle *b, uint32_t name_index);   /* the entry with that name, NULL if none */
@@ -68,7 +70,10 @@ const BdpEntry *bdp_entry_of(const Bundle *b, uint32_t name_index, int type);
 int bdp_find_name(const Bundle *b, const char *name);    /* name index of a name (case-insensitive), -1 if absent */
 
 /* ---- textures (type 9) to RGBA8, mip level 0 */
-int tex_decode(const Bundle *b, const BdpEntry *e, uint8_t **rgba, int *w, int *h);   /* 0 = ok; *rgba malloc'd */
+/* Success transfers one malloc'd RGBA buffer and writes dimensions. Failure leaves all outputs unchanged.
+ * Only TEX_DECODE_NOMEM is transient; absent, unsupported or invalid data returns TEX_DECODE_ERROR. */
+enum { TEX_DECODE_OK = 0, TEX_DECODE_ERROR = -1, TEX_DECODE_NOMEM = -2 };
+int tex_decode(const Bundle *b, const BdpEntry *e, uint8_t **rgba, int *w, int *h);
 
 /* ---- meshes (types 0 and 17): one strip per part, triangulated */
 typedef struct {
@@ -91,7 +96,9 @@ typedef struct {
     uint32_t lead;                                       /* the part drawn first (0: in order); a facade's glass, so
                                                           * the sheet over it does not hide it by its depth */
 } Mesh;
-int mesh_read(const BdpEntry *e, Mesh *m);               /* 0 = ok */
+/* 0 = accepted parts (invalid sections are skipped); allocation failure returns
+ * -1 with an empty Mesh that is safe to pass to mesh_free. */
+int mesh_read(const BdpEntry *e, Mesh *m);
 void mesh_free(Mesh *m);
 uint32_t material_texture(const Bundle *b, uint32_t material);   /* texture name index of a part's material, 0 = none */
 /* a material's flags (+0x4): MAT_TWO_SIDED on flags, girders, trees, cloth, teeth (65 of the 1,893 materials), 2 on
@@ -163,6 +170,7 @@ typedef struct {
     int mirror;                                          /* its other side (left <-> right), itself in the middle */
 } TreeNode;
 typedef struct { TreeNode *nodes; uint32_t n; } Tree;
+/* 0 = ok; allocation failure returns -1 with a zeroed, free-safe Tree. */
 int tree_read(const Bundle *b, const BdpEntry *tree, const BdpEntry *rawanim, Tree *t);   /* rawanim may be NULL */
 void tree_free(Tree *t);
 
@@ -173,15 +181,18 @@ typedef struct {
     float duration;                                      /* seconds */
     const uint8_t **trans, **rot;                        /* kind 2: per bone its tracks; kind 1: trans = per bone its record */
 } Clip;
-int clip_read(const BdpEntry *e, Clip *c);               /* 0 = ok */
+int clip_read(const BdpEntry *e, Clip *c);               /* 0 = ok; -1 clears and frees partial output */
 void clip_free(Clip *c);
 int clip_moves(const Clip *c);                           /* RawAnims mostly hold one pose; 1 = this one moves */
+/* Batch callers reuse phase only for the same clip/time; clip_phase requires valid duration. */
+double clip_phase(const Clip *c, double seconds);
+int clip_pose_phase(const Clip *c, double phase, uint32_t bone, float t[3], float q[4]);
 int clip_pose(const Clip *c, double seconds, uint32_t bone, float t[3], float q[4]);   /* looping; 0 = bone not in it */
 /* the shortest-way slerp from a to b at f (0: a, 1: b), normalised; nearly equal ones lerp */
 void quat_slerp(const float a[4], const float b[4], float f, float out[4]);
 
 /* ---- cloth (type 25): the particles of a monster's hair, each held by up to four bones (docs/FORMAT_BDP.md "Cloth") */
 typedef struct { float pos[3]; uint16_t bones[4]; float weights[4]; int nbones; } ClothParticle;
-uint32_t cloth_particles(const BdpEntry *e, ClothParticle **out);   /* malloc'd; returns the count */
+uint32_t cloth_particles(const BdpEntry *e, ClothParticle **out);   /* allocated even for zero count; failure: 0 and *out NULL */
 
 #endif

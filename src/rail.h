@@ -44,6 +44,8 @@ typedef struct {
     int (*shape_box)(void *ctx, const char *shape, float min[3], float max[3]);
     int (*shape_sphere)(void *ctx, const char *shape, float centre[3], float *radius);   /* the sphere the model keeps (0x184CB0); nonzero = found */
     void *ctx;
+    /* Sticky owner failure: once set, callbacks and event publication stop until teardown. */
+    int (*failed)(void *ctx);
 } RailHost;
 
 /* a building as the scripts see it: its box in the world, Building.isDestroyed (+0x14C = 0: BUILDING_GONE, only the

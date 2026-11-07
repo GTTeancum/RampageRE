@@ -14,26 +14,29 @@
 
 int vol_open(Vol *v, const char *path)
 {
-    uint8_t head[16];
+    uint8_t head[16], *index = NULL;
+    int result = VOL_UNREADABLE;
     memset(v, 0, sizeof *v);
     v->f = fopen(path, "rb");
     if (!v->f || fread(head, 1, 16, v->f) != 16)
-        return VOL_UNREADABLE;
+        goto failed;
     if (memcmp(head, "PVOL", 4) != 0) {                 /* a disc image: its RAMPAGE.VOL */
         uint32_t size;
         if (!iso_is(v->f))
-            return VOL_UNREADABLE;
+            goto failed;
         if (!iso_find(v->f, "RAMPAGE.VOL", &v->base, &size) || size < 16 || _fseeki64(v->f, v->base, SEEK_SET) != 0 ||
-            fread(head, 1, 16, v->f) != 16 || memcmp(head, "PVOL", 4) != 0)
-            return VOL_NOT_IN_IMAGE;
+            fread(head, 1, 16, v->f) != 16 || memcmp(head, "PVOL", 4) != 0) {
+            result = VOL_NOT_IN_IMAGE;
+            goto failed;
+        }
     }
     uint32_t count = rd32(head + 8), names_size = rd32(head + 12);
-    uint8_t *index = malloc(12u * count);
+    index = malloc(12u * count);
     v->names = malloc(names_size + 1);
     v->files = calloc(count, sizeof *v->files);
     if (!index || !v->names || !v->files || fread(index, 12, count, v->f) != count ||
         fread(v->names, 1, names_size, v->f) != names_size)
-        return VOL_UNREADABLE;
+        goto failed;
     v->names[names_size] = 0;
     for (uint32_t i = 0; i < count; i++) {
         uint32_t at = rd32((uint8_t *)v->names + 4 + 4 * i);
@@ -44,6 +47,14 @@ int vol_open(Vol *v, const char *path)
     v->count = count;
     free(index);
     return 0;
+failed:
+    free(index);
+    free(v->names);
+    free(v->files);
+    if (v->f)
+        fclose(v->f);
+    memset(v, 0, sizeof *v);
+    return result;
 }
 
 static const VolFile *find_in(const VolFile *files, uint32_t n, const char *name)
@@ -129,10 +140,16 @@ uint8_t *vol_read_wii(const Vol *v, const char *name, uint32_t *size)
 static void add_file(Vol *v, uint32_t *cap, const char *dir, const char *name, uint32_t size, uint32_t offset, char sep)
 {
     if (v->nwii == *cap) {
-        VolFile *grown = realloc(v->wii, sizeof *v->wii * (*cap = *cap ? *cap * 2 : 256));
+        if (*cap > UINT32_MAX / 2)
+            return;
+        uint32_t next = *cap ? *cap * 2 : 256;
+        if ((uint64_t)next * sizeof *v->wii > SIZE_MAX)
+            return;
+        VolFile *grown = realloc(v->wii, sizeof *v->wii * next);
         if (!grown)
             return;
         v->wii = grown;
+        *cap = next;
     }
     size_t dn = strlen(dir), nn = strlen(name);
     char *path = malloc(dn + 1 + nn + 1);

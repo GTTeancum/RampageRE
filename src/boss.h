@@ -110,6 +110,8 @@ typedef struct {
      * (a continue) goes on counting; the host's, NULL none */
     int *generators;
     void *ctx;
+    /* Sticky owner failure: once set, callbacks and event publication stop until teardown. */
+    int (*failed)(void *ctx);
 } BossHost;
 
 /* ---- what the bosses see of a monster, this frame (index = its slot, 0 .. 3) */

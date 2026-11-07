@@ -37,3 +37,12 @@ android/local.properties
 *.keystore
 *.jks
 *.key
+
+# Xbox user setup package builds (never add prepared retail data).
+/tools/xbox_prep/build/
+/tools/xbox_prep/dist/
+/tools/xbox_prep/*.spec
+/tools/xbox_prep/disc_reader/target/
+/dist/
+/Rampage Xbox/
+._rampage-prep-*/

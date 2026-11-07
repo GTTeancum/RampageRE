@@ -1,0 +1,18 @@
+# Army hold array regression
+
+From the repository root after applying the reviewed fix:
+
+    tests/army_hold_array/run.sh
+    tests/army_hold_array/run.sh --sanitize
+
+Before applying it, test the exact pending flat-array change privately:
+
+    REPO_ROOT=/absolute/path/to/repo tests/army_hold_array/run.sh --candidate --sanitize
+
+The default run is normal-only; `--sanitize` runs both normal and sanitized configurations. Repository discovery uses this script’s location two levels below the repository root; override with `REPO_ROOT`. `TMPDIR` defaults to `.test-results` within that repository, never system `/tmp`.
+
+Requirements: Python 3, GCC-compatible C11 compiler (`CC`, default `cc`), libm, ASan/UBSan support. Uses GCC-specific bounds-strict and warning options. Set TMPDIR to a writable directory with space. Each invocation creates and retains a fresh directory with input and harness hashes, generated source, compiler version, binaries, logs and optimized assembly; compiler temporary files use that directory too. No source edits, network, emulator, cleanup or full build. Default mode fails closed if the reviewed flat-array block is absent, so a future regression to the original first-row call cannot silently pass.
+
+The extractor reads current army.c, army.h and anim.c, extracts the full army_hold, its blend/quaternion implementation, the complete ArmyHost declaration, and the actual host_stopped helper. It supplies minimal template/Army/ArmyUnit layout doubles only for the accessed fields. The real optional failure callback is exercised with an external status owner, not a permanently healthy substitute. Supplemental controls check absent/healthy callbacks, nonzero failure values (1, 7, and -1), unchanged Army and Unit bytes, zero template reads, and early return before a NULL hand can be dereferenced. Invalid-unit/phase controls also run with a healthy callback. Exact extracted declaration/helper/caller hashes and line locations are retained in extraction-pins.json. An independent defined-storage reference rewrites the entire local 3x3 array to a genuine flat nine-float array and calls the blend directly. Exact world, position, and blend state equality is checked over 252,000 caller pairs, alongside guard words, finite outputs, homogeneous matrix fields, and invalid unit/phase no-ops. Cases cover major axes 0..2 and invalid -1/3 fallback, 100 rotations/scales, 12 moving frames, both mirror modes, missing/complete/incomplete offsets and seven blend/dt modes (including zero and overshoot). Normal and ASan/UBSan/bounds-strict builds use -O2 and warnings-as-errors.
+
+Limitations: a brace-based source extractor is intentionally narrow and assumes these functions contain no unbalanced braces inside comments or strings. Source changes may require updating it. Template services and Army/ArmyUnit layout are scoped doubles, not a game integration test or an ABI-size claim. ArmyHost and host_stopped are exact source extracts; the callback status owner is a controllable double, not the real City owner. Both variants share source-derived blend mathematics; this checks storage adaptation and caller behavior, not independent mathematical correctness. Inputs are finite representative cases, not exhaustive/fuzz proof. ASan does not reliably detect traversal past a subarray when within the enclosing allocation. LeakSanitizer is explicitly disabled because this environment uses ptrace; the changed path allocates nothing and this is not a leak audit. Generated host assembly is evidence of that compiler only, never Xbox timing, cycle counts, FPS, or hardware performance.

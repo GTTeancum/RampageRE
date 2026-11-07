@@ -55,6 +55,8 @@ int dir_graph_read(const Bundle *monster, DirGraph *ag)
     ag->n = n;
     ag->action = malloc((size_t)n);
     ag->fallback = malloc(sizeof *ag->fallback * (size_t)n);
+    if (!ag->action || !ag->fallback)
+        return dir_graph_free(ag), -1;
     for (int k = 0; k < n; k++) {
         if (at + 0x2C > size || rd32(d + at) != (uint32_t)k)
             return dir_graph_free(ag), -1;
@@ -70,11 +72,15 @@ int dir_graph_read(const Bundle *monster, DirGraph *ag)
     if (at + (uint32_t)(n * n) > size)
         return dir_graph_free(ag), -1;
     ag->hop = malloc((size_t)(n * n));
+    if (!ag->hop)
+        return dir_graph_free(ag), -1;
     memcpy(ag->hop, d + at, (size_t)(n * n));
     ag->cost = malloc(sizeof *ag->cost * (size_t)n);
     ag->pred = malloc((size_t)n);
     ag->mark = malloc((size_t)n);
     ag->queue = malloc((size_t)n);
+    if (!ag->cost || !ag->pred || !ag->mark || !ag->queue)
+        return dir_graph_free(ag), -1;
     ag->nq = 0;
     return 0;
 }

@@ -312,10 +312,11 @@ int collide_obj_ray(const CollideObj *o, const float start[3], const float dir[3
         if (c <= 0) {                                /* inside */
             float l2 = dot3(s, s);
             *t = 0;
-            if (l2 >= 1e-6f)
+            if (l2 >= 1e-6f) {
+                float len = sqrtf(l2);
                 for (int k = 0; k < 3; k++)
-                    ln[k] = s[k] / sqrtf(l2);
-            else
+                    ln[k] = s[k] / len;
+            } else
                 ln[0] = 1;
             to_world_dir(o->m, ln, normal);
             return 1;

@@ -51,6 +51,8 @@ typedef struct {
      * Unset: the weapon's Velocity up to its MaxFiringRange stands in */
     int (*rod)(void *ctx, const char *effect, float dir[3], float *speed, float *length, float *cycle, int *loops);
     void *ctx;
+    /* Sticky owner failure: once set, callbacks and event publication stop until teardown. */
+    int (*failed)(void *ctx);
 } ArmyHost;
 
 /* ---- what the units see of a monster, this frame (index = the monster's slot, 0 .. 3) */
@@ -392,6 +394,10 @@ typedef struct { ArmyMonWeapon w[ARMY_MON_WEAPONS]; int n; } ArmyMonWeapons;
 /* the setup over the book's WeaponList group; find gives a group of Weapons.bdp (as ArmyHost.find) */
 void army_mon_weapons_read(ArmyMonWeapons *ws, Group list, Group (*find)(void *ctx, const char *book, const char *name),
                            void *ctx);
+/* City-owned callers use this form to stop inherited failures before another find. */
+void army_mon_weapons_read_checked(ArmyMonWeapons *ws, Group list,
+                                   Group (*find)(void *ctx, const char *book, const char *name),
+                                   void *ctx, int (*failed)(void *ctx));
 /* fireWeapon (0x2D4B80): state 3. (stopWeapon, 0x2D4A80: state 2 and the weapon held, Shockwave +0x7C 0x31BA50, the
  * burst off and its effect stopped; no script calls it.) 0 when the monster has no weapon of that key */
 int army_mon_weapon_fire(ArmyMonWeapons *ws, const char *key);

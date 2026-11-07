@@ -1,0 +1,92 @@
+name: Xbox hardware-test package
+on:
+  workflow_dispatch:
+  push:
+    branches: ['xbox-hardware/**']
+permissions:
+  contents: read
+jobs:
+  windows-asset-tool:
+    runs-on: windows-2022
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify frozen console runtime and source
+        run: python packaging/xbox/package.py --verify-runtime
+      - name: Test preparation engine with synthetic data
+        run: python -m unittest discover -s tools/xbox_prep/tests -v
+      - name: Resolve and test optional Wii image reader
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup default stable
+          if ($LASTEXITCODE) { throw 'Rust setup failed' }
+          if (-not (Test-Path tools/xbox_prep/disc_reader/Cargo.lock)) {
+            cargo generate-lockfile --manifest-path tools/xbox_prep/disc_reader/Cargo.toml
+            if ($LASTEXITCODE) { throw 'Cargo resolution failed' }
+          }
+          cargo test --locked --manifest-path tools/xbox_prep/disc_reader/Cargo.toml
+          if ($LASTEXITCODE) { throw 'Wii reader tests failed' }
+          cargo build --locked --release --manifest-path tools/xbox_prep/disc_reader/Cargo.toml
+          if ($LASTEXITCODE) { throw 'Wii reader build failed' }
+      - name: Install the Windows packager and collect licenses
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pip install -r tools/xbox_prep/requirements-build.txt
+          if ($LASTEXITCODE) { throw 'Python packager setup failed' }
+          python tools/xbox_prep/collect_licenses.py tools/xbox_prep/licenses
+          if ($LASTEXITCODE) { throw 'Python license collection failed' }
+          python tools/xbox_prep/collect_rust_licenses.py
+          if ($LASTEXITCODE) { throw 'Rust license collection failed' }
+      - name: Build the single-file GUI
+        working-directory: tools/xbox_prep
+        run: python -m PyInstaller --clean --noconfirm --onefile --windowed --name "Prepare Rampage Xbox" --icon ../../res/rampagere.ico --add-binary "disc_reader/target/release/rampage-disc-reader.exe;." gui.py
+      - name: Exercise the frozen GUI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = (Resolve-Path 'tools/xbox_prep/dist/Prepare Rampage Xbox.exe').Path
+          $report = Join-Path $env:RUNNER_TEMP 'gui-smoke.json'
+          $p = Start-Process -FilePath $exe -ArgumentList @('--smoke-test', '--status-file', "`"$report`"") -WorkingDirectory $env:RUNNER_TEMP -PassThru
+          if (-not $p.WaitForExit(120000)) { $p.Kill(); throw 'GUI smoke timed out' }
+          $p.WaitForExit()
+          if ($p.ExitCode -ne 0 -or -not (Test-Path $report)) { throw "GUI smoke failed: exit $($p.ExitCode)" }
+          $result = Get-Content $report -Raw | ConvertFrom-Json
+          Get-Content $report
+          if (-not $result.ok) { throw 'GUI acceptance checks failed' }
+      - name: Assemble the asset-free console ZIP
+        run: python packaging/xbox/package.py --exe "tools/xbox_prep/dist/Prepare Rampage Xbox.exe" --out dist
+      - name: Preserve corresponding source and exact build metadata
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git archive --format=zip --output=dist/Rampage-Xbox-source.zip HEAD
+          if ($LASTEXITCODE) { throw 'Source archive failed' }
+          Copy-Item tools/xbox_prep/disc_reader/Cargo.lock dist/Cargo.lock
+          Copy-Item "$env:RUNNER_TEMP/gui-smoke.json" dist/gui-smoke.json
+          python -m pip freeze > dist/python-build-dependencies.txt
+          cargo --version > dist/rust-build-version.txt
+          Get-ChildItem dist -File | Where-Object Name -ne SHA256SUMS.txt | Sort-Object Name | ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } | Set-Content -Encoding ascii dist/SHA256SUMS.txt
+      - name: Upload the console hardware-test download
+        uses: actions/upload-artifact@v4
+        with:
+          name: Rampage-Xbox-hardware-test
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+      - name: Preserve lockfile and GUI test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Xbox-package-build-evidence
+          path: |
+            tools/xbox_prep/disc_reader/Cargo.lock
+            ${{ runner.temp }}/gui-smoke.json
+          if-no-files-found: ignore
+          retention-days: 14

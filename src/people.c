@@ -20,6 +20,8 @@ enum { OF_DYING = 0x800, OF_PUSH_OUT = 0x4000, OF_EFF_NODES = 0x8000, OF_PICKUP 
        OF_ACTOR = 0x80000, OF_COUNTED = 0x40000000 };
 
 struct People {
+    int (*failed)(void *ctx);
+    void *failed_ctx;
     Person *v;
     int n, cap;
     PeopleWindowReuse window_reuse;
@@ -57,6 +59,40 @@ struct People {
     int nspawn;
 };
 
+static int people_stopped(const People *p)
+{
+    return p && p->failed && p->failed(p->failed_ctx);
+}
+void people_set_failure(People *p, int (*failed)(void *ctx), void *ctx)
+{
+    p->failed = failed;
+    p->failed_ctx = ctx;
+}
+static float call_clip(People *p, const char *anim, const char *shape)
+{
+    if (people_stopped(p) || !p->clip_seconds) return 0;
+    float result = p->clip_seconds(p->ctx, anim, shape);
+    return people_stopped(p) ? 0 : result;
+}
+static Group call_find(People *p, const char *name)
+{
+    if (people_stopped(p) || !p->find) return (Group){ 0 };
+    Group result = p->find(p->find_ctx, name);
+    return people_stopped(p) ? (Group){ 0 } : result;
+}
+static void call_drop(People *p, const char *name, const float pos[3])
+{
+    if (!people_stopped(p) && p->drop) p->drop(p->drop_ctx, name, pos);
+}
+static int call_visible(People *p, const float pos[3], float radius)
+{
+    return !people_stopped(p) && p->visible && p->visible(p->visible_ctx, pos, radius);
+}
+static int call_reuse(People *p, int who)
+{
+    return !people_stopped(p) && p->window_reuse && p->window_reuse(p->window_reuse_ctx, who);
+}
+
 /* ---------------------------------------------------------------- small things */
 
 /* gWorld.frand() (0x279F98): the world's Park-Miller, gWorld +0x828 (wrand.c) [R] */
@@ -69,10 +105,10 @@ static float frand(People *p)
 static const char *tstr(const Person *q, const char *key) { return q->tmpl.at ? group_str(q->tmpl, key) : NULL; }
 static float tnum(const Person *q, const char *key, float def) { return q->tmpl.at ? group_num(q->tmpl, key, def) : def; }
 
-static void emit(People *p, int type, int who, const char *name, const char *node, const float v[3], float amount, int on)
+static PeopleEvent *emit(People *p, int type, int who, const char *name, const char *node, const float v[3], float amount, int on)
 {
-    if (p->nev >= MAX_EVENTS)
-        return;
+    if (people_stopped(p) || p->nev >= MAX_EVENTS)
+        return NULL;
     PeopleEvent *e = &p->ev[p->nev++];
     memset(e, 0, sizeof *e);
     e->type = type;
@@ -85,12 +121,13 @@ static void emit(People *p, int type, int who, const char *name, const char *nod
     e->object = -1;
     if (v)
         memcpy(e->v, v, sizeof e->v);
+    return e;
 }
 
 /* installObjectTimer(function, monster, delay): the event for that monster slot once the delay is out */
 static void later(People *p, float delay, int type, int monster, const float v[3], float amount, int side)
 {
-    if (p->ntimers >= MAX_TIMERS)
+    if (people_stopped(p) || p->ntimers >= MAX_TIMERS)
         return;
     p->timer[p->ntimers].left = delay;
     memset(&p->timer[p->ntimers].ev, 0, sizeof(PeopleEvent));
@@ -319,7 +356,7 @@ static void start_anim(People *p, Person *q, const char *name, int random_offset
             const char *shape = group_str(look, "Shape|ShapeName");
             if (!shape)
                 shape = tstr(q, "Shape|ShapeName");
-            len = p->clip_seconds(p->ctx, group_str(look, "Anim|AnimName"), shape);
+            len = call_clip(p, group_str(look, "Anim|AnimName"), shape);
         }
     }
     q->anim_len = len;
@@ -520,7 +557,7 @@ static int window_anim_done(People *p, Person *q)
             int k = (int)((float)p->ndrop * frand(p));
             const char *name = p->drop_names[k < p->ndrop ? k : p->ndrop - 1];
             if (p->drop)
-                p->drop(p->drop_ctx, name, q->pos);
+                call_drop(p, name, q->pos);
             else
                 emit(p, PE_DROP, who_of(p, q), name, NULL, q->pos, 0, 1);
         }
@@ -771,7 +808,7 @@ static int on_pulse(People *p, Person *q)
     case PK_RUNNER:
         if (q->state == 16 && fly_countdown(q) == DELETE_ME)
             return DELETE_ME;
-        if (strcmp(q->anim, "Streaking") == 0 && p->visible && !p->visible(p->visible_ctx, q->pos, 4.0f))
+        if (strcmp(q->anim, "Streaking") == 0 && p->visible && !call_visible(p, q->pos, 4.0f))
             return DELETE_ME;                        /* a streaker out of view */
         return 1;
     case PK_MIME:
@@ -1234,10 +1271,12 @@ static void construct(People *p, Person *q)
         q->state = 1;
         q->pulse_delay = 0.25f;
         q->flags |= OF_EFF_NODES | OF_PICKUP;
+        if (people_stopped(p)) return;
         int *allocated = p->band_sound_at ? p->band_sound_at : &p->band_sound;
         if (tstr(q, "Sound|BandSound") && !*allocated) {   /* the band's music, once */
             emit(p, PE_SOUND, who_of(p, q), tstr(q, "Sound|BandSound"), NULL, q->pos, 0, 1);
             q->sub |= 64;
+            if (people_stopped(p)) return;
             *allocated = 1;
         }
         break;
@@ -1318,6 +1357,7 @@ void people_window_emptied(People *p, int who)
 
 int people_add(People *p, Group tmpl, const float pos[3], float heading_deg)
 {
+    if (people_stopped(p)) return -1;
     Person *q = new_person_at(p, tmpl, pos, heading_deg, -1);
     if (!q)
         return -1;
@@ -1350,7 +1390,7 @@ static int window_reuse_slot(People *p, Group tmpl, int building, int storey, in
             pending = p->ev[k].who == i;
         for (int k = 0; k < p->ntimers && !pending; k++)
             pending = p->timer[k].ev.who == i;
-        if (!pending && p->window_reuse(p->window_reuse_ctx, i))
+        if (!pending && call_reuse(p, i))
             return i;
     }
     return -1;
@@ -1358,6 +1398,7 @@ static int window_reuse_slot(People *p, Group tmpl, int building, int storey, in
 
 int people_add_window(People *p, Group tmpl, const float at[3], int building, int storey, int column)
 {
+    if (people_stopped(p)) return -1;
     int reuse = window_reuse_slot(p, tmpl, building, storey, column);
     Person *q = new_person_at(p, tmpl, at, 0, reuse); /* [R 0x318A44 .. 0x318B14] no facing is set: the identity */
     if (!q)
@@ -1391,6 +1432,7 @@ void people_window_move(People *p, int who, float floor_z, float dx)
 
 int people_crowd(People *p, const Group *tmpls, int ntmpls, const float centre[3])
 {
+    if (people_stopped(p)) return 0;
     if (ntmpls <= 0)
         return 0;
     int n = 4 + (int)(frand(p) * 5.0f), made = 0;
@@ -1433,6 +1475,7 @@ int people_object(const People *p, int o, float pos[3])
 
 int people_events(People *p, PeopleEvent *out, int max)
 {
+    if (people_stopped(p)) return 0;
     int n = p->nev < max ? p->nev : max;
     memcpy(out, p->ev, sizeof *out * (size_t)n);
     memmove(p->ev, p->ev + n, sizeof *p->ev * (size_t)(p->nev - n));
@@ -1458,7 +1501,7 @@ static Group template_ref(People *p, Group from, const char *key)   /* the templ
 {
     Group none = { NULL, 0 };
     const char *name = from.at ? group_str(from, key) : NULL;
-    return name && p->find ? p->find(p->find_ctx, name) : none;
+    return name && p->find ? call_find(p, name) : none;
 }
 
 /* Band::createBand: BandMember1 .. n in files of three (the leader alone in front), 3.5 apart along x and 2 along y,
@@ -1525,8 +1568,8 @@ static void swarm_sound(People *p, int o, const char *key)   /* add3DSfx(getStri
 {
     const char *s = swarm_str(p, o, "Sound|", key);
     if (s && p->nev < MAX_EVENTS) {                  /* on the swarm: it goes with it (deleted at its second pulse) */
-        emit(p, PE_SOUND, -1, s, NULL, p->obj[o].pos, 0, 1);
-        p->ev[p->nev - 1].object = o;
+        PeopleEvent *event = emit(p, PE_SOUND, -1, s, NULL, p->obj[o].pos, 0, 1);
+        if (event) event->object = o;
     }
 }
 
@@ -1579,7 +1622,7 @@ static void swarm_out(People *p, int o)
         d[0] += -45.0f + frand(p) * 90.0f;
         d[1] -= 50.0f;
         int pick = (int)(frand(p) * (float)n);
-        Group t = p->find ? p->find(p->find_ctx, names[pick < n ? pick : n - 1]) : (Group){ NULL, 0 };
+        Group t = p->find ? call_find(p, names[pick < n ? pick : n - 1]) : (Group){ NULL, 0 };
         if (!t.at)
             continue;
         int who = people_add(p, t, s, 0);
@@ -1654,6 +1697,7 @@ void people_add_band(People *p, Group band, const float dest[3])
 
 void people_add_swarm(People *p, Group swarm, const float pos[3])
 {
+    if (people_stopped(p)) return;
     int o = 0;
     while (o < p->nobj && !(p->obj[o].swarm && p->obj[o].state == 2))   /* a deleted swarm's place, else a new one */
         o++;
@@ -1689,6 +1733,7 @@ int people_add_hut(People *p, Group hut, const float pos[3])
 
 PeopleEaten people_hut_hit(People *p, int hut, const float direction[3], float vel[3])
 {
+    if (people_stopped(p)) return (PeopleEaten){ 0 };
     PeopleEaten e = { 0, 0, 0, 0 };
     if (vel)
         vel[0] = vel[1] = vel[2] = 0;
@@ -1717,6 +1762,7 @@ int people_hut_state(const People *p, int hut)
 
 int people_add_streaker(People *p, Group tmpl, const float monster_pos[3], float camera_x)
 {
+    if (people_stopped(p)) return -1;
     float dir = camera_x > monster_pos[0] ? -1.0f : 1.0f;   /* away from the camera's side */
     float start[3] = { monster_pos[0], monster_pos[1], monster_pos[2] };
     float out[3] = { start[0], -dir * 1.0f - 3.0f, 0 }, end[3] = { dir * 100.0f, out[1], 0 };
@@ -1816,7 +1862,7 @@ static void people_spawn_chain(People *p)
     for (int i = 0; i < p->nspawn; i++) {
         Group g = p->spawn[i];
         const char *name = group_str(g, "Name");
-        Group t = name && p->find ? p->find(p->find_ctx, name) : (Group){ 0 };
+        Group t = name && p->find ? call_find(p, name) : (Group){ 0 };
         if (!t.at)
             continue;
         Group loc = group_sub(g, "Location");
@@ -1854,6 +1900,7 @@ void people_set_drop(People *p, void (*drop)(void *ctx, const char *name, const 
 
 void people_remove(People *p, int who)
 {
+    if (people_stopped(p)) return;
     if (who >= 0 && who < p->n && p->v[who].phase != PP_GONE)
         gone(p, &p->v[who]);
 }
@@ -1872,12 +1919,13 @@ static void flight_contact(void *user, int other, const float at[3], const float
         return;
     if (c->p->nev >= MAX_EVENTS)
         return;
-    emit(c->p, PE_IMPACT, c->who, NULL, NULL, at, c->p->v[c->who].cm.mass, w->kind);
-    c->p->ev[c->p->nev - 1].object = w->tag;
+    PeopleEvent *event = emit(c->p, PE_IMPACT, c->who, NULL, NULL, at, c->p->v[c->who].cm.mass, w->kind);
+    if (event) event->object = w->tag;
 }
 
 void people_collide_add(People *p, CollideWorld *w)
 {
+    if (people_stopped(p)) return;
     p->cw = w;
     for (int i = 0; i < p->n; i++) {
         Person *q = &p->v[i];
@@ -1904,6 +1952,7 @@ void people_collide_add(People *p, CollideWorld *w)
 
 void people_update(People *p, float dt, const PeopleMonster *m, int nm)
 {
+    if (people_stopped(p)) return;
     p->m = m;
     p->nm = nm;
     people_spawn_chain(p);                           /* the ones eaten since the last frame (people_remove) */
@@ -1971,6 +2020,7 @@ void people_update(People *p, float dt, const PeopleMonster *m, int nm)
 
 void people_window_fall(People *p, int who)
 {
+    if (people_stopped(p)) return;
     if (who < 0 || who >= p->n)
         return;
     Person *q = &p->v[who];
@@ -2062,6 +2112,7 @@ int people_nearest(const People *p, const float hand[3], const float root[3], co
 
 void people_grab(People *p, int who, float blend)
 {
+    if (people_stopped(p)) return;
     if (who < 0 || who >= p->n || p->v[who].phase == PP_GONE)
         return;
     Person *q = &p->v[who];
@@ -2091,6 +2142,7 @@ void people_grab(People *p, int who, float blend)
  * (0x104C60) and scales its place by 1 - w, on the hold's frame: linear in time, and it follows the hand. */
 void people_hold(People *p, int who, const float hand[16], int mirrored, float dt)
 {
+    if (people_stopped(p)) return;
     if (who < 0 || who >= p->n || p->v[who].phase != PP_HELD)
         return;
     Person *q = &p->v[who];
@@ -2150,6 +2202,7 @@ void people_hold(People *p, int who, const float hand[16], int mirrored, float d
 
 PeopleEaten people_eat(People *p, int who, int monster)
 {
+    if (people_stopped(p)) return (PeopleEaten){ 0 };
     PeopleEaten e = { 0, 0, 0, 0 };
     if (who < 0 || who >= p->n || p->v[who].phase != PP_HELD)
         return e;
@@ -2200,6 +2253,7 @@ void people_apply_eaten(const PeopleEaten *e, float *hp, float hp_max, float *en
 
 void people_throw(People *p, int who, float monster_heading)
 {
+    if (people_stopped(p)) return;
     if (who < 0 || who >= p->n || p->v[who].phase != PP_HELD)
         return;
     Person *q = &p->v[who];
@@ -2217,6 +2271,7 @@ void people_throw(People *p, int who, float monster_heading)
 
 int people_hit(People *p, int monster, const float c[3], float radius, float monster_heading, const char *move)
 {
+    if (people_stopped(p)) return 0;
     int n = 0;
     p->hitter = monster;
     for (int i = 0; i < p->n; i++) {

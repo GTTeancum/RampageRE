@@ -67,7 +67,11 @@ int clip_read(const BdpEntry *e, Clip *c)
     if (c->kind == 2) {
         c->bones = rd32(d + 0x2C);
         c->trans = calloc(c->bones ? c->bones : 1, sizeof *c->trans);
+        if (!c->trans)
+            goto fail;
         c->rot = calloc(c->bones ? c->bones : 1, sizeof *c->rot);
+        if (!c->rot)
+            goto fail;
         const uint8_t *p = d + rd32(d + 0x38);
         for (uint32_t i = 0; i < c->bones; i++) {
             c->trans[i] = p;
@@ -85,14 +89,19 @@ int clip_read(const BdpEntry *e, Clip *c)
             if (bone > c->bones) c->bones = bone;
         }
         c->trans = calloc(c->bones ? c->bones : 1, sizeof *c->trans);   /* per bone: its record */
+        if (!c->trans)
+            goto fail;
         for (uint32_t i = 0; i < count; i++) {
             const uint8_t *rec = d + rd32(d + table + 4 * i);
             c->trans[rd32(rec)] = rec;
         }
     } else {
-        return -1;
+        goto fail;
     }
     return 0;
+fail:
+    clip_free(c);
+    return -1;
 }
 
 void clip_free(Clip *c)
@@ -127,12 +136,17 @@ int clip_moves(const Clip *c)
     return 0;
 }
 
-int clip_pose(const Clip *c, double seconds, uint32_t bone, float t[3], float q[4])
+double clip_phase(const Clip *c, double seconds)
+{
+    double f = fmod(seconds / c->duration, 1.0);
+    if (f < 0) f += 1;
+    return f;
+}
+
+int clip_pose_phase(const Clip *c, double f, uint32_t bone, float t[3], float q[4])
 {
     if (bone >= c->bones || c->duration <= 0)
         return 0;
-    double f = fmod(seconds / c->duration, 1.0);
-    if (f < 0) f += 1;
     if (c->kind == 2) {
         float tn = (float)f;
         const uint8_t *tr = c->trans[bone], *keys = tr + 0x10;
@@ -185,12 +199,20 @@ int clip_pose(const Clip *c, double seconds, uint32_t bone, float t[3], float q[
     fr = (float)(x - k);
     const uint8_t *s = rp + 36 * k;
     float angle = rdf(s + 32), n = 0;
+    float cosine = angle == 0 ? 0 : cosf(angle * fr), sine = angle == 0 ? 0 : sinf(angle * fr);
     for (int i = 0; i < 4; i++) {
         float q0 = rdf(s + 4 * i), q1 = rdf(s + 16 + 4 * i);
-        q[i] = angle == 0 ? q0 + q1 * fr : q0 * cosf(angle * fr) + q1 * sinf(angle * fr);
+        q[i] = angle == 0 ? q0 + q1 * fr : q0 * cosine + q1 * sine;
         n += q[i] * q[i];
     }
     n = sqrtf(n);
     for (int i = 0; i < 4; i++) q[i] /= n;
     return 1;
+}
+
+int clip_pose(const Clip *c, double seconds, uint32_t bone, float t[3], float q[4])
+{
+    if (bone >= c->bones || c->duration <= 0)
+        return 0;
+    return clip_pose_phase(c, clip_phase(c, seconds), bone, t, q);
 }

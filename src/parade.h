@@ -49,6 +49,8 @@ typedef struct {
      * (the bikers' looks as read from the bundles, else 1 s) */
     float (*clip_seconds)(void *ctx, const char *anim, const char *shape);
     void *ctx;
+    /* Sticky owner failure: once set, callbacks and event publication stop until teardown. */
+    int (*failed)(void *ctx);
 } ParadeHost;
 
 /* ---- the objects */

@@ -8,6 +8,59 @@
 #include "boss.h"
 #include "wrand.h"
 
+/* Callback arguments are evaluated before this boundary, including inherited reads. */
+static int host_stopped(const BossHost *h)
+{
+    return h && h->failed && h->failed(h->ctx);
+}
+static Group host_find(const BossHost *h, const char *book, const char *name)
+{
+    if (host_stopped(h) || !h->find) return (Group){ 0 };
+    Group result = h->find(h->ctx, book, name);
+    return host_stopped(h) ? (Group){ 0 } : result;
+}
+static float host_clip_seconds(const BossHost *h, const char *anim, const char *shape)
+{
+    if (host_stopped(h) || !h->clip_seconds) return 0;
+    float result = h->clip_seconds(h->ctx, anim, shape);
+    return host_stopped(h) ? 0 : result;
+}
+static int host_node_world(const BossHost *h, const BossPart *p, const char *node, float out[16])
+{
+    if (host_stopped(h) || !h->node_world) return 0;
+    int result = h->node_world(h->ctx, p, node, out);
+    return host_stopped(h) ? 0 : result;
+}
+static int host_shape_box(const BossHost *h, const char *shape, float min[3], float max[3])
+{
+    if (host_stopped(h) || !h->shape_box) return 0;
+    int result = h->shape_box(h->ctx, shape, min, max);
+    return host_stopped(h) ? 0 : result;
+}
+static int host_shape_sphere(const BossHost *h, const char *shape, float centre[3], float *radius)
+{
+    if (host_stopped(h) || !h->shape_sphere) return 0;
+    int result = h->shape_sphere(h->ctx, shape, centre, radius);
+    return host_stopped(h) ? 0 : result;
+}
+static int host_visible(const BossHost *h, const float p[3], float r)
+{
+    if (host_stopped(h) || !h->visible) return 0;
+    int result = h->visible(h->ctx, p, r);
+    return host_stopped(h) ? 0 : result;
+}
+static int host_weapon_make(const BossHost *h, ArmyWeapon *w, Group weapon_group)
+{
+    if (host_stopped(h) || !h->weapon_make) return 0;
+    int result = h->weapon_make(h->ctx, w, weapon_group);
+    return host_stopped(h) ? 0 : result;
+}
+static void host_weapon_tick(const BossHost *h, ArmyWeapon *w, int may, const float from[3], const float dir[3], const float frame[3][3], int target, float dt, int part)
+{
+    if (!host_stopped(h) && h->weapon_tick)
+        h->weapon_tick(h->ctx, w, may, from, dir, frame, target, dt, part);
+}
+
 #define PI 3.1415927f
 #define DELETE_ME (4 | 8 | 16)                       /* [R] what a script handler returns to have its object deleted */
 #define MAX_PARTS 48
@@ -319,7 +372,7 @@ static int upoint(const Obj *o, const char *key, float out[3])   /* getPoint3Pro
 }
 static Group find_tmpl(Boss *b, const char *name)
 {
-    return b->host.find && name ? b->host.find(b->host.ctx, "Objects1_Props", name) : (Group){ 0 };
+    return b->host.find && name ? host_find(&b->host, "Objects1_Props", name) : (Group){ 0 };
 }
 
 /* ---------------------------------------------------------------- events */
@@ -329,7 +382,7 @@ static int idx(const Boss *b, const Obj *o) { return o ? (int)(o - b->o) : -1; }
 static BossEvent *emit(Boss *b, int type, const Obj *o, const char *name, const float pos[3])
 {
     static BossEvent spare;
-    BossEvent *e = b->nev < MAX_EVENTS ? &b->ev[b->nev++] : &spare;
+    BossEvent *e = !host_stopped(&b->host) && b->nev < MAX_EVENTS ? &b->ev[b->nev++] : &spare;
     memset(e, 0, sizeof *e);
     e->type = type;
     e->obj = idx(b, o);
@@ -892,7 +945,7 @@ static void start_anim(Boss *b, Obj *o, const char *name)   /* Actor.startAnim (
             o->p.shape = shape;
         o->p.clip = group_str(look, "Anim|AnimName");
         if (len <= 0 && b->host.clip_seconds)
-            len = b->host.clip_seconds(b->host.ctx, o->p.clip, o->p.shape);
+            len = host_clip_seconds(&b->host, o->p.clip, o->p.shape);
     }
     o->p.anim_len = len;
     o->p.anim_time = 0;
@@ -919,7 +972,7 @@ static void obj_weapons(Boss *b, Obj *o)
         uint32_t nw = group_all(cl, "Weapon|", wr, 8);
         for (uint32_t i = 0; i < nw && o->p.nw < BOSS_WEAPONS; i++) {
             ArmyWeapon *w = &o->p.w[o->p.nw];
-            if (!b->host.weapon_make(b->host.ctx, w, record_group(cl, wr[i])))
+            if (!host_weapon_make(&b->host, w, record_group(cl, wr[i])))
                 continue;
             o->p.nw++;
             army_cluster_read(w, cl);
@@ -958,7 +1011,7 @@ static void weapons_enable(Boss *b, Obj *o, int on)
             if (w->firing && b->host.weapon_tick) {  /* the army ends the beam and its shot */
                 float down[3] = { 0, 0, -1 };
                 w->beam_left = 0;
-                b->host.weapon_tick(b->host.ctx, w, 0, o->p.pos, down, NULL, -1, 0, idx(b, o));
+                host_weapon_tick(&b->host, w, 0, o->p.pos, down, NULL, -1, 0, idx(b, o));
             }
             float t = w->charge_time + w->firing_offset;
             w->charging = 0;
@@ -1012,7 +1065,7 @@ static void obj_weapons_tick(Boss *b, Obj *o, float dt)
     for (int i = 0; i < o->p.nw; i++) {
         ArmyWeapon *w = &o->p.w[i];
         float node[16], from[3], dir[3], F[3][3];
-        int have_node = b->host.node_world && w->node && b->host.node_world(b->host.ctx, &o->p, w->node, node);
+        int have_node = b->host.node_world && w->node && host_node_world(&b->host, &o->p, w->node, node);
         for (int r = 0; r < 3 && have_node; r++) {   /* [R 0x2971A0] the firing frame: the node's world */
             copy3(F[r], node + 4 * r);
             float l = sqrtf(F[r][0] * F[r][0] + F[r][1] * F[r][1] + F[r][2] * F[r][2]);
@@ -1036,7 +1089,7 @@ static void obj_weapons_tick(Boss *b, Obj *o, float dt)
             set3(dir, -sinf(h) * cosf(w->pitch), cosf(h) * cosf(w->pitch), sinf(w->pitch));
             float cn[16];
             const char *ctl = w->rot_node ? w->rot_node : w->elev_node;
-            int drawn = have_node && ctl && b->host.node_world(b->host.ctx, &o->p, ctl, cn);
+            int drawn = have_node && ctl && host_node_world(&b->host, &o->p, ctl, cn);
             if (drawn)                               /* [R 0x2963C0] along the drawn node's Direction axis */
                 for (int k = 0; k < 3; k++)
                     dir[k] = F[w->axis][k] * (w->axis_neg ? -1.0f : 1.0f);
@@ -1044,7 +1097,7 @@ static void obj_weapons_tick(Boss *b, Obj *o, float dt)
                 army_frame_turn(F, front, w->yaw, w->pitch);
         }
         int may = has && aimed && dist3(from, tp) <= w->range;
-        b->host.weapon_tick(b->host.ctx, w, may, from, dir, have_node ? (const float (*)[3])F : NULL,
+        host_weapon_tick(&b->host, w, may, from, dir, have_node ? (const float (*)[3])F : NULL,
                             o->has_point ? -1 : o->target, dt, idx(b, o));
     }
 }
@@ -1121,7 +1174,7 @@ static Obj *obj_new(Boss *b, const char *name, Group tmpl, Group inst, const flo
      * model's box, no model at all radius 1 at the origin */
     {
         float tb[6], ib[6], mb[6], c[3] = { 0, 0, 0 }, rr = 1;
-        int have = o->p.shape && b->host.shape_box && b->host.shape_box(b->host.ctx, o->p.shape, mb, mb + 3);
+        int have = o->p.shape && b->host.shape_box && host_shape_box(&b->host, o->p.shape, mb, mb + 3);
         if (have) {
             float h[3];
             for (int k = 0; k < 3; k++) {
@@ -1132,7 +1185,7 @@ static Obj *obj_new(Boss *b, const char *name, Group tmpl, Group inst, const flo
         }
         /* [R 0x28FD70 -> 0x184CB0] the sphere the model keeps, the union of its parts' spheres (0x185AA0) */
         if (have && b->host.shape_sphere)
-            b->host.shape_sphere(b->host.ctx, o->p.shape, c, &rr);
+            host_shape_sphere(&b->host, o->p.shape, c, &rr);
         collide_shape_pick(&o->cshape, have ? c : NULL, rr, book_box(tmpl, tb), group_num(tmpl, "CollisionRadius", -1),
                            group_num(tmpl, "AutoCollisionBox", 0) != 0, inst.at ? book_box(inst, ib) : NULL,
                            inst.at ? group_num(inst, "CollisionRadius", -1) : -1,
@@ -1187,7 +1240,7 @@ static void horizontal_knock(float v[3], const float d[3], float across, float u
 static int visible(const Boss *b, const float p[3], float r)   /* gWorld.isSphereVisible (unset: the view's x range) */
 {
     if (b->host.visible)
-        return b->host.visible(b->host.ctx, p, r);
+        return host_visible(&b->host, p, r);
     return p[0] + r >= b->view[0] && p[0] - r <= b->view[1];
 }
 /* a knocked-away path (Boss_Helicopter createKnockedAwayPath, Boss_Jumper doHitReaction, Boss_Chicago_Saucer
@@ -3273,6 +3326,7 @@ static void gen_construct(Boss *b, Obj *o)           /* Construct (at the block'
 {
     GenDef *g = &o->s.gen;
     o->oflags |= OF_EFF_NODES;
+    if (host_stopped(&b->host)) return;
     g->gen_id = b->host.generators ? (*b->host.generators)++ : 0;
     g->hp = 3;
     g->hit_fx = -1;
@@ -3296,6 +3350,7 @@ static int gen_damage(Boss *b, Obj *o, int monster, int type)   /* TakeDamage: t
         g->hp = 0;
     fx_on(b, o, tstr(o, "HitEffect"), NULL, NULL, -1, 0);
     if (g->hp == 0) {
+        if (host_stopped(&b->host)) return 0;
         if (g->gen_id >= 0 && g->gen_id < 8 && b->host.play)
             b->host.play[g->gen_id] = 1;            /* gWorld.setPlayValue(genId, 1): the blimp reads it */
         const char *e = tstr(o, "DestEffect");
@@ -3727,6 +3782,7 @@ static void location(Group g, float out[3])
 
 int boss_load_block(Boss *b, Group block_def)
 {
+    if (b && host_stopped(&b->host)) return 0;
     boss_clear(b);
     Record r[64];
     Group ai = group_sub(block_def, "AIDef");
@@ -3777,6 +3833,7 @@ int boss_load_block(Boss *b, Group block_def)
 
 int boss_load_waiting(Boss *b, Group block_def, float y, int slot)
 {
+    if (b && host_stopped(&b->host)) return 0;
     Group where;
     static Record obj[256];
     int made = 0;
@@ -3804,6 +3861,7 @@ int boss_load_waiting(Boss *b, Group block_def, float y, int slot)
 
 int boss_spawn(Boss *b, const char *tmpl_name, Group inst, const float pos[3])
 {
+    if (b && host_stopped(&b->host)) return -1;
     Group t = find_tmpl(b, tmpl_name);
     if (!t.at)
         return -1;
@@ -3816,6 +3874,7 @@ int boss_spawn(Boss *b, const char *tmpl_name, Group inst, const float pos[3])
 
 void boss_update(Boss *b, float dt, const BossMonster *m, int nm, const BossBuilding *bl, int nb)
 {
+    if (b && host_stopped(&b->host)) return;
     b->m = m;
     b->nm = m ? nm : 0;
     b->bl = bl;
@@ -3852,6 +3911,7 @@ int boss_defeated(const Boss *b) { return b->defeated; }
 
 int boss_events(Boss *b, BossEvent *out, int max)
 {
+    if (b && host_stopped(&b->host)) return 0;
     int n = b->nev < max ? b->nev : max;
     if (out && n > 0)
         memcpy(out, b->ev, (size_t)n * sizeof *out);
@@ -3865,6 +3925,7 @@ int boss_events(Boss *b, BossEvent *out, int max)
  * (OnlyHitWithEffNodes: the Tank, Heli, Jumper, Saucer, Blimp, Generator) goes on the attack's hit list, once */
 int boss_hit(Boss *b, int monster, const float centre[3], float radius, float amount, unsigned record)
 {
+    if (b && host_stopped(&b->host)) return 0;
     if (monster < 0 || monster >= b->nm)
         return 0;
     int n = 0;

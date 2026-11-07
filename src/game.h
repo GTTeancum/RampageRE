@@ -95,6 +95,8 @@ typedef struct {
      * state as it searches; 0 none. NULL: none */
     int (*rubble_point)(void *ctx, const float pos[3], float radius, float out[3]);
     void *ctx;
+    /* Sticky owner failure: once set, callbacks and event publication stop until teardown. */
+    int (*failed)(void *ctx);
 } GameHost;
 
 typedef struct {

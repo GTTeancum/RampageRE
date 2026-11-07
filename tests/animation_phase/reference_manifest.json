@@ -1,0 +1,12 @@
+{
+  "baseline_sources": {
+    "anim.c": "c7de77e7d8913243b824ef32f84ebe7e200a22dbc1b5aadf074a928affe264a0",
+    "city.c": "c2a13e8f43e6bb6e5d8ac700753fa7536c231408e6e048370982bd118c39dd78",
+    "data.h": "18b9895dacb11042ddb1ab58dec0b7e4963ebdc3ea945690aa2d4c1752fc294e"
+  },
+  "references": {
+    "reference_pose_instance.c": "54f9511cdd73e9674e2e9dfaf5773edaa95c581eabc76783a34905525545a337",
+    "reference_clip_pose.c": "caaeb49a05bfe9308fd0e051d1fe2b6eff3ca90fca48be6eeac79551e57c083a"
+  },
+  "transform": "Only rename historical clip_pose to reference_pose and historical pose_instance to old_instance; redirect old instance calls to reference_pose. Historical shared-trig implementation retained."
+}

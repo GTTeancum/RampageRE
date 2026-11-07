@@ -14,6 +14,8 @@ int tree_read(const Bundle *b, const BdpEntry *te, const BdpEntry *raw, Tree *t)
     const uint8_t *d = te->data;
     uint32_t n = rd32(d + 0x20), table = rd32(d + 0x2C), first = rd32(d + 0x1C);
     t->nodes = calloc(n ? n : 1, sizeof *t->nodes);
+    if (!t->nodes)
+        return -1;
     t->n = n;
     for (uint32_t i = 0; i < n; i++) {
         const uint8_t *node = d + rd32(d + table + 4 * i);
@@ -68,11 +70,17 @@ void tree_free(Tree *t)
 
 uint32_t cloth_particles(const BdpEntry *e, ClothParticle **out)
 {
+    *out = NULL;
     const uint8_t *d = e->data;
     uint32_t parts = rd32(d + 0x34), at = rd32(d + 0x38), total = 0;
-    for (uint32_t k = 0; k < parts; k++)
-        total += rd32(d + at + 0x8C * k + 0x80);
+    for (uint32_t k = 0; k < parts; k++) {
+        uint32_t count = rd32(d + at + 0x8C * k + 0x80);
+        if (count > UINT32_MAX - total) return 0;
+        total += count;
+    }
     ClothParticle *p = calloc(total ? total : 1, sizeof *p);
+    if (!p)
+        return 0;
     uint32_t n = 0;
     for (uint32_t k = 0; k < parts; k++) {
         const uint8_t *rec = d + at + 0x8C * k, *q = d + rd32(rec + 0x88);

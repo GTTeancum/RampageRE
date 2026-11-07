@@ -7,6 +7,30 @@
 #include "rail.h"
 #include "wrand.h"
 
+/* Callback arguments are evaluated before this boundary, including inherited reads. */
+static int host_stopped(const RailHost *h)
+{
+    return h && h->failed && h->failed(h->ctx);
+}
+static Group host_find(const RailHost *h, const char *book, const char *name)
+{
+    if (host_stopped(h) || !h->find) return (Group){ 0 };
+    Group result = h->find(h->ctx, book, name);
+    return host_stopped(h) ? (Group){ 0 } : result;
+}
+static int host_shape_box(const RailHost *h, const char *shape, float min[3], float max[3])
+{
+    if (host_stopped(h) || !h->shape_box) return 0;
+    int result = h->shape_box(h->ctx, shape, min, max);
+    return host_stopped(h) ? 0 : result;
+}
+static int host_shape_sphere(const RailHost *h, const char *shape, float centre[3], float *radius)
+{
+    if (host_stopped(h) || !h->shape_sphere) return 0;
+    int result = h->shape_sphere(h->ctx, shape, centre, radius);
+    return host_stopped(h) ? 0 : result;
+}
+
 #define SPI 3.1415927f                               /* the scripts' own pi */
 #define TIMESTEP (1.0f / 30.0f)                      /* gWorld.getTimeStep(): its step, 1/30 [R 0x2B7800] */
 #define MAX_OBJS 128
@@ -189,7 +213,7 @@ static float pnum(const RailObj *o, const char *key, float def)
 
 static Group find_template(Rail *r, const char *name)
 {
-    return r->host.find && name ? r->host.find(r->host.ctx, "Objects1_Props", name) : (Group){ 0 };
+    return r->host.find && name ? host_find(&r->host, "Objects1_Props", name) : (Group){ 0 };
 }
 
 static int kind_of_script(const char *s)
@@ -214,7 +238,7 @@ static int idx(const Rail *r, const RailObj *o) { return (int)(o - r->o); }
 static RailEvent *emit(Rail *r, int type, int obj, const char *name, const float pos[3])
 {
     static RailEvent spare;
-    if (r->nev >= MAX_EVENTS) {
+    if (host_stopped(&r->host) || r->nev >= MAX_EVENTS) {
         memset(&spare, 0, sizeof spare);
         return &spare;
     }
@@ -1874,10 +1898,12 @@ static RailObj *create(Rail *r, const char *name)
 
 int rail_script_is_ours(const char *script_name) { return kind_of_script(script_name) >= 0; }
 
-int rail_kind_of(Rail *r, const char *tmpl_name) { return kind_of_template(find_template(r, tmpl_name)); }
+int rail_kind_of(Rail *r, const char *tmpl_name) {
+    if (r && host_stopped(&r->host)) return -1; return kind_of_template(find_template(r, tmpl_name)); }
 
 int rail_spawn(Rail *r, const char *tmpl_name, const float pos[3], float facing, Group inst)
 {
+    if (r && host_stopped(&r->host)) return -1;
     Group t = find_template(r, tmpl_name);
     int kind = kind_of_template(t);
     if (kind < 0)
@@ -1899,6 +1925,7 @@ int rail_spawn(Rail *r, const char *tmpl_name, const float pos[3], float facing,
  * the first spawn in MinDelay + OffsetDelay x rand seconds. Only the records whose template is ours are kept here */
 int rail_load_block(Rail *r, Group block_def)
 {
+    if (r && host_stopped(&r->host)) return 0;
     r->nsp = 0;
     r->active = 0;
     Group ai = group_sub(block_def, "AIDef");
@@ -2039,7 +2066,7 @@ static const float *book_box(Group g, float b[6])
 static void obj_shape_read(const Rail *r, const RailObj *o, CollideShape *s)
 {
     float tb[6], ib[6], mb[6], c[3] = { 0, 0, 0 }, rad = 1;
-    int have = o->shape && r->host.shape_box && r->host.shape_box(r->host.ctx, o->shape, mb, mb + 3);
+    int have = o->shape && r->host.shape_box && host_shape_box(&r->host, o->shape, mb, mb + 3);
     if (have) {
         float h[3];
         for (int k = 0; k < 3; k++) {
@@ -2050,7 +2077,7 @@ static void obj_shape_read(const Rail *r, const RailObj *o, CollideShape *s)
     }
     /* [R 0x28FD70 -> 0x184CB0] the sphere the model keeps, the union of its parts' spheres (0x185AA0) */
     if (have && r->host.shape_sphere)
-        r->host.shape_sphere(r->host.ctx, o->shape, c, &rad);
+        host_shape_sphere(&r->host, o->shape, c, &rad);
     Group in = o->inst;
     collide_shape_pick(s, have ? c : NULL, rad, o->tmpl.at ? book_box(o->tmpl, tb) : NULL, tnum(o, "CollisionRadius", -1),
                        tnum(o, "AutoCollisionBox", 0) != 0, in.at ? book_box(in, ib) : NULL,
@@ -2165,6 +2192,7 @@ static void obj_step(Rail *r, RailObj *o)
 
 void rail_update(Rail *r, float dt, const ArmyMonster *m, int nm, const RailBox *b, int nb)
 {
+    if (r && host_stopped(&r->host)) return;
     r->m = m;
     r->nm = m ? nm : 0;
     r->b = b;
@@ -2191,6 +2219,7 @@ void rail_update(Rail *r, float dt, const ArmyMonster *m, int nm, const RailBox 
 
 int rail_hit(Rail *r, int monster, const float centre[3], float radius, float amount)
 {
+    if (r && host_stopped(&r->host)) return 0;
     (void)amount;                                    /* the scripts do not look at it */
     int hits = 0;
     for (int i = 0; i < r->n; i++) {
@@ -2217,6 +2246,7 @@ void rail_set_collide(Rail *r, CollideWorld *w) { r->cw = w; }
 
 void rail_collide_add(Rail *r, CollideWorld *w)
 {
+    if (r && host_stopped(&r->host)) return;
     for (int i = 0; i < r->n; i++) {
         RailObj *o = &r->o[i];
         o->cobj = -1;
@@ -2270,6 +2300,7 @@ int rail_nearest_pickup(const Rail *r, const float hand[3], const float root[3],
  * HeldObjectMover (a train's run and a cable car's stages stop), then onPickup */
 void rail_grab(Rail *r, int obj, int monster, float blend)
 {
+    if (r && host_stopped(&r->host)) return;
     (void)monster;
     if (obj < 0 || obj >= r->n || r->o[obj].phase != RP_ALIVE)
         return;
@@ -2290,6 +2321,7 @@ void rail_grab(Rail *r, int obj, int monster, float blend)
  * (army_hold_blend, 0x310B50) */
 void rail_hold(Rail *r, int obj, const float hand_world[16], int mirrored, float dt)
 {
+    if (r && host_stopped(&r->host)) return;
     if (obj < 0 || obj >= r->n || r->o[obj].phase != RP_HELD)
         return;
     RailObj *o = &r->o[obj];
@@ -2324,6 +2356,7 @@ void rail_hold(Rail *r, int obj, const float hand_world[16], int mirrored, float
  * eat); it keeps the hand's turn as it flies, with no spin [R, vehicle.c's reading] */
 void rail_throw(Rail *r, int obj, int monster, int eat, const float vel[3])
 {
+    if (r && host_stopped(&r->host)) return;
     (void)eat;                                       /* neither script looks at bWasEaten */
     if (obj < 0 || obj >= r->n || r->o[obj].phase != RP_HELD)
         return;
@@ -2389,6 +2422,7 @@ void rail_draw_world(const Rail *r, int i, float out[16])
 
 int rail_events(Rail *r, RailEvent *out, int max)
 {
+    if (r && host_stopped(&r->host)) return 0;
     int n = r->nev < max ? r->nev : max;
     memcpy(out, r->ev, sizeof *out * (size_t)n);
     memmove(r->ev, r->ev + n, sizeof *r->ev * (size_t)(r->nev - n));

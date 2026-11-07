@@ -130,6 +130,8 @@ typedef float (*PeopleClipSeconds)(void *ctx, const char *anim, const char *shap
 
 People *people_new(PeopleClipSeconds clip_seconds, void *ctx);
 void people_free(People *p);
+/* Install before any property-consuming construction. The host must outlive People. */
+void people_set_failure(People *p, int (*failed)(void *ctx), void *ctx);
 /* Optional host permission to reuse a naturally re-entered civilian's index. Return nonzero only after all
  * external references (held objects, effects, weapons and sounds) have gone. The module also checks its events. */
 typedef int (*PeopleWindowReuse)(void *ctx, int who);
