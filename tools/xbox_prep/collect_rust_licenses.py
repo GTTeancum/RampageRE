@@ -68,23 +68,85 @@ def package_notices(package, bundled_dir=None):
     return folder, sorted(notices)
 
 
+def rust_host():
+    """Use the compiler that builds the helper, not Python's platform name."""
+    version = subprocess.check_output(['rustc', '-vV'], text=True, encoding='utf-8')
+    hosts = [line.partition(':')[2].strip() for line in version.splitlines()
+             if line.startswith('host:')]
+    allowed = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.')
+    if len(hosts) != 1 or '-' not in hosts[0] or not set(hosts[0]) <= allowed:
+        raise RuntimeError('Cannot determine a valid rustc host target from rustc -vV')
+    return hosts[0]
+
+
+def reachable_packages(metadata):
+    """metadata.packages is unfiltered; walk only the filtered resolve graph."""
+    resolve = metadata.get('resolve')
+    if not isinstance(resolve, dict) or not isinstance(resolve.get('root'), str) or not resolve['root']:
+        raise RuntimeError('Cargo metadata has no resolve.root')
+
+    def index(records, label):
+        if not isinstance(records, list):
+            raise RuntimeError(f'Cargo metadata has no {label} list')
+        result = {}
+        for record in records:
+            identifier = record.get('id') if isinstance(record, dict) else None
+            if not isinstance(identifier, str) or not identifier or identifier in result:
+                raise RuntimeError(f'Cargo metadata has invalid or duplicate {label} IDs')
+            result[identifier] = record
+        return result
+
+    packages = index(metadata.get('packages'), 'packages')
+    nodes = index(resolve.get('nodes'), 'resolve.nodes')
+    pending = [resolve['root']]
+    seen = set()
+    while pending:
+        identifier = pending.pop()
+        if identifier in seen:
+            continue
+        if identifier not in packages or identifier not in nodes:
+            raise RuntimeError(f'Incomplete Cargo resolve graph: missing package or node for {identifier}')
+        seen.add(identifier)
+        deps = nodes[identifier].get('deps')
+        if not isinstance(deps, list):
+            raise RuntimeError(f'Incomplete Cargo resolve graph: missing deps for {identifier}')
+        for dep in deps:
+            target = dep.get('pkg') if isinstance(dep, dict) else None
+            if not isinstance(target, str) or not target:
+                raise RuntimeError(f'Incomplete Cargo resolve graph: invalid dependency for {identifier}')
+            pending.append(target)
+    return sorted((packages[key] for key in seen),
+                  key=lambda package: (package['name'], package['version'], package['id']))
+
+
 def collect(root=None):
     root = Path(root) if root else Path(__file__).resolve().parent
+    target = rust_host()
     metadata = json.loads(subprocess.check_output(
-        ['cargo', 'metadata', '--locked', '--format-version', '1', '--manifest-path', str(root/'disc_reader/Cargo.toml')],
+        ['cargo', 'metadata', '--locked', '--format-version', '1', '--filter-platform', target,
+         '--manifest-path', str(root/'disc_reader/Cargo.toml')],
         text=True, encoding='utf-8'))
-    chunks = ['Rust dependency notices from the resolved Cargo.lock.\n']
+    packages = reachable_packages(metadata)
+    chunks = [f'Rust dependency notices from the resolved Cargo.lock for {target}.\n']
     count = 0
-    for package in sorted(metadata['packages'], key=lambda p: (p['name'], p['version'])):
-        if package['source'] is None:
+    errors = []
+    for package in packages:
+        if package['id'] == metadata['resolve']['root']:
             continue
-        folder, notices = package_notices(package, bundled_dir=root/'licenses')
+        try:
+            folder, notices = package_notices(package, bundled_dir=root/'licenses')
+            section = ['\n'+'='*72+'\n'+package['name']+' '+package['version']+'\nSPDX: '+str(package['license'])+
+                       '\nSource: '+str(package.get('repository') or package.get('source') or 'local path')+'\n']
+            for notice in notices:
+                section.append('\n--- '+notice.relative_to(folder).as_posix()+' ---\n'+
+                               notice.read_text(encoding='utf-8', errors='replace')+'\n')
+        except (RuntimeError, OSError, ValueError) as exc:
+            errors.append(f"{package['name']} {package['version']}: {exc}")
+            continue
         count += 1
-        chunks.append('\n'+'='*72+'\n'+package['name']+' '+package['version']+'\nSPDX: '+str(package['license'])+
-                      '\nSource: '+str(package.get('repository') or package['source'])+'\n')
-        for notice in notices:
-            chunks.append('\n--- '+notice.relative_to(folder).as_posix()+' ---\n'+
-                          notice.read_text(encoding='utf-8', errors='replace')+'\n')
+        chunks.extend(section)
+    if errors:
+        raise RuntimeError('Rust dependency notice collection failed:\n- '+'\n- '.join(errors))
     output = root/'licenses/Rust-dependency-notices.txt'
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(''.join(chunks), encoding='utf-8')
