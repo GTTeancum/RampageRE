@@ -1,0 +1,35 @@
+Official Tcl 8.6.15 license provenance
+======================================
+
+CPython v3.12.10 pins Tcl/Tk binary bundle 8.6.15.2:
+https://github.com/python/cpython/blob/v3.12.10/PCbuild/tcltk.props
+
+Official binary bundle:
+Repository: python/cpython-bin-deps
+Commit: c807be2b19bafc06767b2ed8afec4d5f9a9553b2
+Path: amd64/tcllicense.terms
+Git blob SHA-1: 393489a07af7eccf240029f62ce513e6fdc1e96e
+Raw SHA-256 (CRLF): 41613eabfc08921a7da9c4bfd7f3ce5d5406f55214b253d89f392ed86eebeb8f
+URL: https://github.com/python/cpython-bin-deps/blob/c807be2b19bafc06767b2ed8afec4d5f9a9553b2/amd64/tcllicense.terms
+
+Matching official Tcl source notice, used verbatim with LF line endings:
+Repository: python/cpython-source-deps
+Commit: 275286594fd3e162af29e8c0ba4e365d3d1f7775
+Tag: tcl-core-8.6.15.0
+Path: license.terms
+Git blob SHA-1: d8049cd9e7ca055f7e584a76f88861a294b30c9c
+SHA-256 (LF): c0a69a2bfd757361ec7e6143973b103c90409316b49e9c88db26ad6388e79f16
+URL: https://github.com/python/cpython-source-deps/blob/275286594fd3e162af29e8c0ba4e365d3d1f7775/license.terms
+
+The two notices were compared and are byte-identical after CRLF-to-LF
+normalization. No license wording was changed.
+
+CPython's Windows installer copies the bundle's lib subtree. Tk's license
+is within lib/tk8.6, while Tcl's notice is outside lib at the path above:
+https://github.com/python/cpython/blob/v3.12.10/Tools/msi/tcltk/tcltk.wixproj
+
+The collector may use this pinned notice only when the active interpreter's
+"info patchlevel" is exactly 8.6.15 and no installed Tcl notice was found.
+It verifies the LF-normalized SHA-256 before copying the notice. Other
+versions, missing/corrupt notices, and missing Tk/PyInstaller notices remain
+errors. There are no build-time or runtime license downloads.

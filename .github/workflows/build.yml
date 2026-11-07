@@ -25,6 +25,7 @@ permissions:
 
 jobs:
   windows:
+    if: github.event_name != 'push' || !contains(github.event.head_commit.message, '[xbox-package-only]')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
@@ -129,6 +130,7 @@ jobs:
 
   # Ubuntu 22.04: glibc 2.35 and SDL 2.0.20, so the binary also runs on older distributions and on SteamOS.
   linux:
+    if: github.event_name != 'push' || !contains(github.event.head_commit.message, '[xbox-package-only]')
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
@@ -187,6 +189,7 @@ jobs:
 
   # The OpenGL ES path (GLES=1: src/gles, what a Switch or Android build draws with), built and smoke-tested; no package.
   linux-gles:
+    if: github.event_name != 'push' || !contains(github.event.head_commit.message, '[xbox-package-only]')
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
@@ -222,6 +225,7 @@ jobs:
   # also deletes the copied game files and the saves. The APK holds no game data: the app copies it from the user's disc
   # (or, in a bundle the user makes with make_android_bundle.bat, reads it from the APK itself).
   android:
+    if: github.event_name != 'push' || !contains(github.event.head_commit.message, '[xbox-package-only]')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -291,6 +295,7 @@ jobs:
   # Nintendo Switch homebrew (.nro) in devkitPro's own image, which holds devkitA64, libnx, switch-sdl2 and switch-mesa
   # (and sets DEVKITPRO). The same sources on OpenGL ES through src/gles, as linux-gles; nothing to run it on here.
   switch:
+    if: github.event_name != 'push' || !contains(github.event.head_commit.message, '[xbox-package-only]')
     runs-on: ubuntu-latest
     container: devkitpro/devkita64
     steps:
@@ -333,6 +338,7 @@ jobs:
   # PS Vita homebrew (.vpk) in VitaSDK's own image, which holds the toolchain, SDL2 and vitaGL (and sets VITASDK). The
   # same sources on OpenGL ES 2.0 through src/gles, as linux-gles; nothing to run it on here.
   vita:
+    if: github.event_name != 'push' || !contains(github.event.head_commit.message, '[xbox-package-only]')
     runs-on: ubuntu-latest
     container: vitasdk/vitasdk
     steps:
@@ -379,7 +385,7 @@ jobs:
   # The release notes: the annotated tag's message (what is new; its first line is the title of the tag), then how to start;
   # a tag with a suffix (v1.2.3-rc1) is published as a pre-release, a plain one (v1.2.3) as a release.
   release:
-    if: github.ref_type == 'tag'
+    if: (github.event_name != 'push' || !contains(github.event.head_commit.message, '[xbox-package-only]')) && (github.ref_type == 'tag')
     needs: [windows, linux, android, switch, vita]
     runs-on: ubuntu-latest
     permissions:

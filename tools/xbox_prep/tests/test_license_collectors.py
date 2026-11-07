@@ -38,9 +38,11 @@ class LicenseTests(unittest.TestCase):
     def distribution(self,name):
         if name not in self.dists:raise metadata.PackageNotFoundError(name)
         return self.dists[name]
-    def collect(self):
+    def collect(self, *, tcl_patchlevel=None, notice_dir=None):
         with redirect_stdout(io.StringIO()):
-            return pylicenses.collect(self.root/'out',prefix=self.prefix,tcl_library=self.tcl,distribution=self.distribution)
+            return pylicenses.collect(self.root/'out',prefix=self.prefix,tcl_library=self.tcl,
+                                      distribution=self.distribution,tcl_patchlevel=tcl_patchlevel,
+                                      notice_dir=notice_dir)
     def libraries(self):
         (self.tcl/'license.terms').write_text('Tcl copyright and permission notice')
         (self.tk/'license.terms').write_text('Tk copyright and permission notice')
@@ -73,6 +75,32 @@ class LicenseTests(unittest.TestCase):
     def test_required_hooks_notice_fails_closed(self):
         self.libraries();self.dists['pyinstaller-hooks-contrib'].files=[]
         with self.assertRaisesRegex(RuntimeError,'hooks-contrib has no nonempty'):self.collect()
+    def test_official_tcl_8615_fallback(self):
+        (self.tk/'license.terms').write_text('Tk permission notice')
+        copied=self.collect(tcl_patchlevel='8.6.15')
+        self.assertIn('Tcl-8.6.15-LICENSE.txt',copied)
+        self.assertIn('Tcl-8.6.15-PROVENANCE.txt',copied)
+        expected=(Path(pylicenses.__file__).parent/'notices/Tcl-8.6.15-LICENSE.txt').read_bytes()
+        self.assertEqual((self.root/'out/Tcl-8.6.15-LICENSE.txt').read_bytes(),expected)
+    def test_pinned_tcl_notice_not_used_for_other_version(self):
+        (self.tk/'license.terms').write_text('Tk permission notice')
+        with self.assertRaisesRegex(RuntimeError,'Missing required tcl'):
+            self.collect(tcl_patchlevel='8.6.14')
+    def test_pinned_tcl_notice_tampering_fails(self):
+        (self.tk/'license.terms').write_text('Tk permission notice')
+        notices=self.root/'notices';notices.mkdir()
+        (notices/'Tcl-8.6.15-LICENSE.txt').write_text('Altered terms')
+        with self.assertRaisesRegex(RuntimeError,'hash mismatch'):
+            self.collect(tcl_patchlevel='8.6.15',notice_dir=notices)
+    def test_missing_pinned_tcl_notice_fails(self):
+        (self.tk/'license.terms').write_text('Tk permission notice')
+        notices=self.root/'notices';notices.mkdir()
+        with self.assertRaisesRegex(RuntimeError,'Missing pinned official Tcl'):
+            self.collect(tcl_patchlevel='8.6.15',notice_dir=notices)
+    def test_tcl_fallback_does_not_waive_tk(self):
+        with self.assertRaisesRegex(RuntimeError,'Missing required tk'):
+            self.collect(tcl_patchlevel='8.6.15')
+
     def crate(self, explicit=None):
         folder=self.root/'crate';folder.mkdir()
         (folder/'Cargo.toml').write_text('[package]\nname="synthetic"\n')

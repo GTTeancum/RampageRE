@@ -2,6 +2,7 @@
 from importlib import metadata
 from pathlib import Path
 import argparse
+import hashlib
 import re
 import shutil
 import sys
@@ -24,7 +25,30 @@ def combined_tcl_tk(text):
     return bool((joint or separate) and re.search(r'(?i)copyright|permission|redistribution', text))
 
 
-def collect(output, *, prefix=None, tcl_library=None, distribution=None):
+PINNED_TCL = {
+    '8.6.15': ('Tcl-8.6.15-LICENSE.txt',
+               'c0a69a2bfd757361ec7e6143973b103c90409316b49e9c88db26ad6388e79f16'),
+}
+
+
+def pinned_tcl_notice(patchlevel, notice_dir=None):
+    """Use an exact official notice only for the matching active Tcl version."""
+    spec = PINNED_TCL.get(patchlevel)
+    if spec is None:
+        return None
+    folder = Path(notice_dir) if notice_dir is not None else Path(__file__).resolve().parent/'notices'
+    path = folder/spec[0]
+    if not nonempty(path):
+        raise RuntimeError(f'Missing pinned official Tcl {patchlevel} notice: {path}')
+    # Git and Windows checkouts can change line endings, never license words.
+    raw = path.read_bytes().replace(b'\r\n', b'\n')
+    if hashlib.sha256(raw).hexdigest() != spec[1]:
+        raise RuntimeError(f'Pinned official Tcl {patchlevel} notice hash mismatch: {path}')
+    return path
+
+
+def collect(output, *, prefix=None, tcl_library=None, distribution=None,
+            tcl_patchlevel=None, notice_dir=None):
     out = Path(output)
     out.mkdir(parents=True, exist_ok=True)
     prefix = Path(prefix) if prefix else Path(sys.base_prefix)
@@ -41,7 +65,10 @@ def collect(output, *, prefix=None, tcl_library=None, distribution=None):
     if python_license is None:
         raise RuntimeError(f'Cannot locate the Python redistribution license under {prefix}; include the exact official build notice before publishing.')
     save(python_license, 'Python-LICENSE.txt')
-    tcl = Path(tcl_library) if tcl_library else Path(tkinter.Tcl().eval('info library'))
+    interpreter = tkinter.Tcl() if tcl_library is None else None
+    tcl = Path(tcl_library) if tcl_library is not None else Path(interpreter.eval('info library'))
+    if tcl_patchlevel is None and interpreter is not None:
+        tcl_patchlevel = interpreter.eval('info patchlevel')
     found = {'tcl': False, 'tk': False}
     # Official Windows layouts use <Python>/tcl/tcl8.x and tk8.x. Tcl's
     # reported library path also covers non-default install locations.
@@ -69,6 +96,13 @@ def collect(output, *, prefix=None, tcl_library=None, distribution=None):
                 save(path, 'tk-'+path.name+'.txt'); found['tk'] = True
             elif ('tcl' in name and 'tk' in name) or combined_tcl_tk(path.read_text(encoding='utf-8',errors='replace')):
                 save(path, 'Tcl-Tk-'+path.name+'.txt'); found = {'tcl': True, 'tk': True}
+    if not found['tcl']:
+        fallback = pinned_tcl_notice(tcl_patchlevel, notice_dir)
+        if fallback is not None:
+            save(fallback, fallback.name)
+            provenance = fallback.with_name(f'Tcl-{tcl_patchlevel}-PROVENANCE.txt')
+            save(provenance, provenance.name)
+            found['tcl'] = True
     missing = [name for name, present in found.items() if not present]
     if missing:
         raise RuntimeError('Missing required '+', '.join(missing)+' redistribution notices. Checked the active Tcl library, '

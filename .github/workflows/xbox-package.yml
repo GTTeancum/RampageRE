@@ -15,7 +15,7 @@ jobs:
           submodules: false
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.12.10'
       - name: Verify frozen console runtime and source
         run: python packaging/xbox/package.py --verify-runtime
       - name: Test preparation engine with synthetic data
