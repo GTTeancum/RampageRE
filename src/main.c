@@ -186,6 +186,7 @@ typedef struct Mon {
     float fart_in[4];                                /* installObjectTimer("Monsters::timedDoFart", 2): due in, 0 none */
     float thrown_t;                                  /* +0xA94: 1 s from a throw (0x2DA28C), the camera's */
     char rage_fx_name[32]; int rage_fx, rage_on;     /* its book's MonsterFx RageFx (+0x164) and the one on (+0x168) */
+    char lift_node[32];                              /* its book's MiscData|LiftNodeName (+0x100), "" none: Lift_Node */
     int nick, nick_fx[3];                            /* Nick's fire and eyes (+0x174 .. +0x17C): 0 not Nick, 1 to
                                                       * start, 2 on, 3 shut down (becomeHuman, till the respawn) */
     float face_ev;                                   /* the face's event player's time (+0x7DE8 +0x8), a share */
@@ -339,6 +340,9 @@ typedef struct Viewer {
      * simulated time ap_t; the autopilot's next press, the mode, players, bots and city (-1 the campaign's next) it
      * goes for, the demos it waits for (no presses in the menus) */
     Autoplay *ap; double ap_t; float ap_wait;
+    FILE *movelog; int movelog_frame;                /* --movelog: player 1's move runner, a line a frame */
+    int replay_frame; float replay_rows[2][3];       /* replay_log: the camera axes the game's monster read the stick
+                                                        in (+0xA18, +0xA24), for player 1 in place of the port's */
     int ap_type, ap_players, ap_bots, ap_city, ap_demos;
     int bot_guard_falls;                             /* buildings the bots' 60 s guard felled (for the watchdog) */
     int play_values[8];                              /* gWorld.getPlayValue / setPlayValue (0x4D201C): the run's, never
@@ -667,6 +671,8 @@ static int start_moves(Mon *mo)
     if (scene_construction_stop(mo->v)) return -1;   /* (0x2F5D80) */
         snprintf(mo->rage_fx_name, sizeof mo->rage_fx_name, "%s", rage ? rage : "");
         g = mon_props(mo, "MiscData");
+        const char *lift = g.at ? group_str(g, "LiftNodeName") : NULL;   /* (0x2E98C0 .. 0x2EAB10) */
+        snprintf(mo->lift_node, sizeof mo->lift_node, "%s", lift ? lift : "");
     if (scene_construction_stop(mo->v)) return -1;
         foot_init(&mo->feet, g.at && group_num(g, "DisableFootDrag", 0) != 0);
     if (scene_construction_stop(mo->v)) return -1;
@@ -1845,6 +1851,8 @@ static int open_city(Viewer *v, int index, uint32_t block, int game_block)
 /* the viewer's answers to the graph's script checks (Monsters.bsf: there are no buildings, people or power-ups to
  * test against here, so only the monster's own abilities say yes) */
 static int attach_world(Mon *mo, const char *name, Mat4 *out);
+static int lift_world(Mon *mo, Mat4 *out);
+static int mon_node_world(Mon *mo, const char *name, Mat4 *out);
 static int window_person(Mon *mo, const float *xyz);
 static int window_soldier(Mon *mo, const float *xyz);
 
@@ -2541,9 +2549,16 @@ static void grab_nearest(Mon *mo)
     Viewer *v = mo->v;
     Mat4 h;
     /* the hold (0x2DA4A0 -> 0x2DA310) takes nothing while the hand holds a valid object, of whatever kind [R] */
-    if (held_anything(mo) || !v->scene.folk || attach_world(mo, "Helper R Hand", &h) != 0)
+    if (held_anything(mo) || !v->scene.folk)
         return;
-    float hand[3] = { h.m[12], h.m[13], h.m[14] }, root[3] = { mo->mx, mo->my, mo->mz };
+    /* the hand: the script's node by name (0x2AB8E8: vtable +0x48, 0x2E54A0: a bone of the skeleton, else an
+     * attachment node); a monster without one (Nick and Dick have no Helper R Hand) gets -1, and the search is
+     * from its body centre, the feet + MONSTER_DATA +0x1A0 / +0x1A4 (0x2D9A44 -> 0x2DA820, + its place) [R] */
+    float hand[3], root[3] = { mo->mx, mo->my, mo->mz };
+    if (attach_world(mo, "Helper R Hand", &h) == 0) {
+        hand[0] = h.m[12]; hand[1] = h.m[13]; hand[2] = h.m[14];
+    } else
+        mon_body_centre(mo, hand);
     Mat4 n0;                                     /* in front of node 0 (Bip01) as posed, by the node getter that
                                                   * gives the hand (vtable +0x4C(0): 0x2D9AF8 .. 0x2D9B30) [R] */
     const Instance *rin = mon_in(mo);
@@ -5009,7 +5024,7 @@ static void vehicle_step(Viewer *v, float dt, const ArmyMonster *m, int nm, cons
     for (int k = 0; k < v->nmon; k++) {              /* one in a monster's hand (before what follows it) */
         Mon *mo = &v->mon[k];
         Mat4 h;
-        if (mo->held_vehicle >= 0 && attach_world(mo, "Helper R Hand", &h) == 0)
+        if (mo->held_vehicle >= 0 && lift_world(mo, &h) == 0)
             { vehicle_hold(v->veh, mo->held_vehicle, h.m, mo->mirror, dt); if (scene_construction_stop((Viewer *)v)) return; }
     }
     for (int k = 0; k < v->nvfx; k++) {              /* the effects that follow their vehicle, while it is there */
@@ -5152,7 +5167,7 @@ static void rail_step(Viewer *v, float dt, const ArmyMonster *m, int nm)
     for (int k = 0; k < v->nmon; k++) {              /* one in a monster's hand (before what follows it) */
         Mon *mo = &v->mon[k];
         Mat4 h;
-        if (mo->held_rail >= 0 && attach_world(mo, "Helper R Hand", &h) == 0)
+        if (mo->held_rail >= 0 && lift_world(mo, &h) == 0)
             { rail_hold(v->rail, mo->held_rail, h.m, mo->mirror, dt); if (scene_construction_stop((Viewer *)v)) return; }
     }
     for (int k = 0; k < v->nrfx; k++) {              /* the effects that follow their object, while it is there */
@@ -5299,7 +5314,7 @@ static void parade_step(Viewer *v, float dt, const ArmyMonster *m, int nm)
     for (int k = 0; k < v->nmon; k++) {              /* one in a monster's hand (before what follows it) */
         Mon *mo = &v->mon[k];
         Mat4 h;
-        if (mo->held_parade >= 0 && attach_world(mo, "Helper R Hand", &h) == 0)
+        if (mo->held_parade >= 0 && lift_world(mo, &h) == 0)
             { parade_hold(v->parade, mo->held_parade, h.m, mo->mirror, dt); if (scene_construction_stop((Viewer *)v)) return; }
     }
     for (int k = 0; k < v->npfx; k++) {              /* the effects that follow their object, while it is there */
@@ -5464,7 +5479,7 @@ static void street_step(Viewer *v, float dt)
                                                       * what follows it) */
         Mon *mo = &v->mon[k];
         Mat4 h;
-        if (mo->held_sobj >= 0 && attach_world(mo, "Helper R Hand", &h) == 0)
+        if (mo->held_sobj >= 0 && lift_world(mo, &h) == 0)
             { streetobj_hold(v->sobj, mo->held_sobj, h.m, mo->mirror, dt); if (scene_construction_stop((Viewer *)v)) return; }
     }
     for (int i = 0, n = streetobj_count(v->sobj); i < n; i++) {   /* drawn where they are now */
@@ -5794,7 +5809,7 @@ static void army_step(Viewer *v, float dt)
     for (int k = 0; k < v->nmon; k++) {              /* a unit in a monster's hand (before what follows it) */
         Mon *mo = &v->mon[k];
         Mat4 h;
-        if (mo->held_unit >= 0 && attach_world(mo, "Helper R Hand", &h) == 0)
+        if (mo->held_unit >= 0 && lift_world(mo, &h) == 0)
             { army_hold(v->army, mo->held_unit, h.m, mo->mirror, dt); if (scene_construction_stop((Viewer *)v)) return; }
     }
     for (int k = 0; k < v->nfxa; k++) {              /* the effects that follow their unit or shot */
@@ -5904,8 +5919,10 @@ static int ends_with_i(const char *s, const char *tail)
     return a >= b && _stricmp(s + a - b, tail) == 0;
 }
 
-/* an attachment node of MONSTER_DATA (+0xA84) in the world as drawn: its bone's place x its matrix (rows, then the
- * place); mirrored, the other side's node on the other side's bone, reflected; 0 = ok */
+/* an attachment node of MONSTER_DATA (+0xA84) in the world as drawn (0x2E4FF0 for a node past the bones): its
+ * bone's place x its matrix (rows, then the place); mirrored, the node of the other side (+0x36, 0x2E51D4) on its
+ * bone as the game's mirrored pose has it (the other side's node reflected, scene_monster_node), so a mirrored clip's
+ * grab holds in the hand that grabs, as 0x2DACA0 does for the effects' nodes (mon_fx_frame); 0 = ok */
 static int attach_world(Mon *mo, const char *name, Mat4 *out)
 {
     if (!mo->have_graph || !mon_in(mo))
@@ -5915,27 +5932,41 @@ static int attach_world(Mon *mo, const char *name, Mat4 *out)
     for (int i = 0; i < mo->graph.nattach && !a; i++)
         if (mo->graph.attach[i].name && ends_with_i(mo->graph.attach[i].name, name))
             a = &mo->graph.attach[i];
-    if (!a || a->bone < 0 || (uint32_t)a->bone >= in->tree.n)
+    if (a && mo->mirror && a->mirror >= 0 && a->mirror < mo->graph.nattach)
+        a = &mo->graph.attach[a->mirror];
+    Mat4 w;
+    if (!a || a->bone < 0 || (uint32_t)a->bone >= in->tree.n ||
+        scene_monster_node(&mo->v->scene, mo->slot, in->tree.nodes[a->bone].name, &w) != 0)
         return -1;
-    if (mo->mirror) {                                 /* the partner bone's own attachment */
-        int mb = in->tree.nodes[a->bone].mirror;
-        for (int i = 0; i < mo->graph.nattach; i++)
-            if (mo->graph.attach[i].bone == mb && mb != a->bone)
-                a = &mo->graph.attach[i];
-    }
     Mat4 t = mat_identity();
     for (int i = 0; i < 3; i++)
         for (int j = 0; j < 3; j++)
             t.m[4 * i + j] = a->m[3 * i + j];
     for (int j = 0; j < 3; j++)
         t.m[12 + j] = a->m[9 + j];
-    Mat4 m = mat_mul(in->node[a->bone], t);
-    if (mo->mirror)
-        for (int c = 0; c < 4; c++) {                /* S m S */
-            m.m[4 * c] = -m.m[4 * c];
-            m.m[c] = -m.m[c];
-        }
-    *out = mat_mul(in->base, m);
+    *out = mat_mul(w, t);
+    return 0;
+}
+
+/* where a held object hangs (0x2DAD50, for the HeldObjectMover's grab 0x310ED0 and each frame 0x3109E0) [R]: the
+ * node at monster +0x100, which the setup sets to -1 (0x2E9914) and resolves only from its book's
+ * MiscData|LiftNodeName (0x2EAAB8 .. 0x2EAB10, by name through vtable +0x48; the node getter vtable +0x4C): only Cal's
+ * and Jill's books have one ("Helper R Hand"); for the rest (-1) the skeleton's own Lift_Node bone (+0x7DB4), which
+ * the grab, hold, throw and eat clips key apart from the hand: George's hold hangs a person from the fist and stands
+ * a car up in it, the Lizzie skeleton's eats toss the person off the hand and into the mouth. Its place x the scale
+ * (+0xA78 while +0xA74), its axes the bone's, 1 long (the port's base matrix is scaled). [G] A skeleton without a
+ * Lift_Node falls back to Helper R Hand; 0 = ok */
+static int lift_world(Mon *mo, Mat4 *out)
+{
+    int r = mo->lift_node[0] ? mon_node_world(mo, mo->lift_node, out) :
+                               scene_monster_node(&mo->v->scene, mo->slot, "Lift_Node", out);
+    if (r != 0 && (r = attach_world(mo, "Helper R Hand", out)) != 0)
+        return r;
+    for (int a = 0; a < 3; a++) {
+        float *c = &out->m[4 * a], l = sqrtf(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
+        for (int k = 0; l > 1e-6f && k < 3; k++)
+            c[k] /= l;
+    }
     return 0;
 }
 
@@ -6400,6 +6431,7 @@ static void mon_step(Mon *mo, float dt)
         in->v[MV_LX] = lx;
         in->v[MV_LY] = ly;
         for (int k = MV_UP; k <= MV_L3; k++) {
+            if (in->v[k] && !held[k] && !pressed[k]) in->gone[k] = 0.2f;   /* let go (the release, 0x2C1A60) */
             in->v[k] = held[k] || pressed[k];
             if (pressed[k]) in->fresh[k] = 0.2f;
         }
@@ -6412,21 +6444,30 @@ static void mon_step(Mon *mo, float dt)
         const MoveState *st = &mo->graph.states[mo->run.state];
         /* the camera frame the stick is read in: every frame (0x2E0738), or, in a NODE_HOLD_FRAME state, only when the
          * stick moves (0x2E8190), so a climb keeps its direction while the camera swings */
-        if (!(st->flags & NODE_HOLD_FRAME) || lx != mo->stick[0] || ly != mo->stick[1])
+        if (v->replay_frame && mo == &v->mon[0])     /* a replay: the game's own (replay_log) */
+            memcpy(mo->frame, v->replay_rows, sizeof mo->frame);
+        else if (!(st->flags & NODE_HOLD_FRAME) || lx != mo->stick[0] || ly != mo->stick[1])
             memcpy(mo->frame, v->view.rows, sizeof mo->frame);
         mo->stick[0] = lx;
         mo->stick[1] = ly;
         float t0 = mo->run.time, length = st->length;
         float cdt = dt * mo->power.speed;             /* the clips run at the speed scale x their rate (0x2EBFE0:
                                                       * setSpeedScale, the rage's 1.33, the speed power-up) */
-        int ev = -1, was_mode = mo->mode;            /* the mode 0x2E2770 switches on (the landing sets 4) */
-        if (mo->force_to > 0 && mo->force_to <= mo->graph.n) {   /* a played reaction (force_state) */
-            moves_force(&mo->run, mo->force_to - 1);
-            ev = 0;
-        }
-        mo->force_to = 0;
+        int ev = -1;
         mo->water_tested = 0;                        /* 0x2DE5BC: the water is asked anew each frame */
         mo->under_tested = 0;                        /* 0x2DE5A4: and the building under it */
+        /* the clip's events up to where this frame takes it come first: the animation's update (0x2FFF10 -> 0x2E95D0
+         * -> 0x2F45D0 -> 0x2E7840) runs before the monster's update and the controller's runner (0x2C0AD0) [R by the
+         * game's trace, tools/movelog.py: Ground_Grab_Down's doGrabObject at 0.339 s answers pickupSuccess in the frame
+         * whose step crosses it; Jump_Start_1's 16 up at 0.136 is moved and pulled down by gravity in that frame] */
+        clip_events(mo, st, t0, t0 + cdt < length ? t0 + cdt : length);
+        if (scene_construction_stop(v)) return;
+        int was_mode = mo->mode;                     /* the mode 0x2E2770 switches on (the landing sets 4) */
+        /* a posted state (the start record +0x110: playReaction, resetMonsterState, the respawn's drop, an event's):
+         * the controller takes it in right after the runner, the same frame (0x2C0DC4 .. 0x2C0E1C -> 0x2EBF50), so the
+         * state playing runs this frame first, and a goal of the AI that posts one in its update wins [R] */
+        int posted = mo->force_to > 0 && mo->force_to <= mo->graph.n ? mo->force_to - 1 : -1;
+        mo->force_to = 0;
         if (mo->mode == MODE_AIRBORNE) {             /* the air (0x2DEBD8, mode 1 of 0x2DEBB0's switch) */
             float pos[3] = { mo->mx, mo->my, mo->mz };  /* 0x2DEBD8: drag, the move, gravity */
             monster_air_velocity(mo->vel, pos, dt, mo->no_gravity);
@@ -6473,11 +6514,12 @@ static void mon_step(Mon *mo, float dt)
                 /* landed (0x2DC450): slot 56 in the current column, taken as setReaction does (not defeated, not
                  * shrunk below 0.3, 0x2DC5E0 .. 0x2DC610) and let go (0x2DA570, 0x2DC628) */
                 int to = mo->defeated || mo->scale < 0.3f ? -1 : moves_slot(&mo->graph, SLOT_LAND, mo->column);
-                if (to >= 0) {
+                if (to >= 0) {                       /* posted (+0x110): the state in the air runs this frame yet,
+                                                      * the controller starts the landing after it [R by the game's
+                                                      * trace, tools/movelog.py] */
                     let_go(mo, 0);
     if (scene_construction_stop(mo->v)) return;
-                    moves_force(&mo->run, to);
-                    ev = 0;
+                    posted = to;
                 }
                 mo->mode = MODE_PRONE;
                 memset(mo->vel, 0, sizeof mo->vel);
@@ -6487,7 +6529,7 @@ static void mon_step(Mon *mo, float dt)
              * gravity and no ground follow, mounted or not (a knock-off's clip holds it where it is till its own
              * mode event, after unmountBuilding); only below a ground at or under the street it is lifted, 0.4 x
              * ground + 0.6 x z a world step (0x2E06E0 .. 0x2E0730) */
-            if (ev != 0)
+            if (ev != 0 && posted < 0)
                 memset(mo->vel, 0, sizeof mo->vel);
             float g = ground_at(mo);
             if (mo->mz < g && g <= 0)
@@ -6587,6 +6629,20 @@ static void mon_step(Mon *mo, float dt)
             const Instance *ik = mon_in(&v->mon[k]);
             nai += v->mon[k].is_ai && !(ik && ik->hidden);
         }
+        if (v->movelog && mo == &v->mon[0] && dt > 0) {   /* --movelog: the game's line (tools/movelog.py), as the
+                                                      * runner starts its frame, after the events and the update */
+            uint32_t btn = 0;
+            for (int k = MV_UP; k <= MV_L3; k++)
+                btn |= (in->v[k] != 0) << k;
+            float h = mo->heading / 57.2957795f;     /* rot: the matrix's first two rows, x and y (right, forward) */
+            fprintf(v->movelog, "F %d dt %.6f sp %.4f st %d t %.6f pick %d wait 0 btn %x lx %.3f ly %.3f hp %.3f en %.3f "
+                    "mode %d mir %d pos %.4f %.4f %.4f rot %.4f %.4f %.4f %.4f vel %.3f %.3f %.3f np %d nb %d ai %d "
+                    "frm %.3f %.3f %.3f %.3f\n", ++v->movelog_frame, dt, mo->power.speed, mo->run.state, mo->run.time,
+                    mo->run.chosen, btn, lx, ly, mo->hp, mo->energy, mo->mode, mo->mirror, mo->mx, mo->my, mo->mz,
+                    cosf(h), sinf(h), -sinf(h), cosf(h), mo->vel[0], mo->vel[1], mo->vel[2], v->nmon, v->num_bots,
+                    mo->is_ai, mo->frame[0][0], mo->frame[0][1], mo->frame[1][0], mo->frame[1][1]);
+            fflush(v->movelog);
+        }
         int switched = ev == 0 || (mo->is_ai && mo->have_ag ?   /* the AI picks the transitions (0x2E1AA0) */
                                    dir_ai_step(&mo->ai, &mo->ag, &mo->run, root, cdt, dt, nai, answer, mo) :
                                    moves_step(&mo->run, in, cdt, answer, mo));
@@ -6596,6 +6652,13 @@ static void mon_step(Mon *mo, float dt)
             else if (v->game)
                 game_move_done(v->game, mo->slot);
         float t1 = switched ? (ev == 0 ? t0 : (t0 + cdt < length ? t0 + cdt : length)) : mo->run.time;
+        if (posted >= 0 && ev != 0 && !(mo->is_ai && mo->ai.forced)) {   /* the posted state, after the runner */
+            moves_force(&mo->run, posted);
+            if (!switched)
+                t1 = t0 + cdt < length ? t0 + cdt : length;   /* (the clip played on to here first) */
+            switched = 1;
+            ev = 0;                                  /* a forced start: no transition (below) */
+        }
         float a[3], b[3], q[4];                      /* the root's travel and turn this frame the state hands the monster */
         if (root_at(mo, clip_at(mo, st, t0), a, q) == 0 && root_at(mo, clip_at(mo, st, t1), b, q) == 0) {
             float c = cosf(mo->heading / 57.2957795f), s = sinf(mo->heading / 57.2957795f);
@@ -6608,9 +6671,6 @@ static void mon_step(Mon *mo, float dt)
             if (st->flags & NODE_ROOT_TURN)
                 mo->heading += m * root_turn(mo, clip_at(mo, st, t0), clip_at(mo, st, t1));
         }
-        clip_events(mo, st, t0, t1);
-    if (scene_construction_stop(mo->v)) return;                  /* the old clip's events up to now */
-        if (scene_construction_stop(v)) return;
         if (mo->mode == MODE_BUILDING && mo->mount.at.building >= 0) {   /* held on the face (0x2D5870) */
             float pos[3] = { mo->mx, mo->my, mo->mz }, delta[3] = { mo->mx - before[0], mo->my - before[1], mo->mz - before[2] };
             float h = mo->heading;
@@ -6883,7 +6943,7 @@ static void play_step(Viewer *v, float dt, float aspect)
             Mat4 h;
             if (mo->held >= 0 && people_get(v->scene.folk, mo->held)->phase != PP_HELD)
                 mo->held = -1;
-            if (mo->held >= 0 && attach_world(mo, "Helper R Hand", &h) == 0)
+            if (mo->held >= 0 && lift_world(mo, &h) == 0)
                 { people_hold(v->scene.folk, mo->held, h.m, mo->mirror, dt); if (scene_construction_stop((Viewer *)v)) return; }
         }
         PeopleEvent ev[32];
@@ -7391,6 +7451,61 @@ static void game_next_block(Viewer *v)
  * play that player's monster (the others' keys idle meanwhile, the computer's monsters go on). Once the game goes back
  * to the shell the words stop: the ones left are returned (NULL none), for the shell */
 static void attract_press(Viewer *v);
+
+/* --do "replay FILE": the recompiled game's move log (tools/movelog.py, PS2X_MOVELOG) played back: each line's pad
+ * variables (the buttons 4 .. 21 as held, a press where one was not held the line before; the left stick) drive the
+ * monster for one frame of the line's dt, as the game's runner read them; with --movelog the port writes the same
+ * lines to compare */
+static void replay_log(Viewer *v, Mon *mo, const char *path, float aspect)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "replay: cannot read %s\n", path);
+        return;
+    }
+    char line[1024];
+    uint32_t prev = 0;
+    int warned = 0;
+    while (fgets(line, sizeof line, f) && !v->exit_game) {
+        unsigned frame;
+        float dt;
+        const char *b = strstr(line, " btn "), *x = strstr(line, " lx "), *y = strstr(line, " ly ");
+        if (sscanf(line, "F %u dt %f", &frame, &dt) != 2 || !b || !x || !y)
+            continue;
+        uint32_t btn = (uint32_t)strtoul(b + 5, NULL, 16);
+        for (int j = 0; j < v->nmon; j++)            /* the keys' pads idle, this monster's from the line */
+            if (v->mon[j].drive != DRIVE_COMPUTER)
+                memset(&v->mon[j].pad, 0, sizeof v->mon[j].pad);
+        for (int k = MV_UP; k <= MV_L3; k++) {
+            mo->pad.held[k] = (uint8_t)(btn >> k & 1);
+            mo->pad.pressed[k] = (uint8_t)((btn >> k & 1) && !(prev >> k & 1));
+        }
+        mo->pad.lx = strtof(x + 4, NULL);
+        mo->pad.ly = strtof(y + 4, NULL);
+        prev = btn;
+        const char *fr = strstr(line, " frm "), *np = strstr(line, " np ");
+        float a[4];
+        if (fr && sscanf(fr + 5, "%f %f %f %f", &a[0], &a[1], &a[2], &a[3]) == 4) {
+            /* the stick's frame as the game's monster had it: the comparison leaves the camera out */
+            float rows[2][3] = { { a[0], a[1], 0 }, { a[2], a[3], 0 } };
+            memcpy(v->replay_rows, rows, sizeof rows);
+            v->replay_frame = 1;
+        }
+        if (np && atoi(np + 4) != v->nmon && !warned) {
+            fprintf(stderr, "replay: the game had %d players, here %d (--players)\n", atoi(np + 4), v->nmon);
+            warned = 1;
+        }
+        play_step(v, dt, aspect);
+        if (pose_monsters(v, 0)) {                   /* posed each frame, as the main loop does */
+            scene_update(&v->scene, 0);
+            hit_spheres_all(v);
+        }
+        game_next_block(v);
+    }
+    v->replay_frame = 0;
+    fclose(f);
+}
+
 static const char *play_script(Viewer *v, const char *script, float aspect)
 {
     if (scene_construction_stop((Viewer *)v)) return NULL;
@@ -7425,6 +7540,16 @@ static const char *play_script(Viewer *v, const char *script, float aspect)
                 mo = &v->mon[k];
             else
                 printf("no player %d\n", k + 1);
+            continue;
+        }
+        if (_stricmp(word, "replay") == 0) {         /* replay FILE: the game's own move log, frame by frame */
+            char path[512];
+            int k = 0;
+            while (*p == ' ') p++;
+            while (*p && *p != ',' && k < (int)sizeof path - 1) path[k++] = *p++;
+            while (k > 0 && path[k - 1] == ' ') k--;
+            path[k] = 0;
+            replay_log(v, mo, path, aspect);
             continue;
         }
         if (_stricmp(word, "mirror") == 0) {         /* the next clip mirrored, as an event of type 8 would */
@@ -9197,6 +9322,10 @@ static int viewer_main(int argc, char **argv)
         }
         else if (strcmp(argv[i], "--autoplay") == 0) autoplay = 1;   /* the playthrough test (docs/NATIVE.md) */
         else if (strcmp(argv[i], "--ap-log") == 0 && i + 1 < argc) ap_log = argv[++i];
+        else if (strcmp(argv[i], "--movelog") == 0 && i + 1 < argc) {   /* tools/movelog.py */
+            v.movelog = fopen(argv[++i], "w");
+            if (!v.movelog) fprintf(stderr, "cannot write %s\n", argv[i]);
+        }
         else if (strcmp(argv[i], "--ap-shots") == 0 && i + 1 < argc) ap_shots = argv[++i];
         else if (strcmp(argv[i], "--ap-minutes") == 0 && i + 1 < argc) ap_lim.minutes = atof(argv[++i]);
         else if (strcmp(argv[i], "--ap-blocks") == 0 && i + 1 < argc) ap_lim.blocks = atoi(argv[++i]);
@@ -9797,15 +9926,17 @@ leave_world:
         }
         game_next_block(&v);                         /* the game moved on to the next block */
         if (v.exit_game) continue;
-        if (w.pressed[VK_NEXT] && v.nblocks) { v.block = (v.block + 1) % v.nblocks; build(&v); }
+        int vk = !v.shell_mode;                      /* the viewer's keys: none in a game from the front end (1 .. 7,
+                                                      * N, M, G there left the game's city, block or monster, issue #7) */
+        if (vk && w.pressed[VK_NEXT] && v.nblocks) { v.block = (v.block + 1) % v.nblocks; build(&v); }
         if (v.exit_game) continue;
-        if (w.pressed[VK_PRIOR] && v.nblocks) { v.block = (v.block + v.nblocks - 1) % v.nblocks; build(&v); }
+        if (vk && w.pressed[VK_PRIOR] && v.nblocks) { v.block = (v.block + v.nblocks - 1) % v.nblocks; build(&v); }
         if (v.exit_game) continue;
-        if (w.pressed['N']) { v.night = !v.night; build(&v); }
+        if (vk && w.pressed['N']) { v.night = !v.night; build(&v); }
         if (v.exit_game) continue;
-        if (w.pressed['F']) v.fog = !v.fog;
-        if (w.pressed['H']) v.show_hits = !v.show_hits;
-        if (w.pressed['M']) {                        /* player 1's monster: the next one */
+        if (vk && w.pressed['F']) v.fog = !v.fog;
+        if (vk && w.pressed['H']) v.show_hits = !v.show_hits;
+        if (vk && w.pressed['M']) {                  /* player 1's monster: the next one */
             v.mon[0].monster = v.mon[0].monster + 1 < (int)v.nmonsters ? v.mon[0].monster + 1 : -1;
             for (int k = 1; k < v.nmon; k++)         /* (the others keep theirs; with none, none at all) */
                 if (v.mon[k].monster < 0)
@@ -9814,7 +9945,7 @@ leave_world:
             build(&v);
             if (v.exit_game) continue;
         }
-        if (w.pressed['G'] && have_monster(&v)) {
+        if (vk && w.pressed['G'] && have_monster(&v)) {
             v.play = !v.play;
             cam_init(&v.cam, &v.cam_settings);
             dircam_init(&v.cd, &v.cam);
@@ -9824,12 +9955,12 @@ leave_world:
                     play_state(&v.mon[k]);
             if (scene_construction_stop(&v)) continue;
         }
-        if (have_monster(&v) && !v.play && (w.pressed['K'] || w.pressed['L'])) {
+        if (vk && have_monster(&v) && !v.play && (w.pressed['K'] || w.pressed['L'])) {
             v.clip = w.pressed['L'] ? v.clip + 1 : (v.clip > 0 ? v.clip - 1 : 0);
             build(&v);
             if (v.exit_game) continue;
         }
-        for (int i = 0; i < ncities && !v.exit_game; i++)
+        for (int i = 0; vk && i < ncities && !v.exit_game; i++)
             if (w.pressed['1' + i] && i != v.city_index)
                 open_city(&v, i, 0, -1);
         if (v.exit_game) continue;
@@ -9842,7 +9973,8 @@ leave_world:
         if (playing) {
             float aspect = w.width ? (float)w.height / w.width : 0.75f;
             if (shot && !settled) {                     /* a shot: the camera settles, then the script */
-                if (!v.ap)                           /* (--autoplay: its words first, then it plays on) */
+                if (!v.ap && !(script && !_strnicmp(script, "replay", 6)))   /* (--autoplay: its words first, then
+                                                      * it plays on; a replay from the game's first frame) */
                     play_script(&v, "wait 2", aspect);
                 if (scene_construction_stop(&v) || v.exit_game)
                     continue;

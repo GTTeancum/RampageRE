@@ -201,6 +201,7 @@ int moves_read(const Bundle *b, MoveGraph *g)
                 g->attach[k].m[j] = rdf(a + 4 * j);
             g->attach[k].name = name_at(b, (int32_t)rd32(a + 0x30));
             g->attach[k].bone = (int)(rd32(a + 0x34) & 0xFFFF);
+            g->attach[k].mirror = (int16_t)(rd32(a + 0x34) >> 16);
         }
     }
     int32_t fxsel = (int32_t)rd32(d + 0x9C8);         /* 0x2F3950: +0xA80[+0x9C8], none when < 0 */
@@ -426,6 +427,12 @@ void moves_derive(MoveInput *in)
         int k = (int)floorf(a / (3.14159265f / 4));
         v[OCTANT[(k % 8 + 8) % 8]] = 1;
     }
+    /* [R 0x2C1950 .. 0x2C1A0C] an eighth is new while either axis moved lately (its count of frames since a stick
+     * event that was not 0 at most 2, 0x2C14B8) and the stick points there: Front_Climb_Up's and Front_Idle_Up's
+     * L.left == 1 (new) into Front_Transition_Mirror, Jump_Mount_Side_L_Impact's L.right == 1 (new) */
+    float moved = fmaxf(in->fresh[MV_LX], in->fresh[MV_LY]);
+    for (int k = MV_L_UP; k <= MV_L_DOWNRIGHT; k++)
+        in->fresh[k] = v[k] > 0 ? moved : 0;
     v[MV_TRUE] = 1;
     v[MV_FALSE] = 0;
     in->fresh[MV_TRUE] = 1;
@@ -439,6 +446,10 @@ static int holds(const MoveCond *c, const MoveInput *in)
     if (c->var >= MV_COUNT)
         return 0;
     uint32_t var = c->var;
+    if (var == MV_FALSE)                             /* [R 0x2EC598 .. 0x2EC5C4, 0x2EC7C8 ..] false never holds and */
+        return 0;                                    /* true always does, held or new, whatever the test: so each */
+    if (var == MV_TRUE)                              /* monster's held false == 0 into its Side_L_Punch_Flurry */
+        return 1;                                    /* (from 0.75 s, priority 3) is switched off too */
     if ((c->flags & 2) && in->mirrored) {            /* mirrored: the other side (0x2C1638, 0x2C1688) */
         static const uint8_t SWAP[][2] = { { 50, 53 }, { 51, 54 }, { 52, 55 }, { 33, 34 }, { 41, 42 }, { 43, 44 },
                                            { 46, 47 } };
@@ -446,6 +457,10 @@ static int holds(const MoveCond *c, const MoveInput *in)
             if (var == SWAP[k][0]) { var = SWAP[k][1]; break; }
             else if (var == SWAP[k][1]) { var = SWAP[k][0]; break; }
     }
+    union { uint32_t u; float f; } u = { c->value };
+    if (!(c->flags & 1) && var < MV_R_SIZE && c->op == 4 &&   /* [R 0x2EC630 .. 0x2EC734] a "new" == 0 of a button */
+        (is_bool(var) ? (c->value & 0xFF) == 0 : u.f == 0))   /* or an axis: let go lately (0x2C1A60, its count of */
+        return in->gone[var] > 0;                    /* frames since <= 2), the front's Circle == 0 into the release */
     if (!(c->flags & 1) && in->fresh[var] <= 0)      /* a "new" condition: the input must have just come */
         return 0;
     float a = in->v[var], b;
@@ -453,7 +468,6 @@ static int holds(const MoveCond *c, const MoveInput *in)
         a = a != 0;
         b = (c->value & 0xFF) != 0;
     } else {
-        union { uint32_t u; float f; } u = { c->value };
         b = u.f;
     }
     switch (c->op) {
@@ -586,8 +600,10 @@ int moves_step(MoveRunner *r, MoveInput *in, float dt, MoveCall call, void *ctx)
             }
         }
     }
-    for (int k = 0; k < MV_COUNT; k++)               /* inputs age; a switch uses them up */
+    for (int k = 0; k < MV_COUNT; k++) {             /* inputs age; a switch uses them up */
         in->fresh[k] = switched ? 0 : in->fresh[k] - dt;
+        in->gone[k] = switched ? 0 : in->gone[k] - dt;
+    }
     return switched;
 }
 

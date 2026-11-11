@@ -32,7 +32,7 @@ Offsets from the start of the entry. The tables follow each other from 0xAA8 in 
 | 0xA58 / 0xA5C | start lists | 29 × 12 at 0xF760 | u32 ?, offset of a state, u32 flags (8: keep a time) |
 | 0xA94 / 0xA98 | slot columns | 6 × 0x128 at 0xF8BC | 74 slots each overriding the defaults (−1 = keep), see "Slots" |
 | 0xA78 / 0xA7C / 0xA80 | effect slot nodes | 2 at 0xFFAC, pointers at 0x1022C | each {u32 count, offset} then 0x34 bytes a node: f32[12] matrix (rows, then the place), i16 bone, i16 the slot of the other side. +0x9C8 picks the set (0x2F3950; −1 none): 1 in all 30, its 11 nodes (Cal, Eyegore, Jill, Natalie, Venus 12); set 0 is one node. The clip events of type 12 put their effects on them ("Effect slots") |
-| 0xA84 / 0xA88 | attachment nodes | 15 × 0x38 at 0x10234 | f32[12] matrix, name (`fxNode_Belch`, `Helper L Hand`, `Tracking_Node`, ...), bone \| index << 16 |
+| 0xA84 / 0xA88 | attachment nodes | 15 × 0x38 at 0x10234 | f32[12] matrix, name (`fxNode_Belch`, `Helper L Hand`, `Tracking_Node`, ...), bone \| index << 16: the index is the other side's node (`Helper R Hand` ↔ `Helper L Hand`, the rest their own), which the node getter 0x2E4FF0 takes instead while the monster plays mirrored (0x2E51D4), on the mirrored pose; so a held object stays in the hand that grabbed it (main.c `attach_world`) |
 | 0xA8C / 0xA90 | effect names | 12 at 0x1057C | `Monster_Belch.edf`, `Debris_mega_punch.edf`, ... |
 | 0xA54 | the move graph | header 0x34 bytes at 0x105AC | +0x2C state count, +0x30 offset of the first state |
 | | states | 176 from 0x105E0 | see below |
@@ -119,9 +119,19 @@ front-left, right, left, back, back-right, back-left. None below a stick size of
 them `M.front`, `M.front8`, ...; mirrored, the condition reader swaps 33 / 34, 41 / 42, 43 / 44 and 46 / 47.
 
 Ids 4 … 21 and 48 … 57 are booleans, the rest floats. The stick sizes (30, 31) always count as new and 32 … 47 while
-they are set (0x2C17C0), so `|L|>0.7(new)` means only "pushed past 0.7". When the monster is mirrored (+0x7DA1 of the monster) the
+they are set (0x2C17C0), so `|L|>0.7(new)` means only "pushed past 0.7". An eighth (48 … 55) is new while the stick
+points there and either axis moved lately: its count of frames since a stick event that was not 0 (0x2C14B8 zeroes
+it) at most 2 (0x2C1950 .. 0x2C1A0C). So `Front_Climb_Up`'s and `Front_Idle_Up`'s `L.left == 1` (new) into
+`Front_Transition_Mirror` (priority 8) turns a climbing monster when the stick goes to the side. When the monster is mirrored (+0x7DA1 of the monster) the
 left / right pairs swap (50 ↔ 53, 51 ↔ 54, 52 ↔ 55, and pairs of the sectors). Variable 57 reads 0 and is never new
-(0x2C1838), so a `false == 0` (new) or `false > 0` condition never holds: those transitions are switched off. The
+(0x2C1838), and the picker does not compare 56 and 57 at all: a condition on `false` never holds and one on `true`
+always does, held or new, whatever its test and value (0x2EC598 .. 0x2EC5C4, 0x2EC7C8 ..). So every `false`
+transition is switched off, the held `false == 0` too (each monster has one: `Side_L_Charge_Punch` →
+`Side_L_Punch_Flurry` from 0.75 s at priority 3, which a plain `==` would take before the charge is done). A new
+`== 0` of a button or an axis (ids below 30) means "let go": it holds while that input's count of frames since it
+was released (+0x20 of its entry) is at most gp −0x7218 (2) (0x2EC630 .. 0x2EC734 → 0x2C1A60); each monster has one,
+`Front_Charge_Punch`'s `Circle == 0` (new) into `Front_Charge_Release`, so letting go ends the charge (`moves.c`
+keeps a release 0.2 s, as a press, `MoveInput.gone`). The
 game's own events (landing, hits) come in through the slots instead ("Slots"), and nothing found fires
 `Ground_TurnAround` for a pad-controlled monster: it turns with the stick ("Steering").
 
@@ -347,7 +357,9 @@ playing a `George_Head_*` clip at the rate 1 / its duration with a blend of 0.2.
 the animation player (0x2FFF10) on its own 0 .. 1 clock and replaces the body clip, rotation and place, on the bones
 of a mask built at spawn (0x2EA458): the subtree under `Bip01 Head` (George: 8 .. 27, the eyes, lips, cheeks, brows
 and jaw), the head itself only with the head layer; for `Eyegore`, `Cal`, `Venus`, `Natilie` and `Jill`'s skeletons
-the subtree three nodes above the head, and their brows and eyes by name. At spawn `Monsters::PostInit` starts
+the subtree two nodes above the head (the head's parent's parent, 0x2EA484 .. 0x2EA4A4: Cal's `Bip01 Spine`; three
+would be the pelvis, whose subtree holds every tentacle, which the face clips key still), and their brows and eyes by
+name. At spawn `Monsters::PostInit` starts
 `DefaultFacialAnim` (`Expression_Idle`, looping, no head layer); a face clip that ends plays again while it loops or
 has plays left (0x2E95D0), else the next queued one (`queueFacialAnim`), else the default again. So the face bones
 never show the body clips' own: the shared `SKELETON_1_*` clips turn George's eyes 112 … 176° from his bind pose,
@@ -429,6 +441,13 @@ A runner per monster (`src/moves.c` is its port): +0 the state, +0x4 the next on
    looping into the same state carries the time over (time − length). The request it fills (per player, 0x100
    bytes) holds the new node (+0x0), its blend time (+0x4), the start time (+0x8), the sticks × 255 (+0x1C..+0x28)
    and flags (+0x2C: the transition's blend mode << 4, 0x1 keep the phase); the monster's command (0x2E6580) plays it.
+
+A frame, in order [R by the recompiled game's trace, tools/movelog.py]: the animation's update fires the clip's
+events up to where the frame's step takes it (0x2FFF10 → 0x2E95D0 → 0x2F45D0 → 0x2E7840), then the monster's update
+moves it by its velocity and gravity, tests the landing and the mount (0x2DE530 and on), then the controller
+(0x2C0AD0) runs the runner and only then takes in a posted state (+0x110, 0x2C0DC4 .. 0x2C0E1C → 0x2EBF50). So
+`Jump_Start_1`'s 16 up at 0.136 is moved by and pulled down in the frame whose step crosses it, and a landing
+(0x2DC450 posts slot 56 through setReaction) leaves the air state running that frame, the landing starting after it.
 
 ## Blending
 0x2FFA00 starts a clip in the monster's animation player: with blend mode 0, or 1 while nothing plays yet, it cuts;
