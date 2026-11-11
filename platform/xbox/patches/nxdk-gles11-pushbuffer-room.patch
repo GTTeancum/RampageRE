@@ -1,0 +1,91 @@
+diff --git a/gles_arrays_draw.c b/gles_arrays_draw.c
+index ace55be..4c1fb86 100644
+--- a/gles_arrays_draw.c
++++ b/gles_arrays_draw.c
+@@ -274,6 +274,8 @@ GL_API void GL_APIENTRY glDrawArrays(GLenum mode, GLint first, GLsizei count)
+         return;
+     }
+ 
++    gliPushbufferReserve(4096);
++
+     GLint draw_first = first;
+     if (gliNeedsStaging()) {
+         if (!gliHasBoundVBOArrays()) {
+@@ -318,6 +320,9 @@ GL_API void GL_APIENTRY glDrawElements(GLenum mode, GLsizei count, GLenum type,
+ 
+     const void *indices_ptr = gliGetBufferPointer(context->vertex_array_data.element_array_buffer_binding, indices);
+ 
++    /* inline indices: at most 4 bytes each (32-bit), plus the draw's methods */
++    gliPushbufferReserve((size_t)count * 4u + 4096u);
++
+     // Scan indices to find vertex range, then stage client arrays
+     if (gliNeedsStaging()) {
+         GLsizei max_index = gliScanMaxIndex(type, indices_ptr, count);
+diff --git a/gles_private.h b/gles_private.h
+index 1bc1745..8392798 100644
+--- a/gles_private.h
++++ b/gles_private.h
+@@ -525,6 +525,7 @@ void gliArrayFlush(void);
+ void gliStagingInit(void);
+ void gliStagingDestroy(void);
+ void gliStagingFrameEnd(void);
++void gliPushbufferReserve(size_t bytes);
+ GLboolean gliStageClientArrays(GLint first, GLsizei vertex_count);
+ GLsizei gliScanMaxIndex(GLenum type, const void *indices, GLsizei count);
+ GLboolean gliNeedsStaging(void);
+diff --git a/nv2a_helper.c b/nv2a_helper.c
+index 8e37da7..a77aeac 100644
+--- a/nv2a_helper.c
++++ b/nv2a_helper.c
+@@ -3,6 +3,39 @@
+ /* Private pbkit helper; no presentation tracing. */
+ extern void pb_reset_drain_guard(unsigned phase);
+ 
++/* pbkit restarts its push buffer only at pb_reset and never checks for room:
++ * a frame past PBKIT_PUSHBUFFER_SIZE (plus pbkit's 8 KiB slack) writes into
++ * whatever follows the buffer and the GPU fetches that as methods ("DMA push
++ * buffer engine encountered invalid data", seen on a real Xbox past
++ * head + 0x82000). Before each draw, a frame close to the end drains the GPU
++ * and restarts at the head, as glFlipNV2A does every frame. */
++#define GLI_PUSHBUFFER_SIZE (512u * 1024u) /* PBKIT_PUSHBUFFER_SIZE; pb_size is never called */
++#define GLI_PUSHBUFFER_MARGIN (64u * 1024u) /* state and setup methods between two checks */
++static uint8_t *gli_pushbuffer_start; /* pbkit's head once the first reset has run */
++
++static void gli_pushbuffer_restart(void)
++{
++    pb_reset_drain_guard(1);
++    pb_reset();
++    pb_reset_drain_guard(2);
++    uint32_t *head = pb_begin();
++    pb_end(head);
++    gli_pushbuffer_start = (uint8_t *)head;
++}
++
++void gliPushbufferReserve(size_t bytes)
++{
++    uint32_t *put = pb_begin();
++    pb_end(put);
++    if (!gli_pushbuffer_start)  /* before the first frame's reset: pb_init's few methods are not counted */
++        gli_pushbuffer_start = (uint8_t *)put;
++    size_t used = (size_t)((uint8_t *)put - gli_pushbuffer_start);
++    if (bytes > GLI_PUSHBUFFER_SIZE - GLI_PUSHBUFFER_MARGIN)
++        bytes = GLI_PUSHBUFFER_SIZE - GLI_PUSHBUFFER_MARGIN; /* one draw this large overflows anyway */
++    if (used > GLI_PUSHBUFFER_SIZE - GLI_PUSHBUFFER_MARGIN - bytes)
++        gli_pushbuffer_restart();
++}
++
+ static int gl_swap_interval = 1;
+ static GLboolean gl_show_fps = GL_FALSE;
+ 
+@@ -90,6 +123,11 @@ void glFlipNV2A()
+     /* Preserve the post-reset GET/PUT and PGRAPH busy check. This is not
+      * an immutable completion ticket for CPU-dispatched GPU callbacks. */
+     pb_reset_drain_guard(2);
++    {
++        uint32_t *head = pb_begin();
++        pb_end(head);
++        gli_pushbuffer_start = (uint8_t *)head;
++    }
+ 
+     if (gl_swap_interval > 0) {
+         for (int i = 0; i < gl_swap_interval; i++) {

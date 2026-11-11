@@ -41,11 +41,31 @@
 
 #define AUDIO_IRQ 6
 
-static volatile unsigned int analogBufferCount;
+/* Finished buffers are counted from each DMA engine's CIV advancing, not from
+ * interrupt bits. Counting bits missed completions on a real Xbox: a channel
+ * that ran dry (LVBCI, "drained") and was refilled reports its next completion
+ * with LVBCI again, which the drained guard ignored; two such misses left the
+ * S/PDIF count above zero for good, no DPC was queued and SDL's audio thread
+ * waited forever (movie clocks follow the heard samples, so the picture froze).
+ * The MCPX's absolute CIV/LVI cannot be trusted either: a channel may run past
+ * LVI over stale descriptors, and the two channels drift apart. Each CIV step
+ * is one buffer played; a channel is never credited with more buffers than
+ * were published, and a buffer that halts the engine at LVI (LVBCI with
+ * CIV == LVI, Xemu's behaviour) is counted at once and not again when CIV
+ * later leaves it. */
+static volatile unsigned int analogBufferCount;  /* published, not yet played */
 static volatile unsigned int digitalBufferCount;
-static bool analogDrained;
-static bool digitalDrained;
 static bool analogCompletionOnly;
+
+typedef struct CHANNEL_STATE {
+    unsigned int consumed;   /* buffers played since XAudioInit, at most publishedBuffers */
+    unsigned char lastCiv;
+    bool done;               /* the buffer at lastCiv is already counted (halted at LVI) */
+} CHANNEL_STATE;
+static CHANNEL_STATE channelState[2];  /* 0 analog (0x110), 1 S/PDIF (0x170) */
+static unsigned int publishedBuffers;  /* since XAudioInit */
+static unsigned int postedBuffers;     /* buffers handed (or due) to the callback */
+static volatile unsigned int completedBuffers; /* finished, not yet given to the callback */
 
 static KINTERRUPT InterruptObject;
 static KDPC DPCObject;
@@ -65,16 +85,58 @@ static void __stdcall DPC(PKDPC Dpc,
 	AC97_DEVICE *pac97device;
 
 	pac97device = &ac97Device;
-	if (pac97device)
+	/* A queued DPC is queued once however many buffers finish before it runs:
+	 * hand the callback every one of them (SDL posts one free buffer each). */
+	unsigned int n = __atomic_exchange_n(&completedBuffers, 0, __ATOMIC_SEQ_CST);
+	while (n--)
 		if (pac97device->callback)
 			(pac97device->callback)((void *)pac97device, pac97device->callbackData);
 
 	return;
 }
 	
-// Although we have to explicitly clear the S/PDIF interrupt sources, in fact
-// the way we are set up PCM and S/PDIF are in lockstep and we only listen for
-// PCM actions, since S/PDIF is always spooling through the same buffer.
+static volatile unsigned char *ChannelRegisters(volatile unsigned char *pb, int c)
+{
+    return pb + (c ? 0x170 : 0x110);
+}
+
+/* Runs at the interrupt's IRQL (ISR, or PublishSamples via KeSynchronizeExecution). */
+static void ChannelUpdate(volatile unsigned char *pb, int c, unsigned char status)
+{
+    CHANNEL_STATE *ch = &channelState[c];
+    volatile unsigned char *r = ChannelRegisters(pb, c);
+    unsigned char civ = r[4] & 31;
+    unsigned int steps = (unsigned int)(civ - ch->lastCiv) & 31;
+    if (steps && ch->done) {        /* leaving the buffer counted when it halted the engine */
+        steps--;
+        ch->done = false;
+    }
+    ch->lastCiv = civ;
+    ch->consumed += steps;
+    if ((status & 4) && civ == (r[5] & 31) && !ch->done) { /* LVBCI: halted on the last valid one */
+        ch->consumed++;
+        ch->done = true;
+    }
+    if ((int)(ch->consumed - publishedBuffers) > 0) /* a run over stale descriptors frees nothing */
+        ch->consumed = publishedBuffers;
+}
+
+static void UpdateCompletions(volatile unsigned char *pb, unsigned char analogStatus, unsigned char digitalStatus)
+{
+    ChannelUpdate(pb, 0, analogStatus);
+    ChannelUpdate(pb, 1, digitalStatus);
+    unsigned int analog = channelState[0].consumed, digital = channelState[1].consumed;
+    analogBufferCount = publishedBuffers - analog;
+    digitalBufferCount = publishedBuffers - digital;
+    /* a buffer is free once both outputs played it; Xemu's S/PDIF never does */
+    unsigned int freed = (analogCompletionOnly || (int)(analog - digital) < 0) ? analog : digital;
+    if ((int)(freed - postedBuffers) > 0) {
+        completedBuffers += freed - postedBuffers;
+        postedBuffers = freed;
+        KeInsertQueueDpc(&DPCObject, NULL, NULL);
+    }
+}
+
 static BOOLEAN __stdcall ISR(PKINTERRUPT Interrupt, PVOID ServiceContext)
 {
 	AC97_DEVICE *pac97device = &ac97Device;
@@ -83,54 +145,12 @@ static BOOLEAN __stdcall ISR(PKINTERRUPT Interrupt, PVOID ServiceContext)
 	unsigned char analogInterrupt = pb[0x116];
 	unsigned char digitalInterrupt = pb[0x176];
 
-	bool waitCompleted = false;
-
-	if (analogInterrupt) {
-		bool waitingForAnalog = analogCompletionOnly || (analogBufferCount > digitalBufferCount);
-
-		// Was the interrupt triggered because we were out of data?
-		if ((analogInterrupt & 8) && (analogCompletionOnly || !analogDrained)) {
-			if (analogBufferCount > 0) {
-				waitCompleted |= waitingForAnalog;
-				analogBufferCount--;
-			}
-		}
-
-        if (analogCompletionOnly) {
-            // No emulated SPDIF consumer exists to catch up with analog.
-            digitalBufferCount = analogBufferCount;
-        }
-		analogDrained = analogInterrupt & 4;
-
-		pb[0x116]=0xFF; // clear all int sources
-	}
-
-	if (digitalInterrupt) {
-		bool waitingForDigital = !analogCompletionOnly && (digitalBufferCount > analogBufferCount);
-
-		// Was the interrupt triggered because we were out of data?
-		if ((digitalInterrupt & 8) && !digitalDrained) {
-			if (digitalBufferCount > 0) {
-				waitCompleted |= waitingForDigital;
-				digitalBufferCount--;
-			}
-		}
-
-		digitalDrained = digitalInterrupt & 4;
-
-		pb[0x176]=0xFF; // clear all int sources
-	}
-
-
-	// If a buffer was consumed by analog and digital output, we ask for a DPC
-	if (waitCompleted) {
-		//KeInsertQueueDpc queues Dpc and returns TRUE if Dpc not already queued.
-		//Dpc will be queued only once. So only one Dpc is fired after ISRs cease fire.
-		//DPCs avoid crashes inside non reentrant user callbacks called by nested ISRs.
-		//CAUTION : if you use fpu in DPC you have to save & restore yourself fpu state!!!
-		//(fpu=floating point unit, i.e the coprocessor executing floating point opcodes)
-		KeInsertQueueDpc(&DPCObject,NULL,NULL); //calls user callback soon
-	}
+	UpdateCompletions(pb, analogInterrupt, digitalInterrupt);
+	/* write-1-to-clear what was handled; a newer event stays raised */
+	if (analogInterrupt)
+		pb[0x116] = analogInterrupt;
+	if (digitalInterrupt)
+		pb[0x176] = digitalInterrupt;
 
 	return TRUE;
 }
@@ -224,8 +244,10 @@ void XAudioInit(int sampleSizeInBits, int numChannels, XAudioCallback callback, 
 	// reset buffer status
 	analogBufferCount = 0;
 	digitalBufferCount = 0;
-	analogDrained = false;
-	digitalDrained = false;
+	memset(channelState, 0, sizeof channelState); /* the reset left CIV at 0 */
+	publishedBuffers = 0;
+	postedBuffers = 0;
+	completedBuffers = 0;
 	
 	// Register our ISR
 	vector = HalGetInterruptVector(AUDIO_IRQ, &irql);
@@ -277,7 +299,8 @@ typedef struct AUDIO_SUBMISSION {
  * cannot run until both channels, their counts and nextDescriptor agree.
  * Only bounded stores occur here: no allocation, blocking, callbacks or FPU.
  * In particular, publishing LVI can immediately resume a drained DMA engine.
- * Its completion must not be acknowledged before the new count is recorded. */
+ * Its completion must not be acknowledged before the new count is recorded:
+ * the counts are brought up to date here with the new buffer. */
 static BOOLEAN __stdcall PublishSamples(PVOID context)
 {
     const AUDIO_SUBMISSION *submission = context;
@@ -291,12 +314,10 @@ static BOOLEAN __stdcall PublishSamples(PVOID context)
 	pac97device->pcmOutDescriptor[pac97device->nextDescriptor].bufferStartAddress    = address;
 	pac97device->pcmOutDescriptor[pac97device->nextDescriptor].bufferLengthInSamples = wordCount;
 	pac97device->pcmOutDescriptor[pac97device->nextDescriptor].bufferControl         = bufferControl;
-	analogBufferCount++;
 
 	pac97device->pcmSpdifDescriptor[pac97device->nextDescriptor].bufferStartAddress    = address;
 	pac97device->pcmSpdifDescriptor[pac97device->nextDescriptor].bufferLengthInSamples = wordCount;
 	pac97device->pcmSpdifDescriptor[pac97device->nextDescriptor].bufferControl         = bufferControl;
-	digitalBufferCount++;
 
     unsigned char descriptor = pac97device->nextDescriptor;
 	// increment to the next buffer descriptor (rolling around to 0 once you get to 31)
@@ -305,6 +326,8 @@ static BOOLEAN __stdcall PublishSamples(PVOID context)
     __asm__ volatile ("" ::: "memory");
     pb[0x115] = descriptor;
     pb[0x175] = descriptor;
+    publishedBuffers++;
+    UpdateCompletions(pb, 0, 0);
     return TRUE;
 }
 

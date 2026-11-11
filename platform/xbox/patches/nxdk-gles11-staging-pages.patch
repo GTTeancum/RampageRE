@@ -138,16 +138,16 @@
 +            1, v->fog_coord_array_type, v->fog_coord_array_stride);
 +#undef RESERVE
 +    if (arena_available(arena) < required) {
-+        /* Previous packets may still DMA from this memory. Wait for a GPU-written
-+         * completion value before reuse, outside any current draw packet. */
-+        *staging_fence = 0;
++        /* Previous packets may still DMA from this memory. Wait for the GPU to
++         * go idle before reuse, outside any current draw packet. A semaphore
++         * release through pbkit DMA object 3 halts real NV2A hardware with a
++         * PGRAPH protection error on SET_CONTEXT_DMA_SEMAPHORE (Xemu accepts
++         * it), so use the same idle wait as glFinish. staging_fence is unused. */
 +        uint32_t *pb = pb_begin();
-+        /* pbkit DMA context 3 spans 0..GLI_STAGING_DMA_MAX, also used by vertex DMA. */
-+        pb = pb_push1(pb, NV097_SET_CONTEXT_DMA_SEMAPHORE, 3);
-+        pb = pb_push1(pb, NV097_SET_SEMAPHORE_OFFSET, MmGetPhysicalAddress((PVOID)staging_fence));
-+        pb = pb_push1(pb, NV097_BACK_END_WRITE_SEMAPHORE_RELEASE, 1);
++        pb = pb_push1(pb, NV097_WAIT_FOR_IDLE, 0);
 +        pb_end(pb);
-+        while (*staging_fence != 1) NtYieldExecution();
++        while (pb_busy()) NtYieldExecution();
++        (void)staging_fence;
 +        arena_reset(arena);
 +    }
 +    return GL_TRUE;

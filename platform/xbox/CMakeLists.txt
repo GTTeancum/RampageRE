@@ -33,9 +33,11 @@ set(GAME_SOURCES
  main.c shot.c render_gl.c city.c vol.c bundle.c tex.c mesh.c prb.c tree.c anim.c camera.c moves.c
  building.c climb.c ik.c people.c fx.c cloth.c sound.c army.c hud.c vehicle.c water.c edible.c game.c
  boss.c look.c shadow.c director.c footstep.c challenge.c reveal.c rail.c parade.c streetobj.c profile.c
- collide.c shell.c movie.c wrand.c texpack_xbox.c iso.c plat_xbox.c xbox_libc.c rounding_xbox.c audio_xbox_hal.c pad_xbox.c win_xbox.c settings.c postfx_xbox.c autoplay.c)
+ collide.c shell.c movie.c wrand.c texpack_xbox.c iso.c plat_xbox.c xbox_libc.c rounding_xbox.c audio_xbox_hal.c pad_xbox.c win_xbox.c settings.c postfx_xbox.c autoplay.c xbox_fastmem.c)
 list(TRANSFORM GAME_SOURCES PREPEND "${ROOT}/src/")
 add_executable(rampage_xbox ${GAME_SOURCES})
+# The fast libc replacements must not be compiled back into calls to themselves.
+set_source_files_properties("${ROOT}/src/xbox_fastmem.c" PROPERTIES COMPILE_OPTIONS "-fno-builtin")
 # Private integration candidate: enable only with the reviewed exact-palette backend.
 option(RAMPAGE_XBOX_EXACT_PALETTE "Use exact P8 storage for eligible immutable world textures" OFF)
 if(RAMPAGE_XBOX_EXACT_PALETTE)
@@ -46,7 +48,7 @@ if(RAMPAGE_XBOX_EXACT_PALETTE)
 endif()
 set_property(TARGET rampage_xbox PROPERTY C_STANDARD 99)
 target_compile_definitions(rampage_xbox PRIVATE RAMPAGE_XBOX RAMPAGE_LOW_MEMORY XBOX _WINGDI_)
-target_compile_options(rampage_xbox PRIVATE -fsigned-char)
+target_compile_options(rampage_xbox PRIVATE -fsigned-char -fno-math-errno)
 target_include_directories(rampage_xbox PRIVATE "${ROOT}/src" "${NXDK_DIR}/lib/sdl/SDL2/include")
 target_link_options(rampage_xbox PRIVATE "-include:_automount_d_drive")
 target_link_libraries(rampage_xbox PRIVATE "${NXDK_DIR}/lib/libnxdk_automount_d.lib" GL GLESv1_CM "${NXDK_DIR}/lib/libSDL2.lib" "${RAMPAGE_XBOX_PBKIT_LIBRARY}")

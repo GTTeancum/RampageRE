@@ -1223,6 +1223,34 @@ static void mix_block(float *out, int frames)
             continue;
         const Sample *s = vc->s;
         float g = S.sfx_gain * S.inst[i].gain, al = spu_amp(vc->l) * g, ar = spu_amp(vc->r) * g;
+#ifdef RAMPAGE_XBOX
+        /* The same resampler with the position in 32.32 fixed point: on the console's x87 every
+         * (int) of the double position switched the rounding mode twice a sample, and the mixer
+         * alone was a tenth of all CPU time with a city's voices playing. */
+        if (vc->pos >= 0 && vc->step >= 0 && vc->pos < 2147483647.0 && vc->step < 65536.0) {
+            uint64_t pos = (uint64_t)(vc->pos * 4294967296.0), step = (uint64_t)(vc->step * 4294967296.0);
+            const int n = s->n, loop = s->loop;
+            for (int f = 0; f < frames; f++) {
+                int k = (int)(pos >> 32);
+                if (k >= n) {
+                    if (loop < 0 || loop >= n) {
+                        vc->on = 0;
+                        break;
+                    }
+                    pos -= (uint64_t)(n - loop) << 32;
+                    k = (int)(pos >> 32);
+                }
+                int k1 = k + 1 < n ? k + 1 : loop >= 0 ? loop : k;
+                float fr = (float)(int)((uint32_t)pos >> 8) * (1.0f / 16777216.0f);
+                float x = (float)s->pcm[k] + fr * (float)(s->pcm[k1] - s->pcm[k]);
+                out[2 * f] += x * al;
+                out[2 * f + 1] += x * ar;
+                pos += step;
+            }
+            vc->pos = (double)pos * (1.0 / 4294967296.0);
+            continue;
+        }
+#endif
         for (int f = 0; f < frames; f++) {
             int k = (int)vc->pos;
             if (k >= s->n) {
