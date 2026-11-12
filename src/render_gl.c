@@ -225,6 +225,9 @@ typedef struct { uint32_t name; float reg[4]; GLuint id; float scale[2]; } Regio
 typedef struct {
     const Bundle *b; GLuint *tex, *hud_tex; uint32_t n;            /* per name index: GL texture, ~0 = none */
     RegionTex *reg; int nreg;
+#ifdef RAMPAGE_XBOX
+    uint8_t *not_ifl;                                /* per name index: 1 = not an .ifl (shown_texture) */
+#endif
 } BundleTex;
 
 /* an animated texture (.ifl, a text entry: per line a frame's image and how many frames it shows, 3ds Max's 30 per
@@ -242,8 +245,41 @@ typedef struct {
     uint32_t rev, nverts, ntris;
     const float *pos, *nrm, *uv, *col; const uint32_t *tris;
     size_t at_nrm, at_uv, at_col;
+#ifdef RAMPAGE_XBOX
+    uint16_t *idx16;                     /* the triangles as 16-bit indices (xbox_part), NULL: more than 65536 vertices */
+    uint8_t churn;                       /* times its registered arrays changed: past 3 it is left to the staging */
+    uint8_t wait;                        /* draws on its own before its arrays are registered (vbo 3: waiting) */
+    uint8_t skinned;                     /* drawn posed: never registered */
+    const float *gpos, *gnrm, *guv, *gcol;       /* its registered arrays in GPU memory (gliStaticArrayAddress) */
+    struct SkinGpu *sg;                  /* a skinned part as the GPU poses it (xbox_skin_gpu) */
+#endif
 } PartBuf;
 typedef struct { const MeshPart *parts; uint32_t nparts; PartBuf *pb; } MeshBuf;
+#ifdef RAMPAGE_XBOX
+/* the batches of the standing city (bat_frame) */
+typedef struct { GLuint tex; float col[4], amb[3]; uint8_t fmt, two_sided, clamp, uncut, own, blend; } BatKey;   /* blend: 0 opaque,
+                                                      * 1 the cracks, 2 a blended sheet, 3 see-through by its colour */
+typedef struct { uint32_t item, i0, ni, nv; uint16_t part, gone; } BatMember;   /* its indices: b->idx[i0 .. i0 + ni);
+                                                      * gone: it left, its triangles are no longer sent (its place
+                                                      * in the arrays is given up when the batch is next built) */
+typedef struct {
+    float *pos, *nrm, *uv, *col; uint16_t *idx;
+    uint32_t nverts, nidx, cidx;                 /* built; the indices' capacity */
+    BatMember *mem; uint32_t nmem, cmem;         /* its members */
+    uint32_t fverts, fidx;                       /* their vertices and indices */
+    int registered, failed, dirty;               /* dirty: its members changed, built again at its next draw */
+} BatSub;
+typedef struct { BatKey key; BatSub *sub; int nsub; } BatGroup;
+typedef struct {
+    const MeshPart *parts; uint32_t nparts, mesh, settle, moves, nkeys;
+    float world[16], amb[4];
+    int16_t *key;                                /* per part: its group, -1 drawn by draw_part */
+    int16_t *sub;                                /* per part: the batch of its group it is a member of, -1 none */
+    uint32_t *rev, *out;                         /* per part: its MeshPart.rev; the frame it comes back (0: in) */
+    uint8_t *chg;                                /* per part: times it changed (it stays out longer each time) */
+    uint8_t seen, sorted, active;
+} BatItem;
+#endif
 
 struct Renderer {
     const Scene *scene;
@@ -265,6 +301,15 @@ struct Renderer {
     MeshBuf *mbuf; uint32_t nmbuf;                   /* by Scene.meshes index, made at its first draw (part_buffers) */
     float *stage; size_t nstage;                     /* a part's arrays laid out for its buffer */
     float *water_uv; size_t nwater_uv;              /* shared water draw scratch; renderer-owned high-water capacity */
+#ifdef RAMPAGE_XBOX
+    BatGroup *bgroup; uint32_t nbgroup;
+    BatItem *bitem; uint32_t nbitem;                 /* by Scene.items index */
+    const int16_t *bat_keys;                         /* the item draw_mesh is drawing: its batched parts */
+    const Instance *cur_inst;                        /* its instance (the bones of a skinned one) */
+    const Instance *pal_inst; uint32_t pal_frame, xframe, npal; Mat4 *pal;   /* that instance's palette, this frame's */
+    float bat_amb[3], bat_amb_now[3]; int bat_own;   /* the scene's ambient; the one set while the batches draw */
+    uint16_t *bat_idx; uint32_t cbat_idx;            /* a batch's indices of the items in sight this frame */
+#endif
 };
 
 /* ---- texture settings (port extra, docs/NATIVE.md "Graphics settings") */
@@ -352,6 +397,12 @@ void rnd_set_output_pump(Renderer *r, void (*pump)(void))
 static void pump_output(Renderer *r)
 {
     if (!r->output_pump) return;
+#ifdef RAMPAGE_XBOX
+    /* Called for every part drawn. Reading the console's clock is a kernel call and a port read, and several
+     * hundred parts a frame made that alone milliseconds: look at the clock every 16th part. */
+    static unsigned calls;
+    if (++calls & 15u) return;
+#endif
     double now = win_time();
     if (now >= r->output_pump_at && now - r->output_pump_at < 0.016) return;
     r->output_pump_at = now;
@@ -379,6 +430,9 @@ static void drop_textures(Renderer *r)
         free(r->cache[k].tex);
         free(r->cache[k].hud_tex);
         free(r->cache[k].reg);
+#ifdef RAMPAGE_XBOX
+        free(r->cache[k].not_ifl);
+#endif
     }
     r->ncache = 0;
     r->nifl = 0;
@@ -436,14 +490,98 @@ static int buffers_ok(void)
     return g_buf.gen != NULL;
 }
 
+#ifdef RAMPAGE_XBOX
+/* nxdk-gles11's static client arrays (platform/xbox/patches/nxdk-gles11-static-arrays.patch): an unskinned scene
+ * part's arrays are copied once into memory the NV2A reads and drawn from there, in place of the copy into the
+ * staging arena at every draw. gl4es has no buffers on its ES 1.1 backend, so the arrays stay client arrays to it
+ * and the registration is by their addresses; PartBuf.vbo is 1 while a part's are registered, 2 when the store
+ * refused them or the part is skinned (its arrays are posed every frame; not tried again until the part changes).
+ * Every part also keeps its triangles as 16-bit indices: gl4es converts 32-bit ones on every draw, and the NV2A
+ * takes inline indices at half the push-buffer bytes. */
+unsigned char gliStaticArrayAdd(const void *src, size_t bytes, const void *owner);
+void gliStaticArrayRemove(const void *src, const void *owner);
+void *gliStaticArrayAlloc(size_t bytes, const void *owner);
+void gliStaticArraysHint(unsigned char on);
+/* The draws that do not go through gl4es (platform/xbox/patches/nxdk-gles11-direct-draw.patch): arrays that are
+ * in GPU memory are named to the NV2A by their addresses and drawn, the GL state as it stands. A draw through
+ * glDrawElements crossed gl4es (which copies small draws into its own batches) and the backend's client arrays,
+ * tens of microseconds each whatever its size. gl4es is asked first (gl4es_xbox_predraw: its pending texture work
+ * is done; 0 when the draw needs gl4es after all, a texture whose coordinates it rewrites). gliSkinDraw poses a
+ * skinned mesh on the GPU with a vertex program (platform/xbox/shaders/skin.vs.cg). */
+const void *gliStaticArrayAddress(const void *src);
+void gliDirectDraw(const float *pos, const float *nrm, const float *uv, const float *col, const uint16_t *idx, int count);
+int gliSkinMaxBones(void);
+void gliSkinDraw(const float *pos, const float *nrm, const float *uv, const float *col, const float *bone,
+                 const float *weight, const uint16_t *idx, int count, const float (*palette)[12], int nbones);
+int gl4es_xbox_predraw(void);
+
+/* A skinned part for the GPU: its triangles in groups that each use at most the vertex program's bones, a group's
+ * vertices (the bind pose, with each one's bones as indices into the group's list, and their weights) in the static
+ * store. Made once for a mesh part and shared by every instance drawn with it. */
+#define SKIN_GROUP_BONES 26
+#define SKIN_GROUP_VERTS 16000u                  /* (16 bytes a vertex in the largest array, a 256 KB chunk) */
+typedef struct {
+    float *pos, *nrm, *uv, *col, *bone, *weight;
+    uint16_t *idx;
+    uint32_t nverts, nidx;
+    uint8_t nb, b[SKIN_GROUP_BONES];             /* its bones: indices into the instance's palette */
+} SkinGroup;
+typedef struct SkinGpu { SkinGroup *g; int ng, failed; } SkinGpu;
+
+static void skin_gpu_free(SkinGpu *sg)
+{
+    if (!sg)
+        return;
+    for (int k = 0; k < sg->ng; k++) {
+        SkinGroup *g = &sg->g[k];
+        if (g->pos) gliStaticArrayRemove(g->pos, sg);
+        if (g->nrm) gliStaticArrayRemove(g->nrm, sg);
+        if (g->uv) gliStaticArrayRemove(g->uv, sg);
+        if (g->col) gliStaticArrayRemove(g->col, sg);
+        if (g->bone) gliStaticArrayRemove(g->bone, sg);
+        if (g->weight) gliStaticArrayRemove(g->weight, sg);
+        free(g->idx);
+    }
+    free(sg->g);
+    free(sg);
+}
+
+static void xbox_static_unregister(PartBuf *pb)
+{
+    skin_gpu_free(pb->sg);
+    pb->sg = NULL;
+    pb->gpos = pb->gnrm = pb->guv = pb->gcol = NULL;
+    if (pb->vbo == 1) {
+        gliStaticArrayRemove(pb->pos, pb);
+        if (pb->nrm) gliStaticArrayRemove(pb->nrm, pb);
+        if (pb->uv) gliStaticArrayRemove(pb->uv, pb);
+        if (pb->col) gliStaticArrayRemove(pb->col, pb);
+    }
+    pb->vbo = 0;
+    free(pb->idx16);
+    pb->idx16 = NULL;
+}
+#endif
+
+#ifdef RAMPAGE_XBOX
+static void bat_drop(Renderer *r);
+#endif
+
 static void drop_buffers(Renderer *r)
 {
+#ifdef RAMPAGE_XBOX
+    bat_drop(r);
+#endif
     for (uint32_t m = 0; m < r->nmbuf; m++) {
         MeshBuf *mb = &r->mbuf[m];
         for (uint32_t k = 0; mb->pb && k < mb->nparts; k++) {
+#ifdef RAMPAGE_XBOX
+            xbox_static_unregister(&mb->pb[k]);
+#else
             GLuint id[2] = { mb->pb[k].vbo, mb->pb[k].ibo };
             if (id[0] || id[1])
                 g_buf.del(2, id);
+#endif
         }
         free(mb->pb);
     }
@@ -528,6 +666,84 @@ static const PartBuf *part_buffers(Renderer *r, const SceneMesh *sm, uint32_t i)
     return pb;
 }
 
+#ifdef RAMPAGE_XBOX
+/* part i of scene mesh sm: its 16-bit indices and, unskinned, its arrays registered as static, made at its first
+ * draw and again when the part changed (as part_buffers); NULL: not a scene mesh, the draw is as before */
+static const PartBuf *xbox_part(Renderer *r, const SceneMesh *sm, uint32_t i, int skinned)
+{
+    const Scene *s = r->scene;
+    if (!s || !s->meshes || (uintptr_t)sm < (uintptr_t)s->meshes ||
+        (uintptr_t)sm >= (uintptr_t)(s->meshes + s->nmeshes))
+        return NULL;
+    uint32_t mi = (uint32_t)(sm - s->meshes);
+    if (r->nmbuf < s->nmeshes) {
+        MeshBuf *b = realloc(r->mbuf, sizeof *b * s->nmeshes);
+        if (!b)
+            return NULL;
+        memset(b + r->nmbuf, 0, sizeof *b * (s->nmeshes - r->nmbuf));
+        r->mbuf = b;
+        r->nmbuf = s->nmeshes;
+    }
+    const Mesh *m = &sm->mesh;
+    MeshBuf *mb = &r->mbuf[mi];
+    if (mb->parts != m->parts || mb->nparts != m->nparts) {
+        for (uint32_t k = 0; mb->pb && k < mb->nparts; k++)
+            xbox_static_unregister(&mb->pb[k]);
+        free(mb->pb);
+        mb->pb = calloc(m->nparts ? m->nparts : 1, sizeof *mb->pb);
+        mb->parts = m->parts;
+        mb->nparts = mb->pb ? m->nparts : 0;
+        if (!mb->pb)
+            return NULL;
+    }
+    const MeshPart *p = &m->parts[i];
+    PartBuf *pb = &mb->pb[i];
+    if (!pb->vbo || pb->rev != p->rev || pb->nverts != p->nverts || pb->ntris != p->ntris || pb->pos != p->pos ||
+        pb->nrm != p->nrm || pb->uv != p->uv || pb->col != p->col || pb->tris != p->tris ||
+        pb->skinned != (uint8_t)(skinned != 0)) {
+        if (pb->vbo == 1 && pb->churn < 255)
+            pb->churn++;                             /* (a facade being damaged: registering it again and again
+                                                      * costs more than staging it) */
+        xbox_static_unregister(pb);
+        size_t n = p->nverts;
+        pb->rev = p->rev; pb->nverts = p->nverts; pb->ntris = p->ntris;
+        pb->pos = p->pos; pb->nrm = p->nrm; pb->uv = p->uv; pb->col = p->col; pb->tris = p->tris;
+        if (n <= 65536 && p->ntris && p->tris && (pb->idx16 = malloc(sizeof *pb->idx16 * 3 * (size_t)p->ntris)))
+            for (size_t k = 0; k < 3 * (size_t)p->ntris; k++)
+                pb->idx16[k] = (uint16_t)p->tris[k];
+        pb->vbo = pb->churn <= 3 && n && p->pos && (!skinned || p->uv || p->col) ? 3 : 2;
+        pb->wait = 0;
+        pb->skinned = (uint8_t)(skinned != 0);
+    }
+    /* Registered only once it has been drawn on its own for a second and a half: a part on its way into a batch (its
+     * item settling) would leave a second copy of itself in the store, and the store is small. */
+    if (pb->vbo == 3 && !(pb->sg && !pb->sg->failed) && ++pb->wait >= 90) {   /* (not one the GPU poses: its
+                                                                                 * groups have their own copies) */
+        size_t n = p->nverts;
+        /* (a posed part: its positions and normals are the skin's, only what it keeps of its own is registered) */
+        int ok = (pb->skinned || gliStaticArrayAdd(p->pos, sizeof(float) * 3 * n, pb)) &&
+                 (pb->skinned || !p->nrm || gliStaticArrayAdd(p->nrm, sizeof(float) * 3 * n, pb)) &&
+                 (!p->uv || gliStaticArrayAdd(p->uv, sizeof(float) * 2 * n, pb)) &&
+                 (!p->col || gliStaticArrayAdd(p->col, sizeof(float) * 4 * n, pb));
+        if (!ok) {
+            uint16_t *keep = pb->idx16;
+            pb->idx16 = NULL;
+            pb->vbo = 1;                             /* (so the ones that were added are removed) */
+            xbox_static_unregister(pb);
+            pb->idx16 = keep;
+            pb->vbo = 2;
+        } else {
+            pb->vbo = 1;
+            pb->gpos = pb->skinned ? NULL : gliStaticArrayAddress(p->pos);
+            pb->gnrm = pb->skinned || !p->nrm ? NULL : gliStaticArrayAddress(p->nrm);
+            pb->guv = p->uv ? gliStaticArrayAddress(p->uv) : NULL;
+            pb->gcol = p->col ? gliStaticArrayAddress(p->col) : NULL;
+        }
+    }
+    return pb;
+}
+#endif
+
 void rnd_scene(Renderer *r, const Scene *s)
 {
     drop_textures(r);
@@ -550,6 +766,10 @@ void rnd_free(Renderer *r)
     free(r->bound);
     free(r->stage);
     free(r->water_uv);
+#ifdef RAMPAGE_XBOX
+    free(r->pal);
+    free(r->bat_idx);
+#endif
     free(r);
 }
 
@@ -572,6 +792,77 @@ void rnd_video(Renderer *r, const uint8_t *rgba, int w, int h)
 }
 
 /* the movie's texture, uploaded when it changed */
+#ifdef RAMPAGE_XBOX
+/* The state a run of draw_part calls leaves behind, so that a part only sends what differs from the part before:
+ * every GL call crosses gl4es and nxdk-gles11, and a part repeating the dozen settings of the one before it was a
+ * third of its cost on the console. -1 / not known: unknown, the next use sets it. Anything else that draws or
+ * changes this state ends the run first (xs_end): the tracker then knows nothing, and the lighting, switched lazily
+ * for the prelit parts, is put back as the run found it. */
+static struct {
+    int cull, tex2d, nrm, uv, col, light, light_base, tex_known;
+    GLuint tex, wrap_id[64];
+    GLint wrap[64];
+} xs = { -1, -1, -1, -1, -1, -1, -1, 0, 0, { 0 }, { 0 } };
+
+static void xs_end(void)
+{
+    if (xs.light_base >= 0 && xs.light != xs.light_base) {
+        if (xs.light_base) glEnable(GL_LIGHTING);
+        else glDisable(GL_LIGHTING);
+    }
+    xs.cull = xs.tex2d = xs.nrm = xs.uv = xs.col = xs.light = xs.light_base = -1;
+    xs.tex_known = 0;
+    memset(xs.wrap_id, 0, sizeof xs.wrap_id);
+}
+static void xs_enable(int *st, GLenum cap, int on)
+{
+    if (*st == on) return;
+    *st = on;
+    if (on) glEnable(cap);
+    else glDisable(cap);
+}
+static void xs_client(int *st, GLenum array, int on)
+{
+    if (*st == on) return;
+    *st = on;
+    if (on) glEnableClientState(array);
+    else glDisableClientState(array);
+}
+static void xs_bind(GLuint id)
+{
+    xs_enable(&xs.tex2d, GL_TEXTURE_2D, 1);
+    if (xs.tex_known && xs.tex == id) return;
+    xs.tex = id;
+    xs.tex_known = 1;
+    glBindTexture(GL_TEXTURE_2D, id);
+}
+static void xs_wrap(GLuint id, GLint wrap)       /* of the texture xs_bind just bound */
+{
+    unsigned k = id & 63u;
+    if (xs.wrap_id[k] == id && xs.wrap[k] == wrap) return;
+    xs.wrap_id[k] = id;
+    xs.wrap[k] = wrap;
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap);
+}
+static int xs_light_base(void)                   /* the lighting as the run found it */
+{
+    if (xs.light_base < 0)
+        xs.light = xs.light_base = glIsEnabled(GL_LIGHTING) ? 1 : 0;
+    return xs.light_base;
+}
+static void xs_light(int on)
+{
+    xs_light_base();
+    xs_enable(&xs.light, GL_LIGHTING, on);
+}
+#define XS_END() xs_end()
+#define XS_TEXTURE_BOUND() (xs.tex_known = 0)    /* something else bound a texture */
+#else
+#define XS_END() ((void)0)
+#define XS_TEXTURE_BOUND() ((void)0)
+#endif
+
 static GLuint video_texture(Renderer *r)
 {
     if (!r->video)
@@ -579,6 +870,7 @@ static GLuint video_texture(Renderer *r)
     if (!r->video_tex) {
         glGenTextures(1, &r->video_tex);
         glBindTexture(GL_TEXTURE_2D, r->video_tex);
+        XS_TEXTURE_BOUND();
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
@@ -591,6 +883,7 @@ static GLuint video_texture(Renderer *r)
         r->video_new = 1;
     }
     glBindTexture(GL_TEXTURE_2D, r->video_tex);
+    XS_TEXTURE_BOUND();
     if (r->video_new) {
         if (r->video_tex_w != r->video_w || r->video_tex_h != r->video_h) {
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, r->video_w, r->video_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, r->video);
@@ -682,6 +975,7 @@ static GLuint texture_at(Renderer *r, const Bundle *b, uint32_t name, int zero_o
                 return 0;
             }
             glBindTexture(GL_TEXTURE_2D, id);
+            XS_TEXTURE_BOUND();
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
@@ -805,6 +1099,7 @@ static GLuint region_texture(Renderer *r, const Bundle *b, uint32_t name, const 
                     return 0;
                 }
                 glBindTexture(GL_TEXTURE_2D, id);
+            XS_TEXTURE_BOUND();
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
@@ -848,10 +1143,23 @@ static uint32_t shown_texture(Renderer *r, const Bundle *b, uint32_t name, doubl
     const BdpEntry *e = bdp_entry(b, name);
     if (!name || !e || e->type != ET_RAW || bdp_entry_of(b, name, ET_TEXTURE))
         return name;
+#ifdef RAMPAGE_XBOX
+    /* (asked for every part of every frame: the ending of the name is looked at once) */
+    BundleTex *bt = bundle_tex(r, b);
+    if (bt && name < bt->n && !bt->not_ifl)
+        bt->not_ifl = calloc(bt->n ? bt->n : 1, 1);
+    if (bt && name < bt->n && bt->not_ifl && bt->not_ifl[name])
+        return name;
+#endif
     const char *nm = bdp_name(b, name);
     size_t len = strlen(nm);
-    if (len < 4 || _stricmp(nm + len - 4, ".ifl") != 0)
+    if (len < 4 || _stricmp(nm + len - 4, ".ifl") != 0) {
+#ifdef RAMPAGE_XBOX
+        if (bt && name < bt->n && bt->not_ifl)
+            bt->not_ifl[name] = 1;
+#endif
         return name;
+    }
     Ifl *f = NULL;
     for (int k = 0; k < r->nifl && !f; k++)
         if (r->ifl[k].b == b && r->ifl[k].name == name)
@@ -923,6 +1231,10 @@ static int part_blended(const SceneMesh *sm, const MeshPart *p)
     return p->blend == 1 || (!p->blend && mc[3] < 0.98f);   /* blend 2 writes its depth: drawn in its turn */
 }
 
+#ifdef RAMPAGE_XBOX
+int xbox_pixel_width(void);
+int xbox_pixel_height(void);
+#endif
 static void draw_part(Renderer *r, const SceneMesh *sm, const Skin *skin, uint32_t i, uint32_t first, double t);
 
 /* the world's cube-map materials [R]: RWorldMaterialFilter (vtable 0x44AAC0) gives a material named BUILDING_CUBEMAP
@@ -977,8 +1289,19 @@ static void sphere_coords(int on)
 static int item_seen(Renderer *r, const DrawItem *it, const float mv[16], float tx, float ty)
 {
     const Scene *s = r->scene;
+#ifdef RAMPAGE_XBOX
+    /* (the GPU poses the people and the army as it draws them: the ones well out of the view are left out, by the
+     * bind pose's bound four times over, which a walk or a fall stays inside; a monster and a cloth always drawn) */
+    int loose = 0;
+    if (it->skin) {
+        if (it->skin->cloth || it->skin->gpu_skin <= 0 || scene_monster_slot(s, it->instance) >= 0)
+            return 1;
+        loose = 1;
+    }
+#else
     if (it->skin)
         return 1;
+#endif
     if (r->nbound < s->nmeshes) {
         MeshBound *b = realloc(r->bound, sizeof *b * s->nmeshes);
         if (!b)
@@ -1014,6 +1337,10 @@ static int item_seen(Renderer *r, const DrawItem *it, const float mv[16], float 
         sc = l > sc ? l : sc;
     }
     float rad = mb->r * sqrtf(sc), wp[3], vp[3];
+#ifdef RAMPAGE_XBOX
+    if (loose)
+        rad = 4 * rad + 2;
+#endif
     for (int k = 0; k < 3; k++)
         wp[k] = w[k] * c[0] + w[4 + k] * c[1] + w[8 + k] * c[2] + w[12 + k];
     for (int k = 0; k < 3; k++)
@@ -1043,6 +1370,10 @@ static void draw_mesh(Renderer *r, const SceneMesh *sm, const Skin *skin, double
         const MeshPart *p = &m->parts[i];
         if (!p->ntris)
             continue;
+#ifdef RAMPAGE_XBOX
+        if (r->bat_keys && r->bat_keys[i] >= 0)
+            continue;                                /* in a batch (bat_frame) */
+#endif
         if (r->hold && part_blended(sm, p)) {
             if (r->nheld == r->cheld) {
                 int n = r->cheld ? 2 * r->cheld : 256;
@@ -1064,6 +1395,578 @@ static void draw_mesh(Renderer *r, const SceneMesh *sm, const Skin *skin, double
 }
 
 /* the parts draw_mesh held back, in their order, each with its modelview */
+#ifdef RAMPAGE_XBOX
+/* ---- the standing city in a few large draws ------------------------------------------------------------------
+ * A block is some hundreds of small parts (a wall, a trim, a lamp: 44 triangles on average), and on the console a
+ * draw costs the same whatever its size: the parts, not their triangles, were the frame. The parts that stand still
+ * and are drawn plainly (one texture, opaque, no second layer, the scene's own light) are therefore gathered by what
+ * they are drawn with into batches in world space, and a batch is one draw. A batch is built again only when its
+ * members change. Everything else is drawn as before, part by part: the skinned, the moving, the blended, the
+ * layered, and an item that changed lately: a building being hit (its facade is made again with every blow) for a
+ * second, a thing that moved for longer each time it does (a car that stops and starts would otherwise have its
+ * batches built again and again). An item drawn with its own ambient (an adornment) is batched with the others of
+ * that ambient, the ambient set for the batch. */
+/* which of Scene.items this frame's culling kept (rnd_frame); scene_update reads the last frame's */
+uint8_t *g_xbox_item_seen;
+uint32_t g_xbox_item_seen_n;
+
+#define BAT_MAX_VERTS 10000u                         /* (its largest array, the colours, is 160 KB of a 256 KB chunk
+                                                      * of the static store; smaller batches packed the chunks
+                                                      * better but were three times as many draws) */
+#define BAT_MAX_INDICES 30000u
+#define BAT_SETTLE_FRAMES 60u
+
+static uint32_t bat_hash(uint32_t h, uint32_t v)
+{
+    h ^= v;
+    return h * 16777619u;
+}
+
+/* a batch's arrays are the static store's: built in the memory the NV2A reads, no second copy. When the store has
+ * no room there is no batch (its members are drawn part by part): on a 64 MB console the heap has none to spare
+ * either. */
+static void bat_arrays_free(BatSub *b)
+{
+    if (b->pos) gliStaticArrayRemove(b->pos, b);
+    if (b->nrm) gliStaticArrayRemove(b->nrm, b);
+    if (b->uv) gliStaticArrayRemove(b->uv, b);
+    if (b->col) gliStaticArrayRemove(b->col, b);
+    b->pos = b->nrm = b->uv = b->col = NULL;
+    b->registered = 0;
+    b->nverts = b->nidx = 0;
+}
+
+static void bat_sub_free(BatSub *b)
+{
+    bat_arrays_free(b);
+    free(b->idx); free(b->mem);
+    memset(b, 0, sizeof *b);
+}
+
+static void bat_drop(Renderer *r)
+{
+    for (uint32_t g = 0; g < r->nbgroup; g++) {
+        for (int k = 0; k < r->bgroup[g].nsub; k++)
+            bat_sub_free(&r->bgroup[g].sub[k]);
+        free(r->bgroup[g].sub);
+    }
+    free(r->bgroup);
+    r->bgroup = NULL;
+    r->nbgroup = 0;
+    for (uint32_t i = 0; i < r->nbitem; i++) {
+        free(r->bitem[i].key); free(r->bitem[i].sub); free(r->bitem[i].rev); free(r->bitem[i].out); free(r->bitem[i].chg);
+    }
+    free(r->bitem);
+    r->bitem = NULL;
+    r->nbitem = 0;
+    r->bat_keys = NULL;
+    free(r->bat_idx);
+    r->bat_idx = NULL;
+    r->cbat_idx = 0;
+}
+
+/* what a plain part is drawn with, as draw_part would: 0 when the part is not plain */
+static int bat_part_key(Renderer *r, const SceneMesh *sm, const MeshPart *p, const Instance *in, double t, BatKey *k)
+{
+    const Scene *s = r->scene;
+    if (!p->ntris || !p->nverts || !p->pos || !p->tris || p->nverts > BAT_MAX_VERTS || 3u * p->ntris > BAT_MAX_INDICES)
+        return 0;
+    uint32_t name = material_texture(sm->b, p->material), tex = shown_texture(r, sm->b, name, t);
+    float reg[4];
+    if (tex != name)                                 /* an .ifl: its frame changes */
+        return 0;
+    if (p->uv && material_region(sm->b, p->material, reg))
+        return 0;
+    if (cube_material(s, sm, p->material))
+        return 0;
+    if (s->cloud_material && sm->b == s->city && p->material == s->cloud_material)
+        return 0;
+    memset(k, 0, sizeof *k);
+    material_color(sm->b, p->material, k->col);
+    /* the blended parts (draw_part: the part's own blend, else its material's; the glass by its colour's alpha) are
+     * batched too, in batches of their own drawn after the opaque world (bat_draw_blended) */
+    k->blend = (uint8_t)(p->blend ? p->blend : material_blended(sm->b, p->material) ? 2 : k->col[3] < 0.98f ? 3 : 0);
+    if (k->blend > 3)
+        return 0;
+    if (p->col && p->uv && material_damage_layer(sm->b, p->material))
+        return 0;
+    if (p->nrm && material_env(sm->b, p->material))
+        return 0;
+    k->tex = texture(r, sm->b, tex);
+    k->fmt = (uint8_t)((p->nrm ? 1 : 0) | (p->uv ? 2 : 0) | (p->col ? 4 : 0));
+    k->two_sided = (material_flags(sm->b, p->material) & MAT_TWO_SIDED) != 0;
+    k->clamp = k->tex && material_clamped(sm->b, p->material);
+    k->uncut = material_uncut(sm->b, p->material) != 0;
+    if (p->col && k->blend != 3)                     /* the colour is the array's */
+        k->col[0] = k->col[1] = k->col[2] = k->col[3] = 1;
+    if (in->own_ambient && s->nlights && p->nrm) {   /* lit by the item's ambient (unlit parts: no difference) */
+        k->own = 1;
+        for (int c = 0; c < 3; c++)                  /* in sixteenths: the adornments' ambients are a ramp by their
+                                                      * height, and one batch for each value was hundreds of draws */
+            k->amb[c] = (float)(int)(in->ambient[c] * 16.0f + 0.5f) / 16.0f;
+    }
+    return 1;
+}
+
+static int bat_group_of(Renderer *r, const BatKey *k)
+{
+    for (uint32_t g = 0; g < r->nbgroup; g++)
+        if (!memcmp(&r->bgroup[g].key, k, sizeof *k))
+            return (int)g;
+    BatGroup *n = realloc(r->bgroup, sizeof *n * (r->nbgroup + 1));
+    if (!n)
+        return -1;
+    r->bgroup = n;
+    memset(&n[r->nbgroup], 0, sizeof *n);
+    n[r->nbgroup].key = *k;
+    return (int)r->nbgroup++;
+}
+
+/* the batch's arrays from its members, each through its item's matrix */
+static void bat_build(Renderer *r, const BatKey *key, BatSub *b)
+{
+    const Scene *s = r->scene;
+    uint32_t nv = 0, ni = 0, live = 0;
+    for (uint32_t m = 0; m < b->nmem; m++)               /* the members that left give up their places */
+        if (!b->mem[m].gone)
+            b->mem[live++] = b->mem[m];
+    b->nmem = live;
+    for (uint32_t m = 0; m < b->nmem; m++) {
+        const MeshPart *p = &s->meshes[s->items[b->mem[m].item].mesh].mesh.parts[b->mem[m].part];
+        nv += p->nverts;
+        ni += 3 * p->ntris;
+    }
+    bat_arrays_free(b);
+    b->fverts = nv;
+    b->fidx = ni;
+    if (!nv || !ni)
+        return;
+    if (ni > b->cidx) {
+        free(b->idx);
+        b->idx = malloc(sizeof(uint16_t) * ni);
+        b->cidx = b->idx ? ni : 0;
+    }
+    int nrm = key->fmt & 1, uv = key->fmt & 2, col = key->fmt & 4;
+    b->pos = gliStaticArrayAlloc(sizeof(float) * 3 * nv, b);
+    b->nrm = nrm ? gliStaticArrayAlloc(sizeof(float) * 3 * nv, b) : NULL;
+    b->uv = uv ? gliStaticArrayAlloc(sizeof(float) * 2 * nv, b) : NULL;
+    b->col = col ? gliStaticArrayAlloc(sizeof(float) * 4 * nv, b) : NULL;
+    b->registered = 1;
+    if (!b->idx || !b->pos || (nrm && !b->nrm) || (uv && !b->uv) || (col && !b->col)) {
+        bat_arrays_free(b);
+        b->failed = 1;                               /* its members are drawn part by part (bat_frame) */
+        return;
+    }
+    uint32_t v0 = 0, i0 = 0;
+    for (uint32_t m = 0; m < b->nmem; m++) {
+        b->mem[m].i0 = i0;
+        const DrawItem *it = &s->items[b->mem[m].item];
+        const MeshPart *p = &s->meshes[it->mesh].mesh.parts[b->mem[m].part];
+        const float *w = it->world.m;
+        /* the normals through the matrix of cofactors (the inverse transpose but for its scale: GL_NORMALIZE is on) */
+        float c[9] = { w[5] * w[10] - w[6] * w[9], w[6] * w[8] - w[4] * w[10], w[4] * w[9] - w[5] * w[8],
+                       w[2] * w[9] - w[1] * w[10], w[0] * w[10] - w[2] * w[8], w[1] * w[8] - w[0] * w[9],
+                       w[1] * w[6] - w[2] * w[5], w[2] * w[4] - w[0] * w[6], w[0] * w[5] - w[1] * w[4] };
+        float det = w[0] * c[0] + w[1] * c[1] + w[2] * c[2];
+        float *po = b->pos + 3 * v0;
+        for (uint32_t k = 0; k < p->nverts; k++) {
+            float x = p->pos[3 * k], y = p->pos[3 * k + 1], z = p->pos[3 * k + 2];
+            po[3 * k] = w[0] * x + w[4] * y + w[8] * z + w[12];
+            po[3 * k + 1] = w[1] * x + w[5] * y + w[9] * z + w[13];
+            po[3 * k + 2] = w[2] * x + w[6] * y + w[10] * z + w[14];
+        }
+        if (key->fmt & 1) {
+            float *no = b->nrm + 3 * v0;
+            for (uint32_t k = 0; k < p->nverts; k++) {
+                float x = p->nrm[3 * k], y = p->nrm[3 * k + 1], z = p->nrm[3 * k + 2];
+                no[3 * k] = c[0] * x + c[3] * y + c[6] * z;
+                no[3 * k + 1] = c[1] * x + c[4] * y + c[7] * z;
+                no[3 * k + 2] = c[2] * x + c[5] * y + c[8] * z;
+            }
+        }
+        if (key->fmt & 2)
+            memcpy(b->uv + 2 * v0, p->uv, sizeof(float) * 2 * p->nverts);
+        if (key->fmt & 4)
+            memcpy(b->col + 4 * v0, p->col, sizeof(float) * 4 * p->nverts);
+        uint16_t *io = b->idx + i0;
+        if (det < 0) {                               /* a mirrored item: its triangles the other way round */
+            for (uint32_t k = 0; k < p->ntris; k++) {
+                io[3 * k] = (uint16_t)(v0 + p->tris[3 * k]);
+                io[3 * k + 1] = (uint16_t)(v0 + p->tris[3 * k + 2]);
+                io[3 * k + 2] = (uint16_t)(v0 + p->tris[3 * k + 1]);
+            }
+        } else {
+            for (uint32_t k = 0; k < 3 * p->ntris; k++)
+                io[k] = (uint16_t)(v0 + p->tris[k]);
+        }
+        v0 += p->nverts;
+        i0 += 3 * p->ntris;
+    }
+    b->nverts = nv;
+    b->nidx = ni;
+    b->failed = 0;
+}
+
+static void bat_draw(Renderer *r, const BatKey *key, const BatSub *b)
+{
+    /* Only the members in sight are sent: the batch holds the whole block, and the NV2A takes its indices inline,
+     * so drawing all of it every frame cost more than the draws it saved. */
+    if (b->nidx > r->cbat_idx) {
+        uint16_t *n = realloc(r->bat_idx, sizeof *n * b->nidx);
+        if (!n)
+            return;
+        r->bat_idx = n;
+        r->cbat_idx = b->nidx;
+    }
+    uint32_t nidx = 0;
+    for (uint32_t m = 0; m < b->nmem; m++) {
+        const BatMember *mm = &b->mem[m];
+        if (mm->gone || (mm->item < g_xbox_item_seen_n && !g_xbox_item_seen[mm->item]))
+            continue;
+        memcpy(r->bat_idx + nidx, b->idx + mm->i0, sizeof *b->idx * mm->ni);
+        nidx += mm->ni;
+    }
+    if (!nidx)
+        return;
+    if (key->own != r->bat_own || (key->own && memcmp(key->amb, r->bat_amb_now, sizeof key->amb))) {
+        const float *a = key->own ? key->amb : r->bat_amb;
+        glLightModelfv(GL_LIGHT_MODEL_AMBIENT, (float[4]){ a[0], a[1], a[2], 1 });
+        r->bat_own = key->own;
+        memcpy(r->bat_amb_now, a, sizeof r->bat_amb_now);
+    }
+    xs_enable(&xs.cull, GL_CULL_FACE, !key->two_sided);
+    if (key->tex) {
+        xs_bind(key->tex);
+        xs_wrap(key->tex, key->clamp ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+    } else
+        xs_enable(&xs.tex2d, GL_TEXTURE_2D, 0);
+    if (!b->nrm) glNormal3f(0, 0, 1);
+    if (!b->col) glColor4fv(key->col);
+    xs_light(!b->nrm ? 0 : xs_light_base());         /* no normals: its light is in its colours (draw_part) */
+    GLboolean test_was = key->uncut && !key->blend ? glIsEnabled(GL_ALPHA_TEST) : GL_FALSE;
+    if (test_was)
+        glDisable(GL_ALPHA_TEST);
+    if (key->blend) {                                /* as draw_part's blended parts */
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glAlphaFunc(GL_GREATER, key->blend == 1 ? 0.01f : 0.0f);
+        if (key->blend == 1) {
+            glDepthMask(GL_FALSE);
+            glDepthFunc(GL_LEQUAL);
+        }
+    }
+    if (b->registered && gl4es_xbox_predraw())
+        gliDirectDraw(b->pos, b->nrm, b->uv, b->col, r->bat_idx, (int)nidx);
+    else {                                           /* (gl4es has work to do for this texture) */
+        glVertexPointer(3, GL_FLOAT, 0, b->pos);
+        xs_client(&xs.nrm, GL_NORMAL_ARRAY, b->nrm != NULL);
+        if (b->nrm) glNormalPointer(GL_FLOAT, 0, b->nrm);
+        xs_client(&xs.uv, GL_TEXTURE_COORD_ARRAY, b->uv != NULL);
+        if (b->uv) glTexCoordPointer(2, GL_FLOAT, 0, b->uv);
+        xs_client(&xs.col, GL_COLOR_ARRAY, b->col != NULL);
+        if (b->col) glColorPointer(4, GL_FLOAT, 0, b->col);
+        if (b->registered)
+            gliStaticArraysHint(1);
+        glDrawElements(GL_TRIANGLES, (GLsizei)nidx, GL_UNSIGNED_SHORT, r->bat_idx);
+        if (b->registered)
+            gliStaticArraysHint(0);
+    }
+    if (key->blend) {
+        glDisable(GL_BLEND);
+        glAlphaFunc(GL_GREATER, 0.5f);
+        glDepthMask(GL_TRUE);
+        glDepthFunc(GL_LESS);
+    }
+    if (test_was)
+        glEnable(GL_ALPHA_TEST);
+    r->drawn += nidx / 3;
+}
+
+/* a part into a batch of its group that has room; the batch is built again at its next draw */
+static void bat_join(Renderer *r, uint32_t i, uint32_t k, const MeshPart *p)
+{
+    BatItem *bi = &r->bitem[i];
+    BatGroup *bg = &r->bgroup[bi->key[k]];
+    uint32_t nv = p->nverts, ni = 3 * p->ntris;
+    int at = -1;
+    for (int q = 0; q < bg->nsub && at < 0; q++)
+        if (!bg->sub[q].nmem || (bg->sub[q].fverts + nv <= BAT_MAX_VERTS && bg->sub[q].fidx + ni <= BAT_MAX_INDICES))
+            at = q;
+    if (at < 0) {
+        if (bg->nsub >= 32767)
+            return;
+        BatSub *n = realloc(bg->sub, sizeof *n * (size_t)(bg->nsub + 1));
+        if (!n)
+            return;
+        bg->sub = n;
+        memset(&n[bg->nsub], 0, sizeof *n);
+        at = bg->nsub++;
+    }
+    BatSub *b = &bg->sub[at];
+    if (b->nmem == b->cmem) {
+        uint32_t c = b->cmem ? 2 * b->cmem : 16;
+        BatMember *mm = realloc(b->mem, sizeof *mm * c);
+        if (!mm)
+            return;
+        b->mem = mm;
+        b->cmem = c;
+    }
+    BatMember *mm = &b->mem[b->nmem++];
+    mm->item = i;
+    mm->part = (uint16_t)k;
+    mm->nv = nv;
+    mm->ni = ni;
+    mm->i0 = 0;
+    mm->gone = 0;
+    b->fverts += nv;
+    b->fidx += ni;
+    b->dirty = 1;
+    bi->sub[k] = (int16_t)at;
+}
+
+/* a part out of its batch (it changed, or its item did) */
+static void bat_leave(Renderer *r, uint32_t i, uint32_t k)
+{
+    BatItem *bi = &r->bitem[i];
+    if (!bi->sub || bi->sub[k] < 0)
+        return;
+    if (bi->key[k] >= 0 && (uint32_t)bi->key[k] < r->nbgroup && bi->sub[k] < r->bgroup[bi->key[k]].nsub) {
+        BatSub *b = &r->bgroup[bi->key[k]].sub[bi->sub[k]];
+        for (uint32_t m = 0; m < b->nmem; m++)
+            if (b->mem[m].item == i && b->mem[m].part == k && !b->mem[m].gone) {
+                b->mem[m].gone = 1;                  /* (not built again for this: bat_draw passes it over) */
+                break;
+            }
+    }
+    bi->sub[k] = -1;
+}
+
+static void bat_item_leave(Renderer *r, uint32_t i)
+{
+    BatItem *bi = &r->bitem[i];
+    for (uint32_t k = 0; bi->sub && k < bi->nkeys; k++)
+        bat_leave(r, i, k);
+}
+
+static int16_t bat_sort_part(Renderer *r, const DrawItem *it, const Instance *in, const Mesh *m, uint32_t k, double t)
+{
+    const Scene *s = r->scene;
+    BatKey bk;
+    int g = bat_part_key(r, &s->meshes[it->mesh], &m->parts[k], in, t, &bk) ? bat_group_of(r, &bk) : -1;
+    if (g >= 0 && g <= 32767 && it->mesh < r->nmbuf && r->mbuf[it->mesh].pb && r->mbuf[it->mesh].parts == m->parts &&
+        k < r->mbuf[it->mesh].nparts)
+        xbox_static_unregister(&r->mbuf[it->mesh].pb[k]);   /* (its own copy: the batch has it now) */
+    return (int16_t)(g > 32767 ? -1 : g);
+}
+
+/* this frame's batches. Each standing item's plain parts are members of batches; a part leaves its batch when it
+ * changes (a facade's cell as it is damaged) and comes back a second later, an item leaves with all its parts when
+ * it moves, hides or is replaced. Only the batches whose members changed are built again, and all are drawn (the
+ * view matrix loaded), each sending the indices of its members in sight. After it Renderer.bitem[i].key says, for
+ * an item in the batches, which of its parts draw_mesh leaves out. */
+static void bat_frame(Renderer *r, double t)
+{
+    const Scene *s = r->scene;
+    static uint32_t frame;
+    frame++;
+    if (r->nbitem != s->nitems) {                    /* another set of items: start again */
+        bat_drop(r);
+        r->bitem = calloc(s->nitems ? s->nitems : 1, sizeof *r->bitem);
+        if (!r->bitem)
+            return;
+        r->nbitem = s->nitems;
+    }
+    for (uint32_t i = 0; i < s->nitems; i++) {
+        const DrawItem *it = &s->items[i];
+        const Instance *in = &s->instances[it->instance];
+        BatItem *bi = &r->bitem[i];
+        uint8_t was = bi->active;
+        bi->active = 0;
+        if (in->hidden || it->instance == s->sky || it->instance == s->ground_inst || it->skin || it->mesh >= s->nmeshes) {
+            if (was) {
+                bat_item_leave(r, i);
+                bi->sorted = 0;                      /* (sorted and joined again when it is back) */
+            }
+            continue;
+        }
+        const Mesh *m = &s->meshes[it->mesh].mesh;
+        int fresh = !bi->seen, moved = memcmp(bi->world, it->world.m, sizeof bi->world) != 0;
+        float amb[4] = { in->ambient[0], in->ambient[1], in->ambient[2], (float)(in->own_ambient != 0) };
+        if (fresh || moved || bi->parts != m->parts || bi->nparts != m->nparts || bi->mesh != it->mesh ||
+            memcmp(bi->amb, amb, sizeof amb)) {
+            if (was)
+                bat_item_leave(r, i);
+            was = 0;
+            bi->seen = 1;
+            bi->parts = m->parts; bi->nparts = m->nparts; bi->mesh = it->mesh;
+            memcpy(bi->world, it->world.m, sizeof bi->world);
+            memcpy(bi->amb, amb, sizeof amb);
+            bi->sorted = 0;
+            if (fresh)
+                bi->settle = frame;                  /* (a new block: at once) */
+            else if (moved) {                        /* a mover: out for longer each time, up to a minute */
+                bi->settle = frame + (BAT_SETTLE_FRAMES << (bi->moves < 6 ? bi->moves : 6));
+                if (bi->moves < 255) bi->moves++;
+            } else
+                bi->settle = frame + BAT_SETTLE_FRAMES;
+        }
+        if ((int32_t)(frame - bi->settle) < 0)
+            continue;                                /* it changed a moment ago: part by part */
+        if (!bi->sorted) {
+            uint32_t n = m->nparts ? m->nparts : 1;
+            int16_t *key = realloc(bi->key, sizeof *key * n);
+            if (key) bi->key = key;
+            int16_t *sub = realloc(bi->sub, sizeof *sub * n);
+            if (sub) bi->sub = sub;
+            uint32_t *rev = realloc(bi->rev, sizeof *rev * n);
+            if (rev) bi->rev = rev;
+            uint32_t *out = realloc(bi->out, sizeof *out * n);
+            if (out) bi->out = out;
+            uint8_t *chg = realloc(bi->chg, n);
+            if (chg) bi->chg = chg;
+            if (!key || !sub || !rev || !out || !chg) {
+                bi->nkeys = 0;
+                continue;
+            }
+            bi->nkeys = m->nparts;
+            for (uint32_t k = 0; k < m->nparts; k++) {
+                key[k] = bat_sort_part(r, it, in, m, k, t);
+                sub[k] = -1;
+                rev[k] = m->parts[k].rev;
+                out[k] = 0;
+                chg[k] = 0;
+                if (key[k] >= 0)
+                    bat_join(r, i, k, &m->parts[k]);
+            }
+            bi->sorted = 1;
+        } else {
+            for (uint32_t k = 0; k < m->nparts; k++) {
+                if (m->parts[k].rev != bi->rev[k]) {         /* this part changed: out of its batch for a second */
+                    bi->rev[k] = m->parts[k].rev;
+                    bat_leave(r, i, k);
+                    bi->key[k] = -1;
+                    bi->out[k] = frame + (BAT_SETTLE_FRAMES << (bi->chg[k] < 5 ? bi->chg[k] : 5));   /* longer each time */
+                    if (!bi->out[k]) bi->out[k] = 1;
+                    if (bi->chg[k] < 255) bi->chg[k]++;
+                } else if (bi->out[k] && (int32_t)(frame - bi->out[k]) >= 0) {
+                    bi->out[k] = 0;
+                    bi->key[k] = bat_sort_part(r, it, in, m, k, t);
+                    if (bi->key[k] >= 0)
+                        bat_join(r, i, k, &m->parts[k]);
+                }
+            }
+        }
+        bi->active = 1;
+    }
+    for (uint32_t g = 0; g < r->nbgroup; g++) {
+        BatGroup *bg = &r->bgroup[g];
+        for (int k = 0; k < bg->nsub; k++) {
+            BatSub *b = &bg->sub[k];
+            if (b->dirty) {
+                b->dirty = 0;
+                bat_build(r, &bg->key, b);
+                if (b->failed) {                     /* no room for it: its members are drawn part by part from now
+                                                      * on (until their items change and are sorted again) */
+                    for (uint32_t m = 0; m < b->nmem; m++) {
+                        BatItem *bi = &r->bitem[b->mem[m].item];
+                        bi->key[b->mem[m].part] = -1;
+                        bi->sub[b->mem[m].part] = -1;
+                    }
+                    b->nmem = 0;
+                    b->fverts = b->fidx = 0;
+                    b->failed = 0;
+                }
+            }
+            if (b->nidx && !bg->key.blend)
+                bat_draw(r, &bg->key, b);
+        }
+    }
+    if (r->bat_own) {                                /* the scene's ambient again */
+        glLightModelfv(GL_LIGHT_MODEL_AMBIENT, (float[4]){ r->bat_amb[0], r->bat_amb[1], r->bat_amb[2], 1 });
+        r->bat_own = 0;
+    }
+}
+
+/* the blended batches, after the opaque world is drawn (the view matrix loaded): the cracks and the facades' sheets
+ * lie on walls that are there by now; among themselves they are drawn in no particular order, as the parts were */
+static void bat_draw_blended(Renderer *r)
+{
+    for (uint32_t g = 0; g < r->nbgroup; g++) {
+        BatGroup *bg = &r->bgroup[g];
+        if (!bg->key.blend)
+            continue;
+        for (int k = 0; k < bg->nsub; k++)
+            if (bg->sub[k].nidx)
+                bat_draw(r, &bg->key, &bg->sub[k]);
+    }
+    if (r->bat_own) {
+        glLightModelfv(GL_LIGHT_MODEL_AMBIENT, (float[4]){ r->bat_amb[0], r->bat_amb[1], r->bat_amb[2], 1 });
+        r->bat_own = 0;
+    }
+}
+#endif
+
+#ifdef RAMPAGE_XBOX
+/* The quads of the effects and of the HUD, gathered and drawn as arrays: a glBegin .. glEnd for each one went through
+ * gl4es's display-list machinery, a few dozen HUD quads costing as much as a hundred parts of the city. Quads are
+ * added in their order and drawn when the state they need changes (the caller's qb_flush), so what is blended over
+ * what is as before. */
+#define QB_MAX 1024
+static struct {
+    float pos[QB_MAX * 4 * 3], uv[QB_MAX * 4 * 2], col[QB_MAX * 4 * 4];
+    uint16_t idx[QB_MAX * 6];
+    int n, ready;
+} qb;
+
+static void qb_flush(void)
+{
+    if (!qb.n)
+        return;
+    glVertexPointer(3, GL_FLOAT, 0, qb.pos);
+    glTexCoordPointer(2, GL_FLOAT, 0, qb.uv);
+    glColorPointer(4, GL_FLOAT, 0, qb.col);
+    glDrawElements(GL_TRIANGLES, qb.n * 6, GL_UNSIGNED_SHORT, qb.idx);
+    qb.n = 0;
+}
+static void qb_begin(void)
+{
+    if (!qb.ready) {
+        for (int i = 0; i < QB_MAX; i++) {
+            uint16_t *o = &qb.idx[6 * i], v = (uint16_t)(4 * i);
+            o[0] = v; o[1] = (uint16_t)(v + 1); o[2] = (uint16_t)(v + 2);
+            o[3] = v; o[4] = (uint16_t)(v + 2); o[5] = (uint16_t)(v + 3);
+        }
+        qb.ready = 1;
+    }
+    qb.n = 0;
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    glEnableClientState(GL_COLOR_ARRAY);
+    glDisableClientState(GL_NORMAL_ARRAY);
+}
+static void qb_end(void)
+{
+    qb_flush();
+    glDisableClientState(GL_VERTEX_ARRAY);
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    glDisableClientState(GL_COLOR_ARRAY);
+}
+/* the next quad's corner k: its place, texture coordinates and colour */
+static void qb_vertex(int k, float x, float y, float z, float u, float v, const float rgb[3], float a)
+{
+    int at = qb.n * 4 + k;
+    float *p = &qb.pos[3 * at], *t = &qb.uv[2 * at], *c = &qb.col[4 * at];
+    p[0] = x; p[1] = y; p[2] = z;
+    t[0] = u; t[1] = v;
+    c[0] = rgb[0]; c[1] = rgb[1]; c[2] = rgb[2]; c[3] = a;
+}
+static void qb_next(void)
+{
+    if (++qb.n == QB_MAX)
+        qb_flush();
+}
+#endif
+
 static void draw_held(Renderer *r, double t)
 {
     glMatrixMode(GL_MODELVIEW);
@@ -1074,11 +1977,246 @@ static void draw_held(Renderer *r, double t)
     }
     glPopMatrix();
     r->nheld = 0;
+    XS_END();
 }
+
+#ifdef RAMPAGE_XBOX
+/* how a part is drawn: on the GPU's skinning program (sg), straight from its arrays in GPU memory (ok), or through
+ * glDrawElements with client arrays (set when first needed) */
+typedef struct {
+    const SkinGpu *sg;
+    const Skin *skin;
+    int ok, arrays_set;
+    const float *pos, *nrm, *uv, *col;               /* in GPU memory */
+    const uint16_t *idx16;
+    const float *cpos, *cnrm, *cuv, *ccol;           /* the client arrays */
+} XboxDirect;
+
+static void xbox_client_arrays(XboxDirect *d)
+{
+    glVertexPointer(3, GL_FLOAT, 0, d->cpos);
+    xs_client(&xs.nrm, GL_NORMAL_ARRAY, d->cnrm != NULL);
+    if (d->cnrm) glNormalPointer(GL_FLOAT, 0, d->cnrm);
+    xs_client(&xs.uv, GL_TEXTURE_COORD_ARRAY, d->cuv != NULL);
+    if (d->cuv) glTexCoordPointer(2, GL_FLOAT, 0, d->cuv);
+    xs_client(&xs.col, GL_COLOR_ARRAY, d->ccol != NULL);
+    if (d->ccol) glColorPointer(4, GL_FLOAT, 0, d->ccol);
+    d->arrays_set = 1;
+}
+
+/* a skinned part's groups, each with its bones' matrices from the instance's pose */
+static void xbox_skin_draw(Renderer *r, const SkinGpu *sg)
+{
+    if (!r->pal && !(r->pal = malloc(sizeof *r->pal * 256)))
+        return;
+    if (r->pal_inst != r->cur_inst || r->pal_frame != r->xframe) {
+        r->npal = scene_skin_palette(r->cur_inst, r->pal);
+        r->pal_inst = r->cur_inst;
+        r->pal_frame = r->xframe;
+    }
+    for (int k = 0; k < sg->ng; k++) {
+        const SkinGroup *g = &sg->g[k];
+        static float gp[SKIN_GROUP_BONES][12];
+        for (int j = 0; j < g->nb; j++) {
+            static const float one[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+            const float *m = g->b[j] < r->npal ? r->pal[g->b[j]].m : one;
+            for (int row = 0; row < 3; row++) {      /* its rows (the matrices are column-major) */
+                gp[j][4 * row] = m[row];
+                gp[j][4 * row + 1] = m[4 + row];
+                gp[j][4 * row + 2] = m[8 + row];
+                gp[j][4 * row + 3] = m[12 + row];
+            }
+        }
+        gliSkinDraw(g->pos, g->nrm, g->uv, g->col, g->bone, g->weight, g->idx, (int)g->nidx,
+                    (const float (*)[12])gp, g->nb);
+    }
+}
+
+static void xbox_part_draw(Renderer *r, XboxDirect *d, GLsizei count, GLenum idx_type, const void *idx)
+{
+    if (d->sg) {
+        if (gl4es_xbox_predraw())
+            xbox_skin_draw(r, d->sg);
+        else if (d->skin)                            /* its texture needs gl4es: the CPU poses it from now on */
+            ((Skin *)d->skin)->gpu_skin = -1;
+        return;
+    }
+    if (d->ok && gl4es_xbox_predraw()) {
+        gliDirectDraw(d->pos, d->nrm, d->uv, d->col, d->idx16, count);
+        return;
+    }
+    if (!d->arrays_set)
+        xbox_client_arrays(d);
+    glDrawElements(GL_TRIANGLES, count, idx_type, idx);
+}
+
+/* part pi of a skinned scene mesh as the GPU poses it, made at its first draw; NULL: not this part (no normals,
+ * a second layer or a texture matrix the program does not do, no room in the store), posed by the CPU instead */
+static const SkinGpu *xbox_skin_gpu(Renderer *r, const SceneMesh *sm, const Skin *skin, uint32_t pi, uint32_t first,
+                                    PartBuf *pb)
+{
+    if (pb->sg)
+        return pb->sg->failed ? NULL : pb->sg;
+    const Scene *s = r->scene;
+    const MeshPart *p = &sm->mesh.parts[pi];
+    SkinGpu *sg = calloc(1, sizeof *sg);
+    if (!sg)
+        return NULL;
+    pb->sg = sg;
+    float reg[4];
+    int maxb = gliSkinMaxBones();
+    if (maxb > SKIN_GROUP_BONES) maxb = SKIN_GROUP_BONES;
+    uint32_t nv = p->nverts, nt = p->ntris;
+    int32_t *vmap = NULL;
+    uint32_t *gv = NULL;
+    uint16_t *gi = NULL;
+    if (maxb < 12 || !p->nrm || !p->pos || !p->tris || !nv || !nt || !skin->bones || !skin->weights ||
+        first + nv > skin->nverts || (p->uv && material_region(sm->b, p->material, reg)) ||
+        cube_material(s, sm, p->material) || material_env(sm->b, p->material) ||
+        (p->col && p->uv && material_damage_layer(sm->b, p->material)) ||
+        (s->cloud_material && sm->b == s->city && p->material == s->cloud_material))
+        goto fail;
+    vmap = malloc(sizeof *vmap * nv);
+    gv = malloc(sizeof *gv * nv);
+    gi = malloc(sizeof *gi * 3 * (size_t)nt);
+    if (!vmap || !gv || !gi)
+        goto fail;
+    for (uint32_t t = 0; t < nt;) {
+        uint8_t local[256], gb[SKIN_GROUP_BONES];
+        int nb = 0;
+        uint32_t ngv = 0, ngi = 0;
+        memset(local, 0xFF, sizeof local);
+        memset(vmap, 0xFF, sizeof *vmap * nv);
+        for (; t < nt; t++) {                        /* the triangles this group's bones and vertices have room for */
+            const uint32_t *tri = p->tris + 3 * t;
+            uint8_t add[12];
+            int nadd = 0;
+            uint32_t fresh = 0;
+            for (int c = 0; c < 3; c++) {
+                uint32_t v = tri[c];
+                if (v >= nv)
+                    goto fail;
+                if (vmap[v] < 0)
+                    fresh++;
+                for (int k = 0; k < 4; k++) {
+                    if (!(skin->weights[first + v][k] > 0))
+                        continue;
+                    uint8_t b = skin->bones[first + v][k];
+                    int known = local[b] != 0xFF;
+                    for (int q = 0; q < nadd && !known; q++)
+                        known = add[q] == b;
+                    if (!known)
+                        add[nadd++] = b;
+                }
+            }
+            if (nb + nadd > maxb || ngv + fresh > SKIN_GROUP_VERTS || ngv + fresh > 65535u)
+                break;
+            for (int q = 0; q < nadd; q++) {
+                local[add[q]] = (uint8_t)nb;
+                gb[nb++] = add[q];
+            }
+            for (int c = 0; c < 3; c++) {
+                uint32_t v = tri[c];
+                if (vmap[v] < 0) {
+                    vmap[v] = (int32_t)ngv;
+                    gv[ngv++] = v;
+                }
+                gi[ngi++] = (uint16_t)vmap[v];
+            }
+        }
+        if (!ngi)
+            goto fail;
+        SkinGroup *grown = realloc(sg->g, sizeof *grown * (size_t)(sg->ng + 1));
+        if (!grown)
+            goto fail;
+        sg->g = grown;
+        SkinGroup *g = &sg->g[sg->ng++];
+        memset(g, 0, sizeof *g);
+        g->pos = gliStaticArrayAlloc(sizeof(float) * 3 * ngv, sg);
+        g->nrm = gliStaticArrayAlloc(sizeof(float) * 3 * ngv, sg);
+        g->uv = p->uv ? gliStaticArrayAlloc(sizeof(float) * 2 * ngv, sg) : NULL;
+        g->col = p->col ? gliStaticArrayAlloc(sizeof(float) * 4 * ngv, sg) : NULL;
+        g->bone = gliStaticArrayAlloc(sizeof(float) * 4 * ngv, sg);
+        g->weight = gliStaticArrayAlloc(sizeof(float) * 4 * ngv, sg);
+        g->idx = malloc(sizeof *g->idx * ngi);
+        if (!g->pos || !g->nrm || (p->uv && !g->uv) || (p->col && !g->col) || !g->bone || !g->weight || !g->idx)
+            goto fail;
+        for (uint32_t q = 0; q < ngv; q++) {         /* (written once, in order: the store is write-combined) */
+            uint32_t v = gv[q];
+            g->pos[3 * q] = p->pos[3 * v]; g->pos[3 * q + 1] = p->pos[3 * v + 1]; g->pos[3 * q + 2] = p->pos[3 * v + 2];
+        }
+        for (uint32_t q = 0; q < ngv; q++) {
+            uint32_t v = gv[q];
+            g->nrm[3 * q] = p->nrm[3 * v]; g->nrm[3 * q + 1] = p->nrm[3 * v + 1]; g->nrm[3 * q + 2] = p->nrm[3 * v + 2];
+        }
+        for (uint32_t q = 0; g->uv && q < ngv; q++) {
+            uint32_t v = gv[q];
+            g->uv[2 * q] = p->uv[2 * v]; g->uv[2 * q + 1] = p->uv[2 * v + 1];
+        }
+        for (uint32_t q = 0; g->col && q < ngv; q++) {
+            uint32_t v = gv[q];
+            for (int c = 0; c < 4; c++)
+                g->col[4 * q + c] = p->col[4 * v + c];
+        }
+        for (uint32_t q = 0; q < ngv; q++) {
+            uint32_t v = gv[q];
+            for (int k = 0; k < 4; k++) {
+                float w = skin->weights[first + v][k];
+                g->bone[4 * q + k] = w > 0 ? (float)local[skin->bones[first + v][k]] : 0.0f;
+            }
+        }
+        for (uint32_t q = 0; q < ngv; q++) {
+            uint32_t v = gv[q];
+            for (int k = 0; k < 4; k++) {
+                float w = skin->weights[first + v][k];
+                g->weight[4 * q + k] = w > 0 ? w : 0.0f;
+            }
+        }
+        memcpy(g->idx, gi, sizeof *g->idx * ngi);
+        g->nverts = ngv;
+        g->nidx = ngi;
+        g->nb = (uint8_t)nb;
+        memcpy(g->b, gb, (size_t)nb);
+    }
+    free(vmap); free(gv); free(gi);
+    return sg;
+fail:
+    free(vmap); free(gv); free(gi);
+    for (int k = 0; k < sg->ng; k++) {               /* (the record stays: not tried again for this part) */
+        SkinGroup *g = &sg->g[k];
+        if (g->pos) gliStaticArrayRemove(g->pos, sg);
+        if (g->nrm) gliStaticArrayRemove(g->nrm, sg);
+        if (g->uv) gliStaticArrayRemove(g->uv, sg);
+        if (g->col) gliStaticArrayRemove(g->col, sg);
+        if (g->bone) gliStaticArrayRemove(g->bone, sg);
+        if (g->weight) gliStaticArrayRemove(g->weight, sg);
+        free(g->idx);
+    }
+    free(sg->g);
+    sg->g = NULL;
+    sg->ng = 0;
+    sg->failed = 1;
+    return NULL;
+}
+#endif
 
 static void draw_part(Renderer *r, const SceneMesh *sm, const Skin *skin, uint32_t i, uint32_t first, double t)
 {
     pump_output(r);
+#ifdef RAMPAGE_XBOX
+    const PartBuf *xp = xbox_part(r, sm, i, skin != NULL);
+    XboxDirect xd;
+    memset(&xd, 0, sizeof xd);
+    xd.skin = skin;
+    if (skin && skin->gpu_skin > 0 && !skin->cloth) {   /* posed by the GPU */
+        xd.sg = r->cur_inst && xp ? xbox_skin_gpu(r, sm, skin, i, first, (PartBuf *)xp) : NULL;
+        if (!xd.sg) {
+            ((Skin *)skin)->gpu_skin = -1;           /* not this one: the CPU poses it from the next frame on */
+            return;
+        }
+    } else if (skin && !skin->pos)
+        return;                                      /* (the CPU has not posed it yet) */
+#endif
     const Scene *s = r->scene;
     const MeshPart *p = &sm->mesh.parts[i];
     uint32_t tex = shown_texture(r, sm->b, material_texture(sm->b, p->material), t);
@@ -1095,6 +2233,14 @@ static void draw_part(Renderer *r, const SceneMesh *sm, const Skin *skin, uint32
         id = cube_env;
         rid = 0;
     }
+#ifdef RAMPAGE_XBOX
+    xs_enable(&xs.cull, GL_CULL_FACE, !(material_flags(sm->b, p->material) & MAT_TWO_SIDED));
+    if (id) {
+        xs_bind(id);
+        xs_wrap(id, !rid && !env_only && material_clamped(sm->b, p->material) ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+    } else
+        xs_enable(&xs.tex2d, GL_TEXTURE_2D, 0);
+#else
     if (material_flags(sm->b, p->material) & MAT_TWO_SIDED) glDisable(GL_CULL_FACE);
     else glEnable(GL_CULL_FACE);
     if (id) {
@@ -1110,6 +2256,7 @@ static void draw_part(Renderer *r, const SceneMesh *sm, const Skin *skin, uint32
     } else {
         glDisable(GL_TEXTURE_2D);
     }
+#endif
     int scroll = s->cloud_material && sm->b == s->city && p->material == s->cloud_material;
     float drift[2] = { 0, 0 };
     if (scroll) {
@@ -1130,6 +2277,35 @@ static void draw_part(Renderer *r, const SceneMesh *sm, const Skin *skin, uint32
      * (posed every frame) from the client arrays */
     const PartBuf *pb = skin ? NULL : part_buffers(r, sm, i);
     const void *pos = p->pos, *nrm = p->nrm, *uv = p->uv, *col = p->col, *idx = p->tris;
+#ifdef RAMPAGE_XBOX
+    int xbox_static = (xp && xp->vbo == 1) || (skin && skin->gpu);   /* (a posed mesh in the GPU's store) */
+    if (xbox_static)
+        gliStaticArraysHint(1);                      /* this part's draws, to the end of the function */
+    GLenum idx_type = GL_UNSIGNED_INT;
+    if (xp && xp->idx16) {
+        idx = xp->idx16;
+        idx_type = GL_UNSIGNED_SHORT;
+        xd.idx16 = xp->idx16;
+    }
+    (void)pos; (void)nrm; (void)uv; (void)col;
+    xd.cpos = skin ? (xd.sg ? NULL : skin->pos + 3 * first) : p->pos;
+    xd.cnrm = skin ? (xd.sg ? NULL : skin->nrm + 3 * first) : p->nrm;
+    xd.cuv = p->uv;
+    xd.ccol = p->col;
+    if (!xd.sg && xd.idx16) {                        /* its arrays in GPU memory, when all of them are */
+        int reg = xp && xp->vbo == 1;
+        xd.pos = skin ? (skin->gpu ? skin->pos + 3 * first : NULL) : reg ? xp->gpos : NULL;
+        xd.nrm = skin ? (skin->gpu ? skin->nrm + 3 * first : NULL) : reg ? xp->gnrm : NULL;
+        xd.uv = reg ? xp->guv : NULL;
+        xd.col = reg ? xp->gcol : NULL;
+        xd.ok = xd.pos && (!xd.cnrm || xd.nrm) && (!p->uv || xd.uv) && (!p->col || xd.col);
+    }
+    if (!xd.ok && !xd.sg)
+        xbox_client_arrays(&xd);
+    if (!xd.cnrm && !xd.sg)
+        glNormal3f(0, 0, 1);
+#else
+    const GLenum idx_type = GL_UNSIGNED_INT;
     if (pb) {
         g_buf.bind(GL_ARRAY_BUFFER, pb->vbo);
         g_buf.bind(GL_ELEMENT_ARRAY_BUFFER, pb->ibo);
@@ -1144,10 +2320,16 @@ static void draw_part(Renderer *r, const SceneMesh *sm, const Skin *skin, uint32
     else { glDisableClientState(GL_NORMAL_ARRAY); glNormal3f(0, 0, 1); }
     if (p->uv) { glEnableClientState(GL_TEXTURE_COORD_ARRAY); glTexCoordPointer(2, GL_FLOAT, 0, uv); }
     else glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+#endif
     float mc[4];                                         /* the material's colour (white when textured) */
     material_color(sm->b, p->material, mc);
+#ifdef RAMPAGE_XBOX
+    if (!p->col)
+        glColor4fv(mc);                              /* (the colour array, when there is one, with the others) */
+#else
     if (p->col) { glEnableClientState(GL_COLOR_ARRAY); glColorPointer(4, GL_FLOAT, 0, col); }
     else { glDisableClientState(GL_COLOR_ARRAY); glColor4fv(mc); }
+#endif
     /* the part's own blend (the facades'), else its material's: GS state 2 as the sheets' (material_blended) */
     int blend = p->blend ? p->blend : material_blended(sm->b, p->material) ? 2 : 0;
     int see_through = !blend && mc[3] < 0.98f;           /* the glass of the saucer, the hover tank, the
@@ -1159,9 +2341,14 @@ static void draw_part(Renderer *r, const SceneMesh *sm, const Skin *skin, uint32
      * and no colours (format 0x102: the Las Vegas signs, CASINO, Gold Rush, the billboards' marquees) is unlit as
      * well: the texture at full strength, by night as by day [G: nothing for the lights to work on; the game's own
      * night shots show them so, not tinted by the night's light] */
+#ifdef RAMPAGE_XBOX
+    int prelit = !p->nrm && !skin && xs_light_base();
+    xs_light(prelit ? 0 : xs_light_base());          /* (left so: the next part, or the end of the run, changes it) */
+#else
     int prelit = !p->nrm && !skin && glIsEnabled(GL_LIGHTING);
     if (prelit)
         glDisable(GL_LIGHTING);
+#endif
     /* a damage layer (material_damage_layer, shader 0x7A): the vertex alpha is the layer's share, not see-through:
      * the part itself is drawn opaque, without the alpha test */
     uint32_t dmg = p->col && p->uv ? material_damage_layer(sm->b, p->material) : 0;
@@ -1197,6 +2384,16 @@ static void draw_part(Renderer *r, const SceneMesh *sm, const Skin *skin, uint32
     GLboolean test_was = uncut && !blend && !see_through ? glIsEnabled(GL_ALPHA_TEST) : GL_FALSE;
     if (test_was)
         glDisable(GL_ALPHA_TEST);
+#ifdef RAMPAGE_XBOX
+    if (env_only) {
+        sphere_coords(1);
+        xs_light(0);
+        xd.col = xd.ccol = NULL;
+        if (xd.arrays_set)
+            xs_client(&xs.col, GL_COLOR_ARRAY, 0);
+        glColor4f(1, 1, 1, 1);
+    }
+#else
     GLboolean lit_was = env_only ? glIsEnabled(GL_LIGHTING) : GL_FALSE;
     if (env_only) {
         sphere_coords(1);
@@ -1204,11 +2401,18 @@ static void draw_part(Renderer *r, const SceneMesh *sm, const Skin *skin, uint32
         glDisableClientState(GL_COLOR_ARRAY);
         glColor4f(1, 1, 1, 1);
     }
-    glDrawElements(GL_TRIANGLES, (GLsizei)(3 * p->ntris), GL_UNSIGNED_INT, idx);
+#endif
+#ifdef RAMPAGE_XBOX
+    xbox_part_draw(r, &xd, (GLsizei)(3 * p->ntris), idx_type, idx);
+#else
+    glDrawElements(GL_TRIANGLES, (GLsizei)(3 * p->ntris), idx_type, idx);
+#endif
     if (env_only) {
         sphere_coords(0);
+#ifndef RAMPAGE_XBOX
         if (lit_was)
             glEnable(GL_LIGHTING);
+#endif
     }
     if (test_was)
         glEnable(GL_ALPHA_TEST);
@@ -1238,7 +2442,11 @@ static void draw_part(Renderer *r, const SceneMesh *sm, const Skin *skin, uint32
             glAlphaFunc(GL_GREATER, 0.0f);
             glDepthFunc(GL_LEQUAL);
             glDepthMask(GL_FALSE);
-            glDrawElements(GL_TRIANGLES, (GLsizei)(3 * p->ntris), GL_UNSIGNED_INT, idx);
+#ifdef RAMPAGE_XBOX
+            xbox_part_draw(r, &xd, (GLsizei)(3 * p->ntris), idx_type, idx);
+#else
+            glDrawElements(GL_TRIANGLES, (GLsizei)(3 * p->ntris), idx_type, idx);
+#endif
             glPopAttrib();
             r->drawn += p->ntris;
         }
@@ -1261,19 +2469,31 @@ static void draw_part(Renderer *r, const SceneMesh *sm, const Skin *skin, uint32
         glDisable(GL_LIGHTING);
         glDisable(GL_FOG);
         glDisable(GL_ALPHA_TEST);
+#ifdef RAMPAGE_XBOX
+        xd.col = xd.ccol = NULL;
+        if (xd.arrays_set)
+            xs_client(&xs.col, GL_COLOR_ARRAY, 0);
+#else
         glDisableClientState(GL_COLOR_ARRAY);
+#endif
         glColor4f(1, 1, 1, 1);
         glEnable(GL_BLEND);
         glBlendFunc(GL_DST_ALPHA, GL_ONE);
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
         glDepthFunc(GL_LEQUAL);
         glDepthMask(GL_FALSE);
-        glDrawElements(GL_TRIANGLES, (GLsizei)(3 * p->ntris), GL_UNSIGNED_INT, idx);
+#ifdef RAMPAGE_XBOX
+        xbox_part_draw(r, &xd, (GLsizei)(3 * p->ntris), idx_type, idx);
+#else
+        glDrawElements(GL_TRIANGLES, (GLsizei)(3 * p->ntris), idx_type, idx);
+#endif
         sphere_coords(0);
         glPopAttrib();
     }
+#ifndef RAMPAGE_XBOX
     if (prelit)
         glEnable(GL_LIGHTING);
+#endif
     if (scroll) {
         glMatrixMode(GL_TEXTURE);
         glLoadIdentity();
@@ -1283,6 +2503,10 @@ static void draw_part(Renderer *r, const SceneMesh *sm, const Skin *skin, uint32
         g_buf.bind(GL_ARRAY_BUFFER, 0);
         g_buf.bind(GL_ELEMENT_ARRAY_BUFFER, 0);
     }
+#ifdef RAMPAGE_XBOX
+    if (xbox_static)
+        gliStaticArraysHint(0);
+#endif
 }
 
 /* the particles (fx.c): after the world, not writing depth, tested against it unless the effect says not to
@@ -1292,6 +2516,7 @@ static void draw_part(Renderer *r, const SceneMesh *sm, const Skin *skin, uint32
  * 0x50002), texture flags 0x11 (bit 0: CLAMP_1 REPEAT on S and T, 0x26AA20) */
 static void draw_water(Renderer *r, const Scene *s, const Camera *cam)
 {
+    XS_END();
     float *uv = r->water_uv;
     glDisable(GL_LIGHTING);
     glDisable(GL_CULL_FACE);
@@ -1321,6 +2546,7 @@ static void draw_water(Renderer *r, const Scene *s, const Camera *cam)
         if (id) {
             glEnable(GL_TEXTURE_2D);
             glBindTexture(GL_TEXTURE_2D, id);
+            XS_TEXTURE_BOUND();
         } else
             glDisable(GL_TEXTURE_2D);
         const uint32_t *tris = water_triangles(w, &ntris);
@@ -1439,6 +2665,7 @@ static int hud_quad_visible(const HudQuad *q, float aspect)
 
 static void draw_hud(Renderer *r, const Scene *s, int width, int height, double t)
 {
+    XS_END();
     float aspect = height ? (float)width / height : 4.0f / 3;
     if (r->has_hud_t)                                /* the GUI's own clock: it runs on while the world is paused */
         t = r->hud_t;
@@ -1446,13 +2673,35 @@ static void draw_hud(Renderer *r, const Scene *s, int width, int height, double 
     int cut = (int)(height * 4.0f / 3 + 0.5f);       /* the 640 x 480 screen's width in pixels */
     int clip = s->hud_clip && cut < width;           /* nothing past its edges: the PS2's frame ends there */
     if (clip)
+#ifdef RAMPAGE_XBOX
+        glScissor((width - cut) / 2 * xbox_pixel_width() / width, 0, cut * xbox_pixel_width() / width, xbox_pixel_height());
+#else
         glScissor((width - cut) / 2, 0, cut, height);
+#endif
     if (s->ngui3d)
         glClear(GL_DEPTH_BUFFER_BIT);
     r->in_hud = 1;
     int layer = 0;
+#ifdef RAMPAGE_XBOX
+    GLuint qb_id = ~0u;
+    int qb_scissor = -1, qb_add = -1;
+    qb_begin();
+#endif
     for (int i = 0; i < s->nhud; i++) {
         const HudQuad *q = &s->hud[i];
+#ifdef RAMPAGE_XBOX
+        if (!q->b && q->tex == HUD_TEX_3D) {
+            qb_end();                                /* a 3D layer sets its own state: the quads after it start anew */
+            glDisable(GL_SCISSOR_TEST);
+            if (layer < s->ngui3d)
+                draw_gui3d(r, &s->gui3d[layer], aspect, t);
+            layer++;
+            qb_id = ~0u;
+            qb_scissor = qb_add = -1;
+            qb_begin();
+            continue;
+        }
+#else
         if (clip && !q->wide)                        /* (the widened fills go across the window) */
             glEnable(GL_SCISSOR_TEST);
         else
@@ -1463,6 +2712,7 @@ static void draw_hud(Renderer *r, const Scene *s, int width, int height, double 
             layer++;
             continue;
         }
+#endif
 #ifdef RAMPAGE_XBOX
         /* Cull before texture lookup/upload, but never skip a 3D-layer sentinel. */
         if (!hud_quad_visible(q, aspect)) continue;
@@ -1474,9 +2724,42 @@ static void draw_hud(Renderer *r, const Scene *s, int width, int height, double 
             continue;
         static const float black[4] = { 0, 0, 0, 1 };
         const float *col = !q->b && q->tex == HUD_TEX_VIDEO && !id ? black : q->col;   /* no picture: black */
+#ifdef RAMPAGE_XBOX
+        {                                            /* the state as below, set only when it changes; the quad to
+                                                      * the batch, its colour at its corners */
+            int scissor = clip && !q->wide, add = q->additive != 0;
+            if (id != qb_id || scissor != qb_scissor || add != qb_add) {
+                qb_flush();
+                if (scissor != qb_scissor) { if (scissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST); }
+                if (id != qb_id) {
+                    if (id) {
+                        glEnable(GL_TEXTURE_2D);
+                        glBindTexture(GL_TEXTURE_2D, id);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                    } else
+                        glDisable(GL_TEXTURE_2D);
+                }
+                if (add != qb_add) glBlendFunc(GL_SRC_ALPHA, add ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA);
+                qb_id = id; qb_scissor = scissor; qb_add = add;
+            }
+            if (q->corners)
+                for (int k = 0; k < 4; k++)
+                    qb_vertex(k, q->cx[k], q->cy[k], 0, q->cu[k], q->cv[k], col, col[3]);
+            else {
+                qb_vertex(0, q->x0 + q->skew, q->y0, 0, q->u0, q->v0, col, col[3]);
+                qb_vertex(1, q->x1 + q->skew, q->y0, 0, q->u1, q->v0, col, col[3]);
+                qb_vertex(2, q->x1, q->y1, 0, q->u1, q->v1, col, col[3]);
+                qb_vertex(3, q->x0, q->y1, 0, q->u0, q->v1, col, col[3]);
+            }
+            qb_next();
+            continue;
+        }
+#endif
         if (id) {
             glEnable(GL_TEXTURE_2D);
             glBindTexture(GL_TEXTURE_2D, id);
+            XS_TEXTURE_BOUND();
             /* clamped [no PS2 meaning]: the GUI's shaders repeat as the textures load (their compiled records'
              * wrap 0x11, FORMAT_GUI.md "GuiQuad"), but on the PS2 a picture is drawn at about a texel a pixel,
              * where the edge pixels sample the edge texels; in a bigger window the outer pixels' bilinear taps
@@ -1508,6 +2791,10 @@ static void draw_hud(Renderer *r, const Scene *s, int width, int height, double 
         }
 #endif
     }
+#ifdef RAMPAGE_XBOX
+    qb_end();
+    XS_TEXTURE_BOUND();
+#endif
     r->in_hud = 0;
     glDisable(GL_SCISSOR_TEST);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -1522,6 +2809,7 @@ static void draw_hud(Renderer *r, const Scene *s, int width, int height, double 
  * the game, drawn before the monster; here the monster is already drawn) */
 static void draw_shadows(Renderer *r, int pass)
 {
+    XS_END();
     const Scene *s = r->scene;
     const ShadowList *l = s->shadows;
     int first = 0;
@@ -1553,6 +2841,7 @@ static void draw_shadows(Renderer *r, int pass)
         if (id) {
             glEnable(GL_TEXTURE_2D);
             glBindTexture(GL_TEXTURE_2D, id);
+            XS_TEXTURE_BOUND();
         } else
             glDisable(GL_TEXTURE_2D);
         glAlphaFunc(GL_GREATER, b->alpha_test ? 1.0f / 255 : 0.0f);
@@ -1565,6 +2854,18 @@ static void draw_shadows(Renderer *r, int pass)
             glEnable(GL_POLYGON_OFFSET_FILL);
             glPolygonOffset(-1, -1);
         }
+#ifdef RAMPAGE_XBOX
+        if (b->count > 0) {                          /* the same vertices, as arrays in place of a call for each */
+            const ShadowVert *v = &l->v[b->first];
+            glEnableClientState(GL_VERTEX_ARRAY);
+            glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+            glEnableClientState(GL_COLOR_ARRAY);
+            glVertexPointer(3, GL_FLOAT, sizeof *v, v->pos);
+            glTexCoordPointer(2, GL_FLOAT, sizeof *v, v->uv);
+            glColorPointer(4, GL_FLOAT, sizeof *v, v->rgba);
+            glDrawArrays(GL_TRIANGLES, 0, b->count);
+        }
+#else
         glBegin(GL_TRIANGLES);
         for (int k = b->first; k < b->first + b->count; k++) {
             const ShadowVert *v = &l->v[k];
@@ -1573,6 +2874,7 @@ static void draw_shadows(Renderer *r, int pass)
             glVertex3fv(v->pos);
         }
         glEnd();
+#endif
     }
     glPopClientAttrib();
     glPopAttrib();
@@ -1591,6 +2893,7 @@ static void draw_shadows(Renderer *r, int pass)
  * in (the car, the street under it) does not cut it */
 static void draw_fx(Renderer *r, const FxQuad *fx, int nfx, const Camera *cam, float fog_start, float fog_end, int world)
 {
+    XS_END();
     float M[16];
     glGetFloatv(GL_MODELVIEW_MATRIX, M);
     float right[3] = { M[0], M[4], M[8] }, up[3] = { M[1], M[5], M[9] };
@@ -1601,12 +2904,42 @@ static void draw_fx(Renderer *r, const FxQuad *fx, int nfx, const Camera *cam, f
     glDepthMask(GL_FALSE);
     glAlphaFunc(GL_GREATER, 0.004f);
     float fog_k = fog_end > fog_start ? 1 / (fog_end - fog_start) : 0;
+#ifdef RAMPAGE_XBOX
+    GLuint qb_id = ~0u;
+    int qb_depth = -1, qb_add = -1, qb_flat = -1;
+    qb_begin();
+#endif
     for (int i = 0; i < nfx; i++) {
         const FxQuad *q = &fx[i];
         GLuint id = q->b ? texture_at(r, q->b, q->tex, 1) : 0;
+#ifdef RAMPAGE_XBOX
+        {                                                  /* the state as below, set only when it changes */
+            int depth = q->ztest || world, add = q->additive != 0, flat = q->kind == FXQ_FLAT;
+            if (id != qb_id || depth != qb_depth || add != qb_add || flat != qb_flat) {
+                qb_flush();
+                if (id != qb_id) {
+                    if (id) {
+                        glEnable(GL_TEXTURE_2D);
+                        glBindTexture(GL_TEXTURE_2D, id);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                    } else
+                        glDisable(GL_TEXTURE_2D);
+                }
+                if (depth != qb_depth) { if (depth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST); }
+                if (add != qb_add) glBlendFunc(GL_SRC_ALPHA, add ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA);
+                if (flat != qb_flat) {
+                    if (flat) { glEnable(GL_POLYGON_OFFSET_FILL); glPolygonOffset(-1, -4); }
+                    else glDisable(GL_POLYGON_OFFSET_FILL);
+                }
+                qb_id = id; qb_depth = depth; qb_add = add; qb_flat = flat;
+            }
+        }
+#else
         if (id) {
             glEnable(GL_TEXTURE_2D);
             glBindTexture(GL_TEXTURE_2D, id);
+            XS_TEXTURE_BOUND();
             /* [R] a particle's shader (the emitter's material, 0x1F8870: 0x57 or 0x55) clamps: its descriptor's
              * first pass repeat byte (+0x8D) is 0, its record's wrap 0x10 (0x265840 -> 0x26AA20: CLAMP_1 CLAMP) */
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -1616,6 +2949,7 @@ static void draw_fx(Renderer *r, const FxQuad *fx, int nfx, const Camera *cam, f
         }
         if (q->ztest || world) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
         glBlendFunc(GL_SRC_ALPHA, q->additive ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA);
+#endif
         float c[4][3];                                     /* top-left, top-right, bottom-right, bottom-left */
         if (q->kind == FXQ_BILLBOARD) {
             float cs = cosf(q->rot), sn = sinf(q->rot), rr[3], uu[3];
@@ -1667,11 +3001,13 @@ static void draw_fx(Renderer *r, const FxQuad *fx, int nfx, const Camera *cam, f
          * test GEQUAL, Z written); the rest shader 2 / 0xC, Z written too], so a quad in its plane is cut by it on the
          * PS2 as here, where its depth rounds behind; the offset stands for GEQUAL's equal depth passing [G: how two
          * coplanar draws round on the GS is the hardware's] */
+#ifndef RAMPAGE_XBOX
         if (q->kind == FXQ_FLAT) {
             glEnable(GL_POLYGON_OFFSET_FILL);
             glPolygonOffset(-1, -4);
         } else
             glDisable(GL_POLYGON_OFFSET_FILL);
+#endif
         float a[4];                                        /* the alpha x the fog factor at each corner */
         for (int k = 0; k < 4; k++) {
             float f = 1;
@@ -1697,6 +3033,11 @@ static void draw_fx(Renderer *r, const FxQuad *fx, int nfx, const Camera *cam, f
             }
         }
         static const int UV[4][2] = { { 0, 1 }, { 2, 1 }, { 2, 3 }, { 0, 3 } };
+#ifdef RAMPAGE_XBOX
+        for (int k = 0; k < 4; k++)
+            qb_vertex(k, c[k][0], c[k][1], c[k][2], q->uv[UV[k][0]], q->uv[UV[k][1]], q->col, a[k]);
+        qb_next();
+#else
         glBegin(GL_QUADS);
         for (int k = 0; k < 4; k++) {
             glColor4f(q->col[0], q->col[1], q->col[2], a[k]);
@@ -1704,7 +3045,12 @@ static void draw_fx(Renderer *r, const FxQuad *fx, int nfx, const Camera *cam, f
             glVertex3fv(c[k]);
         }
         glEnd();
+#endif
     }
+#ifdef RAMPAGE_XBOX
+    qb_end();
+    XS_TEXTURE_BOUND();
+#endif
     glDisable(GL_POLYGON_OFFSET_FILL);
     if (fogged)
         glEnable(GL_FOG);
@@ -1716,6 +3062,10 @@ static void draw_fx(Renderer *r, const FxQuad *fx, int nfx, const Camera *cam, f
 
 void rnd_frame(Renderer *r, const Window *w, const Camera *cam, double t, int fog)
 {
+    XS_END();
+#ifdef RAMPAGE_XBOX
+    r->xframe++;
+#endif
     pump_output(r);
     const Scene *s = r->scene;
     r->drawn = 0;
@@ -1723,7 +3073,11 @@ void rnd_frame(Renderer *r, const Window *w, const Camera *cam, double t, int fo
         drop_textures(r);
         r->tex_gen = g_tex_gen;
     }
+#ifdef RAMPAGE_XBOX
+    glViewport(0, 0, xbox_pixel_width(), xbox_pixel_height());   /* (a 16:9 screen: the window is 853 wide, the pixels 640) */
+#else
     glViewport(0, 0, w->width, w->height);
+#endif
     float sky[3] = { 0.47f, 0.6f, 0.89f };
     if (s && s->fog_end > 0)
         memcpy(sky, s->fog_colour, sizeof sky);
@@ -1806,6 +3160,7 @@ void rnd_frame(Renderer *r, const Window *w, const Camera *cam, double t, int fo
             draw_mesh(r, &s->meshes[it->mesh], it->skin, t);
             glPopMatrix();
         }
+        XS_END();
         glEnable(GL_DEPTH_TEST);
         glDepthMask(GL_TRUE);
         if (fogged)
@@ -1816,11 +3171,43 @@ void rnd_frame(Renderer *r, const Window *w, const Camera *cam, double t, int fo
     for (int pass = 0; pass < 2; pass++) {               /* the street, its building shadows, then the rest */
         r->hold = pass && gtao_active();                 /* port extra: the blended parts after the occlusion (the
                                                           * street's lie on it, darkened as it is) */
+#ifdef RAMPAGE_XBOX
+        if (g_xbox_item_seen_n != s->nitems) {           /* (a new set of items: all taken as seen) */
+            uint8_t *seen = realloc(g_xbox_item_seen, s->nitems ? s->nitems : 1);
+            if (seen) {
+                memset(seen, 1, s->nitems ? s->nitems : 1);
+                g_xbox_item_seen = seen;
+                g_xbox_item_seen_n = s->nitems;
+            } else
+                g_xbox_item_seen_n = 0;
+        }
+        if (pass) {                                      /* the pass's culling first: the batches send what is in sight */
+            for (uint32_t i = 0; i < g_xbox_item_seen_n; i++) {
+                const DrawItem *it = &s->items[i];
+                const Instance *in = &s->instances[it->instance];
+                if (!in->hidden && it->instance != s->sky && it->instance != s->ground_inst)
+                    g_xbox_item_seen[i] = (uint8_t)item_seen(r, it, view_mv, tx, ty);
+            }
+            memcpy(r->bat_amb, amb, sizeof r->bat_amb);
+            r->bat_own = 0;
+            bat_frame(r, t);
+        }
+#endif
         for (uint32_t i = 0; i < s->nitems; i++) {
             const DrawItem *it = &s->items[i];
             const Instance *in = &s->instances[it->instance];
-            if (in->hidden || it->instance == s->sky || (it->instance == s->ground_inst) != !pass ||
-                !item_seen(r, it, view_mv, tx, ty))
+            if (in->hidden || it->instance == s->sky || (it->instance == s->ground_inst) != !pass)
+                continue;
+#ifdef RAMPAGE_XBOX
+            int seen = pass && i < g_xbox_item_seen_n ? g_xbox_item_seen[i] : item_seen(r, it, view_mv, tx, ty);
+            if (i < g_xbox_item_seen_n)
+                g_xbox_item_seen[i] = (uint8_t)seen;     /* (scene_update: a skin out of sight is not posed) */
+            r->bat_keys = pass && i < r->nbitem && r->bitem[i].active ? r->bitem[i].key : NULL;
+            r->cur_inst = in;
+#else
+            int seen = item_seen(r, it, view_mv, tx, ty);
+#endif
+            if (!seen)
                 continue;
             int own = in->own_ambient && s->nlights;   /* an adornment's ambient (0x2CD060), the scene's after it */
             if (own)
@@ -1832,6 +3219,12 @@ void rnd_frame(Renderer *r, const Window *w, const Camera *cam, double t, int fo
             if (own)
                 glLightModelfv(GL_LIGHT_MODEL_AMBIENT, amb);
         }
+#ifdef RAMPAGE_XBOX
+        r->bat_keys = NULL;
+        r->cur_inst = NULL;
+        if (pass)
+            bat_draw_blended(r);
+#endif
         if (!pass && s->shadows)
             draw_shadows(r, SHADOW_PASS_GROUND);
     }
@@ -1856,6 +3249,7 @@ void rnd_frame(Renderer *r, const Window *w, const Camera *cam, double t, int fo
         draw_shadows(r, SHADOW_PASS_DECAL);
         draw_shadows(r, SHADOW_PASS_WALL);
     }
+    XS_END();
     glDisableClientState(GL_VERTEX_ARRAY);
     glDisableClientState(GL_NORMAL_ARRAY);
     glDisableClientState(GL_TEXTURE_COORD_ARRAY);

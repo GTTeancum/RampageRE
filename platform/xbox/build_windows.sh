@@ -43,7 +43,7 @@ if [[ $stage == deps || $stage == all ]]; then
     cp -r "$NXDK_DIR/lib/pbkit" "$L/pbkit-src/lib/pbkit"
     rm -f "$L/pbkit-src/lib/pbkit/"*.obj "$L/pbkit-src/lib/pbkit/"*.d
     git -C "$L/pbkit-src" init -q .
-    for p in startup-ready-bounds dpc-scanout-fallback reset-drain-lifecycle kick-batching; do
+    for p in startup-ready-bounds dpc-scanout-fallback reset-drain-lifecycle kick-batching room-hook; do
         apply "$L/pbkit-src" "$P/nxdk-pbkit-$p.patch"
     done
     log "build patched libpbkit.lib"
@@ -57,16 +57,18 @@ if [[ $stage == deps || $stage == all ]]; then
     nxdk-lib -out:"$L/libpbkit.lib" "${objs[@]}"
 
     checkout "$L/nxdk-gles11" https://github.com/Ryzee119/nxdk-gles11.git $GLES_COMMIT
-    for p in default-state staging-pages lighting-normal light-cache texture-telemetry exact-palette reset-drain pushbuffer-room; do
+    for p in default-state staging-pages lighting-normal light-cache texture-telemetry exact-palette reset-drain pushbuffer-room static-arrays frame-pacing deferred-restart staging-pack direct-draw; do
         apply "$L/nxdk-gles11" "$P/nxdk-gles11-$p.patch"
     done
     # nxdk-gles11 includes <pbkit/...>; point it at the patched driver headers first
     checkout "$L/gl4es" https://github.com/ptitSeb/gl4es.git $GL4ES_COMMIT
     apply "$L/gl4es" "$P/gl4es-light-enable-ownership.patch"
+    apply "$L/gl4es" "$P/gl4es-xbox-predraw.patch"
 fi
 
 if [[ $stage == game || $stage == all ]]; then
-    rm -rf "$B"
+    mkdir -p "$B"
+    find "$B" -mindepth 1 -delete   # (not the folder itself: a shell may be standing in it)
     log configure
     /usr/bin/cmake -G "Unix Makefiles" -S "$HERE" -B "$B" \
         -DCMAKE_TOOLCHAIN_FILE="$NXDK_DIR/share/toolchain-nxdk.cmake" \

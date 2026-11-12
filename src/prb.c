@@ -3,6 +3,7 @@
  * u32 record count, u32 ?, u32 0x14, then 12-byte records {u32 kind, u32 name index, u32 value}; kind & 0xFF: 0 int,
  * 1 float, 2 name, 3 group (value = offset from the containing group); (kind >> 8) & 0xFF == 2: an unnamed list element.
  * A group inherits what it lacks from ParentPropertySet = "Group:Book", which may live in another bundle. */
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include "plat.h"
@@ -13,8 +14,11 @@ static void *resolver_ctx;
 
 void prb_set_resolver(BookResolver r, void *ctx) { resolver = r; resolver_ctx = ctx; }
 
+static void group_memo_forget(void);
+
 int book_open(Book *bk, const Bundle *b)
 {
+    group_memo_forget();
     for (uint32_t i = 0; i < b->nentries; i++)
         if (b->entries[i].type == ET_BOOK) {
             bk->d = b->entries[i].data;
@@ -25,19 +29,52 @@ int book_open(Book *bk, const Bundle *b)
     return -1;
 }
 
+#ifdef RAMPAGE_XBOX
+/* book_group searches the book's groups by name, and the game asks for the same few groups every frame (a vehicle's,
+ * a person's records): on the console the comparisons were several percent of a frame. The answers are remembered
+ * by the book's data, the name and its hash; a book opened (a bundle loaded) forgets them all, so a freed book's
+ * address cannot answer for another. */
+#define GROUP_MEMO 512
+static struct { const uint8_t *d; uint32_t hash, at; char name[44]; } group_memo[GROUP_MEMO];
+static void group_memo_clear(void) { memset(group_memo, 0, sizeof group_memo); }
+#else
+#define group_memo_clear() ((void)0)
+#endif
+
+static void group_memo_forget(void) { group_memo_clear(); }
+
 Group book_group(const Book *bk, const char *name)
 {
     Group g = { bk, 0 };
     if (!bk || !bk->d)
         return g;
+#ifdef RAMPAGE_XBOX
+    uint32_t hash = 2166136261u, len = 0;
+    for (const unsigned char *c = (const unsigned char *)name; *c; c++, len++)
+        hash = (hash ^ (uint32_t)(*c >= 'A' && *c <= 'Z' ? *c + 32 : *c)) * 16777619u;
+    unsigned slot = (hash ^ (uint32_t)(uintptr_t)bk->d) & (GROUP_MEMO - 1);
+    if (len < sizeof group_memo[0].name && group_memo[slot].d == bk->d && group_memo[slot].hash == hash &&
+        _stricmp(group_memo[slot].name, name) == 0) {
+        g.at = group_memo[slot].at;
+        return g;
+    }
+#endif
     uint32_t count = rd32(bk->d + 0x1C), table = rd32(bk->d + 0x24);
     for (uint32_t i = 0; i < count; i++) {
         uint32_t at = rd32(bk->d + table + 4 * i);
         if (_stricmp(bdp_name(bk->b, rd32(bk->d + at + 4)), name) == 0) {
             g.at = at;
-            return g;
+            break;
         }
     }
+#ifdef RAMPAGE_XBOX
+    if (len < sizeof group_memo[0].name) {
+        group_memo[slot].d = bk->d;
+        group_memo[slot].hash = hash;
+        group_memo[slot].at = g.at;
+        memcpy(group_memo[slot].name, name, len + 1);
+    }
+#endif
     return g;
 }
 

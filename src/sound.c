@@ -1214,8 +1214,15 @@ void music_for_state(int state, const char *block_music)
  * SPU2 interpolates a voice with its 4-point gaussian table, a hardware matter, not in the ELF: linear here] */
 static float mixbuf[2 * 1024];
 
+#ifdef RAMPAGE_XBOX
+static int32_t xmix_acc[2 * 1024];       /* the voices' sum, 8 fraction bits (mix_block) */
+#endif
+
 static void mix_block(float *out, int frames)
 {
+#ifdef RAMPAGE_XBOX
+    int xmix_used = 0;
+#endif
     memset(out, 0, sizeof(float) * 2 * frames);
     for (int i = 0; i < MAX_INST; i++) {
         Voice *vc = &S.voice[i];
@@ -1224,12 +1231,36 @@ static void mix_block(float *out, int frames)
         const Sample *s = vc->s;
         float g = S.sfx_gain * S.inst[i].gain, al = spu_amp(vc->l) * g, ar = spu_amp(vc->r) * g;
 #ifdef RAMPAGE_XBOX
-        /* The same resampler with the position in 32.32 fixed point: on the console's x87 every
-         * (int) of the double position switched the rounding mode twice a sample, and the mixer
-         * alone was a tenth of all CPU time with a city's voices playing. */
-        if (vc->pos >= 0 && vc->step >= 0 && vc->pos < 2147483647.0 && vc->step < 65536.0) {
+        /* The same resampler in whole numbers: the position in 32.32 fixed point, the two volumes in 4.12, the sum
+         * of the voices in a 32-bit buffer (acc, 8 fraction bits) that is made floats once for all of them. With the
+         * double position and float samples every sample of every voice went through the x87 several times, and the
+         * mixer was a sixteenth of a frame with a city's voices playing. A voice at volume 0 on both sides is only
+         * moved along. */
+        if (vc->pos >= 0 && vc->step >= 0 && vc->pos < 2147483647.0 && vc->step < 65536.0 && s->n > 0) {
             uint64_t pos = (uint64_t)(vc->pos * 4294967296.0), step = (uint64_t)(vc->step * 4294967296.0);
             const int n = s->n, loop = s->loop;
+            const int16_t *pcm = s->pcm;
+            float fl = al * 4096.0f, fr = ar * 4096.0f;
+            int gl = (int)(fl > 16384 ? 16384 : fl < -16384 ? -16384 : fl);
+            int gr = (int)(fr > 16384 ? 16384 : fr < -16384 ? -16384 : fr);
+            if (!gl && !gr) {                        /* unheard: where it would be after the block */
+                pos += step * (uint64_t)frames;
+                if ((int)(pos >> 32) >= n) {
+                    if (loop < 0 || loop >= n)
+                        vc->on = 0;
+                    else {
+                        uint64_t span = (uint64_t)(n - loop) << 32, base = (uint64_t)loop << 32;
+                        pos = base + (pos - base) % span;
+                    }
+                }
+                vc->pos = (double)pos * (1.0 / 4294967296.0);
+                continue;
+            }
+            if (!xmix_used) {
+                memset(xmix_acc, 0, sizeof(int32_t) * 2 * (size_t)frames);
+                xmix_used = 1;
+            }
+            int32_t *acc = xmix_acc;
             for (int f = 0; f < frames; f++) {
                 int k = (int)(pos >> 32);
                 if (k >= n) {
@@ -1239,12 +1270,13 @@ static void mix_block(float *out, int frames)
                     }
                     pos -= (uint64_t)(n - loop) << 32;
                     k = (int)(pos >> 32);
+                    if (k >= n)                      /* (a step longer than the loop) */
+                        k = n - 1;
                 }
                 int k1 = k + 1 < n ? k + 1 : loop >= 0 ? loop : k;
-                float fr = (float)(int)((uint32_t)pos >> 8) * (1.0f / 16777216.0f);
-                float x = (float)s->pcm[k] + fr * (float)(s->pcm[k1] - s->pcm[k]);
-                out[2 * f] += x * al;
-                out[2 * f + 1] += x * ar;
+                int a0 = pcm[k], x = a0 + (((pcm[k1] - a0) * (int)(((uint32_t)pos) >> 17)) >> 15);
+                acc[2 * f] += (x * gl) >> 4;
+                acc[2 * f + 1] += (x * gr) >> 4;
                 pos += step;
             }
             vc->pos = (double)pos * (1.0 / 4294967296.0);
@@ -1268,12 +1300,38 @@ static void mix_block(float *out, int frames)
             vc->pos += vc->step;
         }
     }
+#ifdef RAMPAGE_XBOX
+    if (xmix_used)                                   /* the voices, summed in whole numbers above */
+        for (int i = 0; i < 2 * frames; i++)
+            out[i] = (float)xmix_acc[i] * (1.0f / 256.0f);
+#endif
     for (int i = 0; i < 2; i++) {
         Music *m = &S.music[i];
         if (!m->on)
             continue;
         float a = spu_amp(pack_vol(m->vol)) * S.music_gain;   /* [R] 0x26FE00: byte << 7 on its two voices */
         double step = (double)m->rate / SOUND_RATE;   /* 1: the streams are at 48 kHz [R] */
+#ifdef RAMPAGE_XBOX
+        if (m->rate == SOUND_RATE && m->phase == 0) {    /* (one sample out for one in: no phase to keep) */
+            const int16_t *l = m->pcm[0], *rr = m->pcm[m->ch - 1];
+            int f = 0, ended = 0;
+            while (f < frames && !ended) {
+                if (m->at >= m->have && !music_next_frame(m)) {
+                    music_off(m);
+                    ended = 1;
+                    break;
+                }
+                int run = m->have - m->at;
+                if (run > frames - f) run = frames - f;
+                for (int q = 0; q < run; q++, f++) {
+                    out[2 * f] += (float)l[m->at + q] * a;
+                    out[2 * f + 1] += (float)rr[m->at + q] * a;
+                }
+                m->at += run;
+            }
+            continue;
+        }
+#endif
         for (int f = 0; f < frames; f++) {
             if (m->at >= m->have && !music_next_frame(m)) {
                 music_off(m);

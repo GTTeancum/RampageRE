@@ -21,6 +21,9 @@ if(NOT DEFINED NXDK_GLES11_DIR OR NOT EXISTS "${NXDK_GLES11_DIR}/CMakeLists.txt"
   message(FATAL_ERROR "Set NXDK_GLES11_DIR to an nxdk-gles11 checkout")
 endif()
 set(ROOT "${CMAKE_CURRENT_LIST_DIR}/../..")
+# nxdk compiles with -fno-builtin: every small memcpy and every sqrtf is then a library call. The header names the
+# compiler builtins again, for the game and for gl4es and nxdk-gles11 below (src/xbox_builtins.h).
+add_compile_options(-include "${ROOT}/src/xbox_builtins.h" -fno-math-errno)
 set(NXDK_GLES11_WITH_GL4ES ON CACHE BOOL "" FORCE)
 add_subdirectory("${NXDK_GLES11_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/nxdk-gles11")
 # gl4es shim atof must not reach nxdk's assertion-only strtod.

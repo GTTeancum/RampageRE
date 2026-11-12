@@ -1,0 +1,456 @@
+diff --git a/gles_private.h b/gles_private.h
+index d59e685..1a3f6cf 100644
+--- a/gles_private.h
++++ b/gles_private.h
+@@ -529,6 +529,12 @@ void gliPushbufferReserve(size_t bytes);
+ GLboolean gliStaticArrayAdd(const void *src, size_t bytes, const void *owner);
+ void gliStaticArrayRemove(const void *src, const void *owner);
+ void *gliStaticArrayAlloc(size_t bytes, const void *owner);
++const void *gliStaticArrayAddress(const void *src);
++void gliDirectDraw(const float *pos, const float *nrm, const float *uv, const float *col, const uint16_t *idx,
++                   GLsizei count);
++int gliSkinMaxBones(void);
++void gliSkinDraw(const float *pos, const float *nrm, const float *uv, const float *col, const float *bone,
++                 const float *weight, const uint16_t *idx, GLsizei count, const float (*palette)[12], int nbones);
+ void gliStaticArraysClear(void);
+ void gliStaticArraysHint(GLboolean on);
+ void gliStaticArraysCollect(void);
+diff --git a/gles_staging.c b/gles_staging.c
+index cb7eb6d..b5b0054 100644
+--- a/gles_staging.c
++++ b/gles_staging.c
+@@ -66,6 +66,11 @@ static uint32_t st_live, st_tombs;
+ static uint8_t *st_pending[ST_PENDING];
+ static int st_npending;
+ static GLboolean st_hint, st_used_this_draw;
++/* the arrays made by gliStaticArrayAlloc: a pointer into one of them (a part of a posed mesh, drawn from
++ * its first vertex) is in GPU memory as it stands */
++#define ST_RANGES 512
++static struct { const uint8_t *base; uint32_t bytes; } st_ranges[ST_RANGES];
++static int st_nranges;
+ #define ST_TOMB ((const void *)(uintptr_t)1)
+ /* live bytes, live arrays, arrays served, arrays staged under the hint, chunks, refused adds */
+ volatile uint32_t gli_static_stats[6];
+@@ -238,16 +243,33 @@ void *gliStaticArrayAlloc(size_t bytes, const void *owner)
+     while (st_table[k].src && st_table[k].src != ST_TOMB) k = (k + 1u) & (ST_SLOTS - 1u);
+     if (st_table[k].src == ST_TOMB) st_tombs--;
+     st_table[k].src = dst; st_table[k].dst = dst; st_table[k].bytes = (uint32_t)bytes; st_table[k].owner = owner;
++    if (st_nranges < ST_RANGES) {
++        st_ranges[st_nranges].base = dst;
++        st_ranges[st_nranges].bytes = (uint32_t)bytes;
++        st_nranges++;
++    }
+     st_live++;
+     gli_static_stats[1] = st_live;
+     gli_static_stats[0] += (uint32_t)bytes;
+     return dst;
+ }
+ 
++/* where a registered array is in GPU memory (for gliDirectDraw); NULL: not registered */
++const void *gliStaticArrayAddress(const void *src)
++{
++    st_entry_t *e = st_find(src);
++    return e ? e->dst : NULL;
++}
++
+ void gliStaticArrayRemove(const void *src, const void *owner)
+ {
+     st_entry_t *e = st_find(src);
+     if (!e || e->owner != owner) return;     /* the address has since been registered by someone else */
++    for (int q = 0; q < st_nranges; q++)
++        if (st_ranges[q].base == (const uint8_t *)src) {
++            st_ranges[q] = st_ranges[--st_nranges];
++            break;
++        }
+     gli_static_stats[0] -= e->bytes;
+     st_release(e->dst);
+     e->src = ST_TOMB; e->dst = NULL; e->bytes = 0; e->owner = NULL;
+@@ -268,6 +290,7 @@ void gliStaticArraysClear(void)
+     free(st_table);
+     st_table = NULL;
+     st_live = st_tombs = 0;
++    st_nranges = 0;
+     gli_static_stats[0] = gli_static_stats[1] = gli_static_stats[4] = 0;
+ }
+ 
+@@ -276,11 +299,23 @@ void gliStaticArraysHint(GLboolean on)
+     st_hint = on;
+ }
+ 
++/* inside an array made by gliStaticArrayAlloc: the address itself */
++static uint8_t *st_in_range(const void *src, size_t bytes)
++{
++    const uint8_t *p = (const uint8_t *)src;
++    for (int q = 0; q < st_nranges; q++)
++        if (p >= st_ranges[q].base && p + bytes <= st_ranges[q].base + st_ranges[q].bytes)
++            return (uint8_t *)(uintptr_t)p;
++    return NULL;
++}
++
+ static uint8_t *st_lookup(const void *src, size_t bytes)
+ {
+     if (!st_hint) return NULL;
+     st_entry_t *e = st_find(src);
+     if (e && bytes <= e->bytes) { gli_static_stats[2]++; st_used_this_draw = GL_TRUE; return e->dst; }
++    uint8_t *in = e ? NULL : st_in_range(src, bytes);
++    if (in) { gli_static_stats[2]++; st_used_this_draw = GL_TRUE; return in; }
+     gli_static_stats[3]++;
+     return NULL;
+ }
+@@ -292,7 +327,7 @@ GLboolean gliClientArraysAllStatic(void)
+     gli_context_t *context = gliGetContext();
+     vertex_array_data_t *v = &context->vertex_array_data;
+ #define ST_CHECK(enabled, binding, ptr) \
+-    if ((enabled) && (binding) == 0 && (ptr) != NULL && !st_find(ptr)) return GL_FALSE
++    if ((enabled) && (binding) == 0 && (ptr) != NULL && !st_find(ptr) && !st_in_range((ptr), 1)) return GL_FALSE
+     ST_CHECK(v->vertex_array_enabled, v->vertex_array_buffer_binding, v->vertex_array_ptr);
+     ST_CHECK(v->normal_array_enabled, v->normal_array_buffer_binding, v->normal_array_ptr);
+     ST_CHECK(v->color_array_enabled, v->color_array_buffer_binding, v->color_array_ptr);
+diff --git a/gles_xbox_direct.c b/gles_xbox_direct.c
+new file mode 100644
+index 0000000..a3114a6
+--- /dev/null
++++ b/gles_xbox_direct.c
+@@ -0,0 +1,342 @@
++/* gles_xbox_direct.c - draws that go straight to the NV2A.
++ *
++ * glDrawElements reaches the GPU through gl4es (its vertex attribute bookkeeping, its texture
++ * coordinate fix-ups) and the client arrays of this library (staging, the static-array lookups, a
++ * MmGetPhysicalAddress for every attribute): some tens of microseconds for every draw whatever
++ * its size, and a city frame is several hundred draws. An application whose arrays are already
++ * in GPU memory (gliStaticArrayAlloc, gliStaticArrayAddress) draws them from here instead: the
++ * GL state is flushed as for any draw, the arrays are named to the NV2A by their addresses, the
++ * indices follow. The client-array state of the library is not touched, only marked to be sent
++ * again by the next ordinary draw; gl4es is not involved (the application asks it first whether
++ * it has pending texture work: gl4es_xbox_predraw).
++ *
++ * gliSkinDraw does the same for a skinned mesh, with a vertex program that poses it (shaders/
++ * skin.vs.cg in the tree of the application): the matrices of the bones are sent as constants and
++ * the GPU blends them, where the application posed every vertex on the CPU and sent the result. */
++#include "gles_private.h"
++
++static inline uint32_t *direct_attrib(uint32_t *p, unsigned int index, unsigned int size, unsigned int stride,
++                                      const void *gpu)
++{
++    p = xgu_set_vertex_data_array_format(p, index, XGU_FLOAT, size, stride);
++    /* contiguous memory maps at 0x80000000 | physical: no kernel call to find it */
++    p = xgu_set_vertex_data_array_offset(p, index, (const void *)((uintptr_t)gpu & 0x03FFFFFFu));
++    return p;
++}
++
++static inline uint32_t *direct_attrib_off(uint32_t *p, unsigned int index)
++{
++    p = xgu_set_vertex_data_array_format(p, index, XGU_FLOAT, 0, 0);
++    p = xgu_set_vertex_data_array_offset(p, index, NULL);
++    return p;
++}
++
++/* the GL state but for the client arrays (gliFlushStateChange without gliArrayFlush) */
++static void direct_flush_state(void)
++{
++    gliFBOFlush();
++    gliTransformFlush();
++    gliTextureFlush();
++    gliPointParamsFlush();
++    gliLightingFlush();
++    gliFogFlush();
++}
++
++/* the next ordinary draw sends its client arrays again: the NV2A no longer has them */
++static void direct_arrays_dirty(vertex_array_data_t *vad)
++{
++    vad->vertex_array_dirty = GL_TRUE;
++    vad->color_array_dirty = GL_TRUE;
++    vad->normal_array_dirty = GL_TRUE;
++    vad->point_size_array_dirty = GL_TRUE;
++    vad->fog_coord_array_dirty = GL_TRUE;
++    for (GLuint i = 0; i < GLI_MAX_TEXTURE_UNITS; i++)
++        vad->texcoord_array_dirty[i] = GL_TRUE;
++}
++
++/* the arrays every direct draw has or has not: positions, normals (else the current normal), colours
++ * (else the current colour), texture coordinates of unit 0; the other arrays off */
++static uint32_t *direct_common_arrays(uint32_t *pb, gli_context_t *c, const float *pos, const float *nrm,
++                                      const float *uv, const float *col)
++{
++    vertex_array_data_t *vad = &c->vertex_array_data;
++    current_values_t *cv = &c->current_values;
++    pb = direct_attrib(pb, XGU_VERTEX_ARRAY, 3, 3 * sizeof(float), pos);
++    if (nrm)
++        pb = direct_attrib(pb, XGU_NORMAL_ARRAY, 3, 3 * sizeof(float), nrm);
++    else {
++        pb = direct_attrib_off(pb, XGU_NORMAL_ARRAY);
++        pb = xgu_set_vertex_data4f(pb, XGU_NORMAL_ARRAY, cv->current_normal[0], cv->current_normal[1],
++                                   cv->current_normal[2], 0.0f);
++    }
++    if (col)
++        pb = direct_attrib(pb, XGU_COLOR_ARRAY, 4, 4 * sizeof(float), col);
++    else {
++        pb = direct_attrib_off(pb, XGU_COLOR_ARRAY);
++        pb = xgu_set_vertex_data4f(pb, XGU_COLOR_ARRAY, cv->current_color[0], cv->current_color[1],
++                                   cv->current_color[2], cv->current_color[3]);
++    }
++    if (uv)
++        pb = direct_attrib(pb, XGU_TEXCOORD0_ARRAY, 2, 2 * sizeof(float), uv);
++    else
++        pb = direct_attrib_off(pb, XGU_TEXCOORD0_ARRAY);
++    for (GLuint i = 1; i < GLI_MAX_TEXTURE_UNITS && i < 4; i++)
++        if (vad->texcoord_array_enabled[i])
++            pb = direct_attrib_off(pb, XGU_TEXCOORD0_ARRAY + i);
++    if (vad->point_size_array_enabled)
++        pb = direct_attrib_off(pb, XGU_POINT_SIZE_ARRAY);
++    if (vad->fog_coord_array_enabled)
++        pb = direct_attrib_off(pb, XGU_FOG_ARRAY);
++    return pb;
++}
++
++/* Triangles from arrays that are in GPU memory (addresses as gliStaticArrayAlloc or gliStaticArrayAddress gave
++ * them, or inside such an array): 3 floats a position, 3 a normal, 2 a texture coordinate, 4 a colour; nrm, uv
++ * and col may be NULL. The GL state is what it is, as for glDrawElements. */
++void gliDirectDraw(const float *pos, const float *nrm, const float *uv, const float *col, const uint16_t *idx,
++                   GLsizei count)
++{
++    gli_context_t *c = gliGetContext();
++    if (count <= 0 || !pos || !idx)
++        return;
++    gliPushbufferReserve((size_t)count * 2u + 4096u);
++    direct_flush_state();
++    uint32_t *pb = pb_begin();
++    pb = direct_common_arrays(pb, c, pos, nrm, uv, col);
++    pb = pb_push1(pb, NV097_BREAK_VERTEX_BUFFER_CACHE, 0);
++    pb_end(pb);
++    xgux_draw_elements16(XGU_TRIANGLES, idx, (unsigned int)count);
++    direct_arrays_dirty(&c->vertex_array_data);
++}
++
++/* ---- the skinning program ---- */
++#define SKIN_CONSTANT_BASE 96u      /* c[0]: the user constants, above the fixed-function state */
++#define SKIN_C_SCREEN 0u
++#define SKIN_C_BONES 4u
++#define SKIN_C_EYE 82u
++#define SKIN_C_AMBIENT 85u
++#define SKIN_C_LDIR 86u
++#define SKIN_C_LCOL 89u
++#define SKIN_C_TSCALE 92u
++#define SKIN_C_LITERAL 93u          /* 0 1 3 (the "#const c[93]" of cgc) */
++#define SKIN_C_COUNT 94u
++#define SKIN_MAX_BONES 26
++
++static const XguTransformProgramInstruction skin_program[] = {
++    { { 0x00000000, 0x0a00141b, 0x08361100, 0x201407f8 } },
++    { { 0x00000000, 0x00601455, 0x08361554, 0x580007f8 } },
++    { { 0x00000000, 0x0057a01b, 0x0554186c, 0x282007f8 } },
++    { { 0x00000000, 0x01a00000, 0x2436106c, 0x207007f8 } },
++    { { 0x00000000, 0x0a00141b, 0x08361000, 0x200407f8 } },
++    { { 0x00000000, 0x00601400, 0x0836146c, 0x140007f8 } },
++    { { 0x00000000, 0x0057a055, 0x0554186c, 0x283007f8 } },
++    { { 0x00000000, 0x00acc41b, 0x0c36106c, 0x220007fa } },
++    { { 0x00000000, 0x00ac841b, 0x0c36106c, 0x280007fa } },
++    { { 0x00000000, 0x00aca41b, 0x0c36106c, 0x240007fa } },
++    { { 0x00000000, 0x01a00000, 0x3436106c, 0x207007f8 } },
++    { { 0x00000000, 0x00401655, 0x0836086c, 0x2e0007f8 } },
++    { { 0x00000000, 0x00acc41b, 0x0c36106c, 0x221007fa } },
++    { { 0x00000000, 0x00aca41b, 0x0c36106c, 0x241007fa } },
++    { { 0x00000000, 0x00ac841b, 0x0c36106c, 0x281007fa } },
++    { { 0x00000000, 0x00801600, 0x0836286c, 0x1e1007f8 } },
++    { { 0x00000000, 0x0a00141b, 0x08361200, 0x202407f8 } },
++    { { 0x00000000, 0x006014aa, 0x08361554, 0x980007f8 } },
++    { { 0x00000000, 0x0057a000, 0x0554186c, 0x212007f8 } },
++    { { 0x00000000, 0x01a000c0, 0x2436106c, 0x207007f8 } },
++    { { 0x00000000, 0x0a00141b, 0x08361300, 0x200407f8 } },
++    { { 0x00000000, 0x006014ff, 0x0836146c, 0x140007f8 } },
++    { { 0x00000000, 0x0057a055, 0x0554186c, 0x211007f8 } },
++    { { 0x00000000, 0x00acc41b, 0x0c36106c, 0x220007fa } },
++    { { 0x00000000, 0x00aca41b, 0x0c36106c, 0x240007fa } },
++    { { 0x00000000, 0x00ac841b, 0x0c36106c, 0x280007fa } },
++    { { 0x00000000, 0x008016aa, 0x0836086c, 0x5e0007f8 } },
++    { { 0x00000000, 0x01a000c0, 0x1436106c, 0x207007f8 } },
++    { { 0x00000000, 0x00acc41b, 0x0c36106c, 0x221007fa } },
++    { { 0x00000000, 0x00aca41b, 0x0c36106c, 0x241007fa } },
++    { { 0x00000000, 0x00ac841b, 0x0c36106c, 0x281007fa } },
++    { { 0x00000000, 0x008016ff, 0x0836286c, 0x1e1007f8 } },
++    { { 0x00000000, 0x01a00000, 0x2436106c, 0x207007f8 } },
++    { { 0x00000000, 0x00b6401b, 0x1436186c, 0x280007f8 } },
++    { { 0x00000000, 0x00b6801b, 0x1436186c, 0x220007f8 } },
++    { { 0x00000000, 0x00b6601b, 0x1436186c, 0x240007f8 } },
++    { { 0x00000000, 0x00a0001b, 0x0436086c, 0x210007f8 } },
++    { { 0x00000000, 0x0800001b, 0x08361300, 0x100107f8 } },
++    { { 0x00000000, 0x004000ff, 0x0436086c, 0x2e0007f8 } },
++    { { 0x00000000, 0x00b6c01b, 0x0436186c, 0x210007f8 } },
++    { { 0x00000000, 0x0157a0ff, 0x0436186c, 0x281007f8 } },
++    { { 0x00000000, 0x00b7001b, 0x0436186c, 0x210007f8 } },
++    { { 0x00000000, 0x00572000, 0x1436186c, 0x2e1007f8 } },
++    { { 0x00000000, 0x00b6e01b, 0x0436186c, 0x242007f8 } },
++    { { 0x00000000, 0x0076a01b, 0x1436106c, 0x3e0007f8 } },
++    { { 0x00000000, 0x0157a055, 0x2436186c, 0x281007f8 } },
++    { { 0x00000000, 0x00974000, 0x1436186c, 0x1e0007f8 } },
++    { { 0x00000000, 0x0157a01b, 0x0400186c, 0x210007f8 } },
++    { { 0x00000000, 0x009760ff, 0x0436186c, 0x1e0007f8 } },
++    { { 0x00000000, 0x0040061b, 0x0836086c, 0x2e0007f8 } },
++    { { 0x00000000, 0x0137a01b, 0x04aa186c, 0x2e0007f8 } },
++    { { 0x00000000, 0x0157a01b, 0x0400186c, 0x2e0007f8 } },
++    { { 0x00000000, 0x0060071b, 0x0836106c, 0x1e1007f8 } },
++    { { 0x00000000, 0x0037a055, 0x0c36106c, 0x210007f8 } },
++    { { 0x00000000, 0x0020001b, 0x0836106c, 0x2e0007f8 } },
++    { { 0x00000000, 0x00ecc01b, 0x0436186c, 0x222007fa } },
++    { { 0x00000000, 0x00ec801b, 0x0436186c, 0x282007fa } },
++    { { 0x00000000, 0x00eca01b, 0x0436186c, 0x242007fa } },
++    { { 0x00000000, 0x01a00000, 0x3436106c, 0x207007f8 } },
++    { { 0x00000000, 0x00ecc01b, 0x0436186c, 0x223007fa } },
++    { { 0x00000000, 0x00eca01b, 0x0436186c, 0x243007fa } },
++    { { 0x00000000, 0x00ec801b, 0x0436186c, 0x283007fa } },
++    { { 0x00000000, 0x00401655, 0x0836486c, 0x2e2007f8 } },
++    { { 0x00000000, 0x01a000c0, 0x2436106c, 0x207007f8 } },
++    { { 0x00000000, 0x00801600, 0x0836686c, 0x9e2007f8 } },
++    { { 0x00000000, 0x00ecc01b, 0x0436186c, 0x223007fa } },
++    { { 0x00000000, 0x00eca01b, 0x0436186c, 0x243007fa } },
++    { { 0x00000000, 0x00ec801b, 0x0436186c, 0x283007fa } },
++    { { 0x00000000, 0x008016aa, 0x0836686c, 0x9e2007f8 } },
++    { { 0x00000000, 0x01a000c0, 0x1436106c, 0x207007f8 } },
++    { { 0x00000000, 0x00ecc01b, 0x0c36086c, 0x223007fa } },
++    { { 0x00000000, 0x00eca01b, 0x0436186c, 0x243007fa } },
++    { { 0x00000000, 0x00ec801b, 0x0436186c, 0x283007fa } },
++    { { 0x00000000, 0x008016ff, 0x0836686c, 0x9e0007f8 } },
++    { { 0x00000000, 0x0037a055, 0x0c36106c, 0x210007f8 } },
++    { { 0x00000000, 0x00ec601b, 0x0436186c, 0x212007f8 } },
++    { { 0x00000000, 0x00ec401b, 0x0436186c, 0x222007f8 } },
++    { { 0x00000000, 0x00ec201b, 0x0436186c, 0x242007f8 } },
++    { { 0x00000000, 0x0400001b, 0x08361300, 0x901107f8 } },
++    { { 0x00000000, 0x00ec001b, 0x0436186c, 0x282007f8 } },
++    { { 0x00000000, 0x0040001b, 0x25fe286c, 0x2070e800 } },
++    { { 0x00000000, 0x0096a61b, 0x15fe186c, 0x2070e818 } },
++    { { 0x00000000, 0x0020001b, 0x2436106c, 0x20701800 } },
++    { { 0x00000000, 0x002000ff, 0x2436106c, 0x20708828 } },
++    { { 0x00000000, 0x0057921b, 0x0836186c, 0x2070c848 } },
++    { { 0x00000000, 0x0037a011, 0x0c36106c, 0x20703848 } },
++    { { 0x00000000, 0x0020061b, 0x0836106c, 0x20701819 } },
++};
++static GLboolean skin_program_loaded;
++
++static uint32_t *skin_constants(uint32_t *pb, unsigned int at, const XguVec4 *v, unsigned int count)
++{
++    pb = xgu_set_transform_constant_load(pb, SKIN_CONSTANT_BASE + at);
++    while (count) {
++        unsigned int n = count < 8 ? count : 8;
++        pb = xgu_set_transform_constant(pb, v, n);
++        v += n;
++        count -= n;
++    }
++    return pb;
++}
++
++int gliSkinMaxBones(void)
++{
++    return SKIN_MAX_BONES;
++}
++
++/* A skinned mesh from arrays in GPU memory: pos, nrm, uv, col as for gliDirectDraw (nrm is needed); bone: 4
++ * floats a vertex, the indices of its bones in `palette`; weight: 4 floats, their weights (0: none). palette:
++ * nbones (at most gliSkinMaxBones) matrices, each its 3 rows of 4 (model space: where the bone takes a vertex
++ * of the bind pose). The modelview and projection, the lights (ambient and the first three directional ones,
++ * with the vertex colour of GL_COLOR_MATERIAL as the material), the fog and the bound texture are those of
++ * the GL. */
++void gliSkinDraw(const float *pos, const float *nrm, const float *uv, const float *col, const float *bone,
++                 const float *weight, const uint16_t *idx, GLsizei count, const float (*palette)[12], int nbones)
++{
++    gli_context_t *c = gliGetContext();
++    transformation_state_t *ts = &c->transformation_state;
++    lighting_state_t *ls = &c->lighting_state;
++    if (count <= 0 || !pos || !nrm || !bone || !weight || !idx || nbones <= 0 || nbones > SKIN_MAX_BONES)
++        return;
++    gliPushbufferReserve((size_t)count * 2u + 8192u);
++    direct_flush_state();           /* (the transform flush has made ts->vp_matrix current) */
++
++    static XguVec4 k[SKIN_C_COUNT];
++    mat4 *mv = &ts->modelview_matrix_stack[ts->modelview_matrix_stack_depth - 1];
++    mat4 screen;
++    glm_mat4_mul(ts->vp_matrix, *mv, screen);
++    for (int r = 0; r < 4; r++)     /* cglm is column-major: row r is [column][r] */
++        for (int q = 0; q < 4; q++)
++            k[SKIN_C_SCREEN + r].f[q] = screen[q][r];
++    for (int r = 0; r < 3; r++)
++        for (int q = 0; q < 4; q++)
++            k[SKIN_C_EYE + r].f[q] = (*mv)[q][r];
++    for (int b = 0; b < nbones; b++)
++        for (int r = 0; r < 3; r++)
++            for (int q = 0; q < 4; q++)
++                k[SKIN_C_BONES + 3 * b + r].f[q] = palette[b][4 * r + q];
++    int lit = ls->lighting_enabled != 0;
++    k[SKIN_C_AMBIENT].f[0] = lit ? ls->light_model_ambient[0] : 0.0f;
++    k[SKIN_C_AMBIENT].f[1] = lit ? ls->light_model_ambient[1] : 0.0f;
++    k[SKIN_C_AMBIENT].f[2] = lit ? ls->light_model_ambient[2] : 0.0f;
++    k[SKIN_C_AMBIENT].f[3] = lit ? 1.0f : 0.0f;
++    int nl = 0;
++    for (int i = 0; i < GLI_MAX_LIGHTS && nl < 3; i++) {
++        const light_t *l = &ls->lights[i];
++        if (!lit || !l->enabled || l->position[3] != 0.0f)
++            continue;               /* (the lights of the game are directional) */
++        float x = l->position[0], y = l->position[1], z = l->position[2], len = sqrtf(x * x + y * y + z * z);
++        if (len <= 0.0f)
++            continue;
++        k[SKIN_C_LDIR + nl].f[0] = x / len;
++        k[SKIN_C_LDIR + nl].f[1] = y / len;
++        k[SKIN_C_LDIR + nl].f[2] = z / len;
++        k[SKIN_C_LDIR + nl].f[3] = 0.0f;
++        k[SKIN_C_LCOL + nl].f[0] = l->diffuse[0];
++        k[SKIN_C_LCOL + nl].f[1] = l->diffuse[1];
++        k[SKIN_C_LCOL + nl].f[2] = l->diffuse[2];
++        k[SKIN_C_LCOL + nl].f[3] = 0.0f;
++        nl++;
++    }
++    for (; nl < 3; nl++) {
++        k[SKIN_C_LDIR + nl].f[0] = k[SKIN_C_LDIR + nl].f[1] = k[SKIN_C_LDIR + nl].f[3] = 0.0f;
++        k[SKIN_C_LDIR + nl].f[2] = 1.0f;
++        k[SKIN_C_LCOL + nl].f[0] = k[SKIN_C_LCOL + nl].f[1] = k[SKIN_C_LCOL + nl].f[2] = k[SKIN_C_LCOL + nl].f[3] = 0.0f;
++    }
++    float us = 1.0f, vs = 1.0f;     /* (the fixed-function texture matrix scales to what the texture wants) */
++    texture_unit_t *tu = &c->texture_environment.texture_units[0];
++    if (tu->bound_texture_object && tu->bound_texture_object->texture_2d) {
++        const xgu_texture_t *xt = (const xgu_texture_t *)tu->bound_texture_object->texture_2d;
++        us = xt->u_scale;
++        vs = xt->v_scale;
++    }
++    k[SKIN_C_TSCALE].f[0] = us;
++    k[SKIN_C_TSCALE].f[1] = vs;
++    k[SKIN_C_TSCALE].f[2] = 0.0f;
++    k[SKIN_C_TSCALE].f[3] = 0.0f;
++    k[SKIN_C_LITERAL].f[0] = 0.0f;
++    k[SKIN_C_LITERAL].f[1] = 1.0f;
++    k[SKIN_C_LITERAL].f[2] = 3.0f;
++    k[SKIN_C_LITERAL].f[3] = 0.0f;
++
++    uint32_t *pb;
++    if (!skin_program_loaded) {
++        const unsigned int n = sizeof skin_program / sizeof skin_program[0];
++        pb = pb_begin();
++        pb = xgu_set_transform_program_load(pb, 0);
++        pb_end(pb);
++        for (unsigned int i = 0; i < n; i += 8) {
++            pb = pb_begin();
++            pb = xgu_set_transform_program(pb, &skin_program[i], n - i < 8 ? n - i : 8);
++            pb_end(pb);
++        }
++        skin_program_loaded = GL_TRUE;
++    }
++    pb = pb_begin();
++    pb = skin_constants(pb, SKIN_C_SCREEN, &k[SKIN_C_SCREEN], 4);
++    pb = skin_constants(pb, SKIN_C_BONES, &k[SKIN_C_BONES], 3u * (unsigned int)nbones);
++    pb_end(pb);
++    pb = pb_begin();
++    pb = skin_constants(pb, SKIN_C_EYE, &k[SKIN_C_EYE], SKIN_C_COUNT - SKIN_C_EYE);
++    pb = xgu_set_transform_program_start(pb, 0);
++    pb = xgu_set_transform_execution_mode(pb, XGU_PROGRAM, XGU_RANGE_MODE_PRIVATE);
++    pb = xgu_set_transform_program_cxt_write_enable(pb, false);
++    pb = direct_common_arrays(pb, c, pos, nrm, uv, col);
++    pb = direct_attrib(pb, XGU_TEXCOORD1_ARRAY, 4, 4 * sizeof(float), bone);
++    pb = direct_attrib(pb, XGU_TEXCOORD2_ARRAY, 4, 4 * sizeof(float), weight);
++    pb = pb_push1(pb, NV097_BREAK_VERTEX_BUFFER_CACHE, 0);
++    pb_end(pb);
++    xgux_draw_elements16(XGU_TRIANGLES, idx, (unsigned int)count);
++    pb = pb_begin();                /* the fixed-function pipeline again, the two extra arrays off */
++    pb = xgu_set_transform_execution_mode(pb, XGU_FIXED, XGU_RANGE_MODE_PRIVATE);
++    pb = direct_attrib_off(pb, XGU_TEXCOORD1_ARRAY);
++    pb = direct_attrib_off(pb, XGU_TEXCOORD2_ARRAY);
++    pb_end(pb);
++    direct_arrays_dirty(&c->vertex_array_data);
++}

@@ -35,6 +35,11 @@ typedef struct {                                     /* a skinned mesh's vertice
     uint8_t (*bones)[4]; float (*weights)[4];         /* per vertex of all parts, in part order */
     float *pos, *nrm;                                 /* the posed vertices */
     uint32_t nverts;
+    int posed;                                        /* posed at least once (scene_update) */
+    int gpu;                                          /* Xbox: pos / nrm are in the GPU's static store, not the heap */
+    /* Xbox: 1 = the GPU poses it with a vertex program (render_gl.c: pos / nrm stay NULL and scene_update leaves it
+     * alone), 0 = the CPU does (a cloth), -1 = the renderer could not (the CPU from the next update on) */
+    int gpu_skin;
     /* a cloth mesh (hair, fur, whiskers): its vertices follow the simulation (cloth.c), each on its particle */
     Cloth *cloth; int32_t *particle; int cloth_started;
     ClothWind wind; int has_wind;                     /* a city flag's wind (its object's ClothBit group) */
@@ -349,6 +354,8 @@ void city_build_left(City *c, const char *block, Scene *s);
  * slot (Scene.mon[Scene.nmon]); its slot, -1 = not made. The scene_monster_* functions take the slot k */
 int city_monster(City *c, Scene *s, const char *monster, int clip, float x, float y, float deg);
 void scene_update(Scene *s, double t);               /* pose everything that moves at time t (seconds) */
+/* the matrices of an instance's bones for its skinned meshes (out: 256); returns how many */
+uint32_t scene_skin_palette(const Instance *in, Mat4 *out);
 /* the monster plays the clip whose name ends in suffix ("_WALK2", "_IDLE"); 0 = ok. *speed: how fast its root
  * travels in that clip (units per second), for moving it by hand */
 int scene_monster_clip(Scene *s, int k, const char *suffix, float *speed);

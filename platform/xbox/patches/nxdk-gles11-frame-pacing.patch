@@ -1,0 +1,21 @@
+diff --git a/nv2a_helper.c b/nv2a_helper.c
+index e6c5c81..c92950d 100644
+--- a/nv2a_helper.c
++++ b/nv2a_helper.c
+@@ -131,9 +131,15 @@ void glFlipNV2A()
+     }
+ 
+     if (gl_swap_interval > 0) {
+-        for (int i = 0; i < gl_swap_interval; i++) {
++        /* pbkit shows the finished frame at a vertical blank by itself (pb_finished). Waiting here only
++         * paces a game that is faster than the display: a frame that already took the interval's
++         * refreshes or more does not wait for one more. */
++        static DWORD paced_at;
++        int passed = (int)(pb_get_vbl_counter() - paced_at);
++        for (int i = passed < 0 ? 0 : passed; i < gl_swap_interval; i++) {
+             pb_wait_for_vbl();
+         }
++        paced_at = pb_get_vbl_counter();
+     }
+ 
+     if (gl_show_fps) {

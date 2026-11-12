@@ -1,0 +1,372 @@
+diff --git a/gles_arrays_draw.c b/gles_arrays_draw.c
+index 4c1fb86..7ce02b7 100644
+--- a/gles_arrays_draw.c
++++ b/gles_arrays_draw.c
+@@ -325,9 +325,15 @@ GL_API void GL_APIENTRY glDrawElements(GLenum mode, GLsizei count, GLenum type,
+ 
+     // Scan indices to find vertex range, then stage client arrays
+     if (gliNeedsStaging()) {
+-        GLsizei max_index = gliScanMaxIndex(type, indices_ptr, count);
+-        if (!gliStageClientArrays(0, max_index + 1)) {
+-            return;
++        if (gliClientArraysAllStatic()) {
++            if (!gliStageClientArrays(0, 1)) {
++                return;
++            }
++        } else {
++            GLsizei max_index = gliScanMaxIndex(type, indices_ptr, count);
++            if (!gliStageClientArrays(0, max_index + 1)) {
++                return;
++            }
+         }
+     }
+ 
+diff --git a/gles_private.h b/gles_private.h
+index 8392798..d59e685 100644
+--- a/gles_private.h
++++ b/gles_private.h
+@@ -526,6 +526,13 @@ void gliStagingInit(void);
+ void gliStagingDestroy(void);
+ void gliStagingFrameEnd(void);
+ void gliPushbufferReserve(size_t bytes);
++GLboolean gliStaticArrayAdd(const void *src, size_t bytes, const void *owner);
++void gliStaticArrayRemove(const void *src, const void *owner);
++void *gliStaticArrayAlloc(size_t bytes, const void *owner);
++void gliStaticArraysClear(void);
++void gliStaticArraysHint(GLboolean on);
++void gliStaticArraysCollect(void);
++GLboolean gliClientArraysAllStatic(void);
+ GLboolean gliStageClientArrays(GLint first, GLsizei vertex_count);
+ GLsizei gliScanMaxIndex(GLenum type, const void *indices, GLsizei count);
+ GLboolean gliNeedsStaging(void);
+diff --git a/gles_staging.c b/gles_staging.c
+index b64a2d0..1bae944 100644
+--- a/gles_staging.c
++++ b/gles_staging.c
+@@ -32,6 +32,272 @@ static uint32_t cur_staged_bytes;
+ static uint32_t frame_idx;
+ static volatile uint32_t *staging_fence;
+ 
++/* ---- Static client arrays ----------------------------------------------
++ * A client array is normally copied into the staging arena on every draw
++ * (after scanning the indices of the draw for its extent). The caller may
++ * instead register arrays that do not change: each is copied once into
++ * contiguous memory the GPU reads directly, and a draw made while
++ * gliStaticArraysHint(1) is in force uses that copy for every array found by
++ * its exact address. The hint is the promise of the caller that the
++ * registration is current for the arrays of that draw; without it nothing is
++ * ever looked up, so an address reused by other data cannot pick up a stale
++ * copy. A released copy is freed only once the GPU is idle (frame end, or an
++ * explicit wait). */
++/* Small chunks: the GPU-addressable memory left once a game is running is in pieces, and a store that
++ * wanted megabyte runs was refused at 1280 x 720, leaving its arrays to be staged at every draw. */
++#define ST_CHUNK_BYTES (256u * 1024u)
++#define ST_MAX_CHUNKS 96
++#define ST_SLOTS 16384u
++#define ST_PENDING 1024
++#define ST_KEEP_FREE_PAGES 2048u /* never take a chunk that leaves less than 8 MiB of RAM */
++#define ST_KEEP_LOW_BYTES (512u * 1024u) /* nor one that leaves no 512 KiB run of GPU-addressable RAM */
++typedef struct st_node { struct st_node *next; uint32_t off, size; int used; } st_node_t;
++typedef struct { uint8_t *base; st_node_t *nodes; } st_chunk_t;
++typedef struct { const void *src; uint8_t *dst; uint32_t bytes; const void *owner; } st_entry_t;
++static st_chunk_t st_chunks[ST_MAX_CHUNKS];
++static st_entry_t *st_table;
++static uint32_t st_live, st_tombs;
++static uint8_t *st_pending[ST_PENDING];
++static int st_npending;
++static GLboolean st_hint, st_used_this_draw;
++#define ST_TOMB ((const void *)(uintptr_t)1)
++/* live bytes, live arrays, arrays served, arrays staged under the hint, chunks, refused adds */
++volatile uint32_t gli_static_stats[6];
++
++static uint8_t *st_alloc(uint32_t size)
++{
++    size = (size + 31u) & ~31u;
++    if (!size || size > ST_CHUNK_BYTES) return NULL;
++    for (int c = 0; c < ST_MAX_CHUNKS; c++) {
++        st_chunk_t *ch = &st_chunks[c];
++        if (!ch->base) {
++            MM_STATISTICS ms;
++            memset(&ms, 0, sizeof ms);
++            ms.Length = sizeof ms;
++            if (!NT_SUCCESS(MmQueryStatistics(&ms)) || ms.AvailablePages < ST_KEEP_FREE_PAGES + ST_CHUNK_BYTES / 4096u)
++                return NULL;
++            st_node_t *n = malloc(sizeof *n);
++            if (!n) return NULL;
++            /* Free pages are not enough to go by: the textures and buffers made after this need a run
++             * of GPU-addressable memory, and what is left of it is in pieces. */
++            void *probe = MmAllocateContiguousMemoryEx(ST_KEEP_LOW_BYTES + ST_CHUNK_BYTES, 0, GLI_STAGING_DMA_MAX,
++                                                       0x1000, PAGE_READWRITE);
++            if (!probe) { free(n); return NULL; }
++            MmFreeContiguousMemory(probe);
++            ch->base = MmAllocateContiguousMemoryEx(ST_CHUNK_BYTES, 0, GLI_STAGING_DMA_MAX, 0x1000,
++                                                    PAGE_READWRITE | PAGE_WRITECOMBINE);
++            if (!ch->base) { free(n); return NULL; }
++            n->next = NULL; n->off = 0; n->size = ST_CHUNK_BYTES; n->used = 0;
++            ch->nodes = n;
++            gli_static_stats[4]++;
++        }
++        for (st_node_t *n = ch->nodes; n; n = n->next) {
++            if (n->used || n->size < size) continue;
++            if (n->size > size) {
++                st_node_t *rest = malloc(sizeof *rest);
++                if (!rest) return NULL;
++                rest->next = n->next; rest->off = n->off + size; rest->size = n->size - size; rest->used = 0;
++                n->next = rest; n->size = size;
++            }
++            n->used = 1;
++            return ch->base + n->off;
++        }
++    }
++    return NULL;
++}
++
++static void st_free(uint8_t *p)
++{
++    for (int c = 0; c < ST_MAX_CHUNKS; c++) {
++        st_chunk_t *ch = &st_chunks[c];
++        if (!ch->base || p < ch->base || p >= ch->base + ST_CHUNK_BYTES) continue;
++        uint32_t off = (uint32_t)(p - ch->base);
++        st_node_t *prev = NULL;
++        for (st_node_t *n = ch->nodes; n; prev = n, n = n->next) {
++            if (n->off != off) continue;
++            n->used = 0;
++            if (n->next && !n->next->used) {
++                st_node_t *x = n->next;
++                n->size += x->size; n->next = x->next; free(x);
++            }
++            if (prev && !prev->used) {
++                prev->size += n->size; prev->next = n->next; free(n);
++            }
++            return;
++        }
++        return;
++    }
++}
++
++static void st_wait_idle(void)
++{
++    while (pb_busy()) NtYieldExecution();
++}
++
++/* Only with the GPU idle: no pending draw can still read a released copy. */
++static void st_collect(void)
++{
++    for (int i = 0; i < st_npending; i++) st_free(st_pending[i]);
++    st_npending = 0;
++}
++
++void gliStaticArraysCollect(void)
++{
++    if (st_npending) st_collect();
++}
++
++static void st_release(uint8_t *dst)
++{
++    if (st_npending == ST_PENDING) {
++        st_wait_idle();
++        st_collect();
++    }
++    st_pending[st_npending++] = dst;
++}
++
++static uint32_t st_hash(const void *src)
++{
++    return (uint32_t)((((uintptr_t)src >> 2) * 2654435761u) >> 18) & (ST_SLOTS - 1u);
++}
++
++static st_entry_t *st_find(const void *src)
++{
++    if (!st_table) return NULL;
++    for (uint32_t i = st_hash(src), n = 0; n < ST_SLOTS; i = (i + 1u) & (ST_SLOTS - 1u), n++) {
++        st_entry_t *e = &st_table[i];
++        if (!e->src) return NULL;
++        if (e->src == src) return e;
++    }
++    return NULL;
++}
++
++static void st_rehash(void)
++{
++    st_entry_t *old = st_table, *t = calloc(ST_SLOTS, sizeof *t);
++    if (!t) return;
++    for (uint32_t i = 0; i < ST_SLOTS; i++) {
++        if (!old[i].src || old[i].src == ST_TOMB) continue;
++        uint32_t k = st_hash(old[i].src);
++        while (t[k].src) k = (k + 1u) & (ST_SLOTS - 1u);
++        t[k] = old[i];
++    }
++    free(old);
++    st_table = t;
++    st_tombs = 0;
++}
++
++GLboolean gliStaticArrayAdd(const void *src, size_t bytes, const void *owner)
++{
++    if (!src || src == ST_TOMB || !bytes || bytes > ST_CHUNK_BYTES) { gli_static_stats[5]++; return GL_FALSE; }
++    if (!st_table && !(st_table = calloc(ST_SLOTS, sizeof *st_table))) return GL_FALSE;
++    st_entry_t *e = st_find(src);
++    if (!e && st_live + st_tombs >= ST_SLOTS / 2u) {
++        if (st_tombs) st_rehash();
++        if (st_live + st_tombs >= ST_SLOTS / 2u) { gli_static_stats[5]++; return GL_FALSE; }
++    }
++    uint8_t *dst = st_alloc((uint32_t)bytes);
++    if (!dst) { gli_static_stats[5]++; return GL_FALSE; }
++    gli_memcpy(dst, src, bytes);
++    if (e) {                                 /* the address was registered before: its old copy goes */
++        gli_static_stats[0] -= e->bytes;
++        st_release(e->dst);
++    } else {
++        uint32_t k = st_hash(src);
++        while (st_table[k].src && st_table[k].src != ST_TOMB) k = (k + 1u) & (ST_SLOTS - 1u);
++        if (st_table[k].src == ST_TOMB) st_tombs--;
++        e = &st_table[k];
++        e->src = src;
++        st_live++;
++        gli_static_stats[1] = st_live;
++    }
++    e->dst = dst; e->bytes = (uint32_t)bytes; e->owner = owner;
++    gli_static_stats[0] += e->bytes;
++    return GL_TRUE;
++}
++
++/* Storage for an array the caller builds itself: registered under its own address, so the caller
++ * fills it and passes it to the gl*Pointer calls as it would a client array (under the hint), with no
++ * second copy. Write-combined: fill it once, in order, and do not read it back. NULL: no room. */
++void *gliStaticArrayAlloc(size_t bytes, const void *owner)
++{
++    if (!bytes || bytes > ST_CHUNK_BYTES) { gli_static_stats[5]++; return NULL; }
++    if (!st_table && !(st_table = calloc(ST_SLOTS, sizeof *st_table))) return NULL;
++    if (st_live + st_tombs >= ST_SLOTS / 2u) {
++        if (st_tombs) st_rehash();
++        if (st_live + st_tombs >= ST_SLOTS / 2u) { gli_static_stats[5]++; return NULL; }
++    }
++    uint8_t *dst = st_alloc((uint32_t)bytes);
++    if (!dst) { gli_static_stats[5]++; return NULL; }
++    uint32_t k = st_hash(dst);
++    while (st_table[k].src && st_table[k].src != ST_TOMB) k = (k + 1u) & (ST_SLOTS - 1u);
++    if (st_table[k].src == ST_TOMB) st_tombs--;
++    st_table[k].src = dst; st_table[k].dst = dst; st_table[k].bytes = (uint32_t)bytes; st_table[k].owner = owner;
++    st_live++;
++    gli_static_stats[1] = st_live;
++    gli_static_stats[0] += (uint32_t)bytes;
++    return dst;
++}
++
++void gliStaticArrayRemove(const void *src, const void *owner)
++{
++    st_entry_t *e = st_find(src);
++    if (!e || e->owner != owner) return;     /* the address has since been registered by someone else */
++    gli_static_stats[0] -= e->bytes;
++    st_release(e->dst);
++    e->src = ST_TOMB; e->dst = NULL; e->bytes = 0; e->owner = NULL;
++    st_live--; st_tombs++;
++    gli_static_stats[1] = st_live;
++}
++
++void gliStaticArraysClear(void)
++{
++    st_wait_idle();
++    st_npending = 0;
++    for (int c = 0; c < ST_MAX_CHUNKS; c++) {
++        st_chunk_t *ch = &st_chunks[c];
++        for (st_node_t *n = ch->nodes; n;) { st_node_t *x = n->next; free(n); n = x; }
++        if (ch->base) MmFreeContiguousMemory(ch->base);
++        ch->base = NULL; ch->nodes = NULL;
++    }
++    free(st_table);
++    st_table = NULL;
++    st_live = st_tombs = 0;
++    gli_static_stats[0] = gli_static_stats[1] = gli_static_stats[4] = 0;
++}
++
++void gliStaticArraysHint(GLboolean on)
++{
++    st_hint = on;
++}
++
++static uint8_t *st_lookup(const void *src, size_t bytes)
++{
++    if (!st_hint) return NULL;
++    st_entry_t *e = st_find(src);
++    if (e && bytes <= e->bytes) { gli_static_stats[2]++; st_used_this_draw = GL_TRUE; return e->dst; }
++    gli_static_stats[3]++;
++    return NULL;
++}
++
++/* Every enabled client array of the coming draw is registered: its extent need not be found. */
++GLboolean gliClientArraysAllStatic(void)
++{
++    if (!st_hint || !st_table) return GL_FALSE;
++    gli_context_t *context = gliGetContext();
++    vertex_array_data_t *v = &context->vertex_array_data;
++#define ST_CHECK(enabled, binding, ptr) \
++    if ((enabled) && (binding) == 0 && (ptr) != NULL && !st_find(ptr)) return GL_FALSE
++    ST_CHECK(v->vertex_array_enabled, v->vertex_array_buffer_binding, v->vertex_array_ptr);
++    ST_CHECK(v->normal_array_enabled, v->normal_array_buffer_binding, v->normal_array_ptr);
++    ST_CHECK(v->color_array_enabled, v->color_array_buffer_binding, v->color_array_ptr);
++    for (GLuint i = 0; i < GLI_MAX_TEXTURE_UNITS; ++i)
++        ST_CHECK(v->texcoord_array_enabled[i], v->texcoord_array_buffer_binding[i], v->texcoord_array_ptr[i]);
++    ST_CHECK(v->point_size_array_enabled, v->point_size_array_buffer_binding, v->point_size_array_ptr);
++    ST_CHECK(v->fog_coord_array_enabled, v->fog_coord_array_buffer_binding, v->fog_coord_array_ptr);
++#undef ST_CHECK
++    return GL_TRUE;
++}
++
+ void gliStagingInit(void)
+ {
+     gli_context_t *context = gliGetContext();
+@@ -124,6 +390,11 @@ static void *stage_attribute(arena_t *arena,
+     }
+     const uint8_t *src_end = src_start + total_bytes;
+ 
++    void *registered = st_lookup(src_start, total_bytes);
++    if (registered) {
++        return registered;
++    }
++
+     // Check if this range was already copied (interleaved with an earlier attribute)
+     void *existing = find_staged_overlap(ranges, *range_count, src_start, src_end);
+     if (existing) {
+@@ -164,7 +435,11 @@ static inline uint32_t *push_staged_attrib(uint32_t *p,
+                                            unsigned int stride,
+                                            const void *staged)
+ {
+-    uint32_t phys = context->staging_arena_phys + (uint32_t)((const uint8_t *)staged - (const uint8_t *)context->staging_arena_pool);
++    const uint8_t *pool = (const uint8_t *)context->staging_arena_pool;
++    /* a registered array is outside the arena: contiguous memory maps at 0x80000000 | physical */
++    uint32_t phys = (const uint8_t *)staged >= pool && (const uint8_t *)staged < pool + GLI_STAGING_ARENA_SIZE
++                        ? context->staging_arena_phys + (uint32_t)((const uint8_t *)staged - pool)
++                        : (uint32_t)(uintptr_t)staged & 0x03FFFFFFu;
+     p = xgu_set_vertex_data_array_format(p, index, format, size, stride);
+     p = xgu_set_vertex_data_array_offset(p, index, (const void *)(uintptr_t)phys);
+     return p;
+@@ -258,6 +533,7 @@ GLboolean gliStageClientArrays(GLint first, GLsizei vertex_count)
+     size_t used_before = arena->used;
+     staged_range_t ranges[MAX_STAGED_RANGES];
+     int range_count = 0;
++    st_used_this_draw = GL_FALSE;
+ 
+     uint32_t *pb = pb_begin();
+ 
+@@ -367,7 +643,7 @@ GLboolean gliStageClientArrays(GLint first, GLsizei vertex_count)
+     size_t pad = ((arena->used + 4095u) & ~(size_t)4095u) - arena->used;
+     if (pad) arena_alloc(arena, pad);
+     cur_staged_bytes += arena->used - used_before;
+-    if (range_count > 0) {
++    if (range_count > 0 || st_used_this_draw) {
+         pb = pb_push1(pb, NV097_BREAK_VERTEX_BUFFER_CACHE, 0);
+     }
+     pb_end(pb);
+diff --git a/nv2a_helper.c b/nv2a_helper.c
+index a77aeac..e6c5c81 100644
+--- a/nv2a_helper.c
++++ b/nv2a_helper.c
+@@ -123,6 +123,7 @@ void glFlipNV2A()
+     /* Preserve the post-reset GET/PUT and PGRAPH busy check. This is not
+      * an immutable completion ticket for CPU-dispatched GPU callbacks. */
+     pb_reset_drain_guard(2);
++    gliStaticArraysCollect(); /* the GPU is idle: released static arrays can go */
+     {
+         uint32_t *head = pb_begin();
+         pb_end(head);

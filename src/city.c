@@ -8,6 +8,13 @@
  * template's 4 x 4 texture sheet (column = window style, row = damage). Traffic runs on the two lanes of 0x332D90.
  * What moves: models whose own RawAnim moves (rotors, the fountain), the people's state clips, traffic and a monster
  * (its skeleton's clips; its skinned mesh and cloth posed on the CPU every frame). */
+#ifdef RAMPAGE_XBOX
+#include <xmmintrin.h>
+#include <stddef.h>
+void *gliStaticArrayAlloc(size_t bytes, const void *owner);
+void gliStaticArrayRemove(const void *src, const void *owner);
+void xbox_gpu_idle(void);
+#endif
 #include <math.h>
 #include <limits.h>
 #include <stdlib.h>
@@ -416,6 +423,13 @@ static void skin_free(Skin *sk)
     if (!sk) return;
     if (sk->cloth) cloth_free(sk->cloth);
     free(sk->particle);
+#ifdef RAMPAGE_XBOX
+    if (sk->gpu) {                                   /* (released once the GPU is idle) */
+        gliStaticArrayRemove(sk->pos, sk);
+        gliStaticArrayRemove(sk->nrm, sk);
+        sk->pos = sk->nrm = NULL;
+    }
+#endif
     free(sk->bones); free(sk->weights); free(sk->pos); free(sk->nrm); free(sk);
 }
 
@@ -3819,39 +3833,115 @@ static void pose_instance(Scene *s, Instance *in, double t)
 
 static float monster_sway(const Scene *s, int k);
 
+/* the matrices of an instance's bones for its skins (bind pose to its posed place); returns how many */
+static uint32_t skin_palette(const Instance *in, Mat4 *palette)
+{
+    uint32_t nb = in->tree.n < 256 ? in->tree.n : 256;
+    for (uint32_t j = 0; j < nb; j++) {
+        Mat4 ib;
+        memcpy(ib.m, in->tree.nodes[j].inverse_bind, sizeof ib.m);
+        palette[j] = mat_mul(in->node[j], ib);
+    }
+    if (in->mirrored) {                              /* the game mirrors the pose (0x194BA0); for a mesh that is
+                                                        symmetric this is S x the other side's matrix x S, S the
+                                                        reflection of x */
+        static Mat4 other[256];
+        for (uint32_t j = 0; j < nb; j++) {
+            int m = in->tree.nodes[j].mirror;
+            other[j] = palette[m >= 0 && (uint32_t)m < nb ? (uint32_t)m : j];
+        }
+        for (uint32_t j = 0; j < nb; j++) {
+            Mat4 k = other[j];
+            for (int c = 0; c < 4; c++) {            /* S k S: negate row 0 and column 0, the corner twice */
+                k.m[4 * c] = -k.m[4 * c];
+                k.m[c] = -k.m[c];
+            }
+            palette[j] = k;
+        }
+    }
+    return nb;
+}
+
+uint32_t scene_skin_palette(const Instance *in, Mat4 *out) { return in ? skin_palette(in, out) : 0; }
+
+/* the arrays a skin is posed into by the CPU, made when it first is */
+static int skin_arrays(Skin *sk)
+{
+    if (sk->pos && sk->nrm)
+        return 1;
+    size_t n = sk->nverts ? sk->nverts : 1;
+#ifdef RAMPAGE_XBOX
+    /* The posed vertices go straight into memory the NV2A reads (nxdk-gles11's static store): posed in the heap they
+     * were copied to the GPU at every draw. scene_update waits for an idle GPU before it poses one (xbox_gpu_idle),
+     * so the GPU never reads a mesh half written. No room: the heap. */
+    sk->pos = gliStaticArrayAlloc(sizeof(float) * 3 * n, sk);
+    sk->nrm = sk->pos ? gliStaticArrayAlloc(sizeof(float) * 3 * n, sk) : NULL;
+    if (sk->pos && sk->nrm) {
+        sk->gpu = 1;
+        memset(sk->pos, 0, sizeof(float) * 3 * n);
+        memset(sk->nrm, 0, sizeof(float) * 3 * n);
+        return 1;
+    }
+    if (sk->pos) gliStaticArrayRemove(sk->pos, sk);
+    sk->pos = sk->nrm = NULL;
+#endif
+    sk->pos = calloc(3 * n, sizeof(float));
+    sk->nrm = calloc(3 * n, sizeof(float));
+    if (!sk->pos || !sk->nrm) {
+        free(sk->pos); free(sk->nrm);
+        sk->pos = sk->nrm = NULL;
+        return 0;
+    }
+    return 1;
+}
+
 static void skin_item(Scene *s, const Instance *in, DrawItem *it, int rebuild_palette)
 {
     Skin *sk = it->skin;
+#ifdef RAMPAGE_XBOX
+    static Mat4 palette[256] __attribute__((aligned(16)));   /* (read four floats at a time below) */
+#else
     static Mat4 palette[256];
+#endif
     uint32_t nb = in->tree.n < 256 ? in->tree.n : 256;
-    if (rebuild_palette) {
-        for (uint32_t j = 0; j < nb; j++) {
-            Mat4 ib;
-            memcpy(ib.m, in->tree.nodes[j].inverse_bind, sizeof ib.m);
-            palette[j] = mat_mul(in->node[j], ib);
-        }
-        if (in->mirrored) {                              /* the game mirrors the pose (0x194BA0); for a mesh that is
-                                                            symmetric this is S x the other side's matrix x S, S the
-                                                            reflection of x */
-            static Mat4 other[256];
-            for (uint32_t j = 0; j < nb; j++) {
-                int m = in->tree.nodes[j].mirror;
-                other[j] = palette[m >= 0 && (uint32_t)m < nb ? (uint32_t)m : j];
-            }
-            for (uint32_t j = 0; j < nb; j++) {
-                Mat4 k = other[j];
-                for (int c = 0; c < 4; c++) {            /* S k S: negate row 0 and column 0, the corner twice */
-                    k.m[4 * c] = -k.m[4 * c];
-                    k.m[c] = -k.m[c];
-                }
-                palette[j] = k;
-            }
-        }
-    }
+    if (rebuild_palette)
+        skin_palette(in, palette);
     const Mesh *m = &s->meshes[it->mesh].mesh;
     uint32_t v = 0;
     for (uint32_t pi = 0; pi < m->nparts; pi++) {
         const MeshPart *p = &m->parts[pi];
+#ifdef RAMPAGE_XBOX
+        /* The same sum with the matrices blended first, four floats at a time (the console has SSE): the bones'
+         * weighted matrices are added column by column, and the vertex and its normal go through the result once.
+         * Posing the monsters was the largest single cost of a frame with four of them. */
+        for (uint32_t i = 0; i < p->nverts; i++, v++) {
+            const float *x = p->pos + 3 * i, *n = p->nrm ? p->nrm + 3 * i : NULL;
+            __m128 c0 = _mm_setzero_ps(), c1 = c0, c2 = c0, c3 = c0;
+            for (int k = 0; k < 4; k++) {
+                float w = sk->weights[v][k];
+                if (w <= 0 || sk->bones[v][k] >= nb)
+                    continue;
+                const float *M = palette[sk->bones[v][k]].m;
+                __m128 W = _mm_set1_ps(w);
+                c0 = _mm_add_ps(c0, _mm_mul_ps(W, _mm_load_ps(M)));
+                c1 = _mm_add_ps(c1, _mm_mul_ps(W, _mm_load_ps(M + 4)));
+                c2 = _mm_add_ps(c2, _mm_mul_ps(W, _mm_load_ps(M + 8)));
+                c3 = _mm_add_ps(c3, _mm_mul_ps(W, _mm_load_ps(M + 12)));
+            }
+            __m128 o = _mm_add_ps(_mm_add_ps(_mm_mul_ps(c0, _mm_set1_ps(x[0])), _mm_mul_ps(c1, _mm_set1_ps(x[1]))),
+                                  _mm_add_ps(_mm_mul_ps(c2, _mm_set1_ps(x[2])), c3));
+            float *po = sk->pos + 3 * v, *no = sk->nrm + 3 * v;
+            _mm_storel_pi((__m64 *)po, o);
+            _mm_store_ss(po + 2, _mm_movehl_ps(o, o));
+            if (n) {
+                __m128 on = _mm_add_ps(_mm_add_ps(_mm_mul_ps(c0, _mm_set1_ps(n[0])), _mm_mul_ps(c1, _mm_set1_ps(n[1]))),
+                                       _mm_mul_ps(c2, _mm_set1_ps(n[2])));
+                _mm_storel_pi((__m64 *)no, on);
+                _mm_store_ss(no + 2, _mm_movehl_ps(on, on));
+            } else
+                no[0] = no[1] = no[2] = 0;
+        }
+#else
         for (uint32_t i = 0; i < p->nverts; i++, v++) {
             float o[3] = { 0, 0, 0 }, on[3] = { 0, 0, 0 };
             const float *x = p->pos + 3 * i, *n = p->nrm ? p->nrm + 3 * i : NULL;
@@ -3865,9 +3955,11 @@ static void skin_item(Scene *s, const Instance *in, DrawItem *it, int rebuild_pa
                     if (n) on[r] += w * (M[r] * n[0] + M[4 + r] * n[1] + M[8 + r] * n[2]);
                 }
             }
-            memcpy(sk->pos + 3 * v, o, sizeof o);
-            memcpy(sk->nrm + 3 * v, on, sizeof on);
+            float *po = sk->pos + 3 * v, *no = sk->nrm + 3 * v;
+            po[0] = o[0]; po[1] = o[1]; po[2] = o[2];
+            no[0] = on[0]; no[1] = on[1]; no[2] = on[2];
         }
+#endif
     }
     if (sk->cloth && sk->particle) {                 /* hair: simulated in the world (the monster's moves drag it) */
         static float world[256][16];
@@ -3919,7 +4011,10 @@ static void skin_item(Scene *s, const Instance *in, DrawItem *it, int rebuild_pa
         }
         float *lp = s->cloth_scratch, *ln = lp + 3 * np;
         cloth_to_local(sk->cloth, lp, ln);
-        int trace_cloth = getenv("RAMPAGE_CLOTH") != NULL;
+        static int trace_cloth = -1;                 /* (asked once: getenv searched the environment for every
+                                                      * cloth of every frame) */
+        if (trace_cloth < 0)
+            trace_cloth = getenv("RAMPAGE_CLOTH") != NULL;
         float dev = 0;
         for (uint32_t k = 0; k < sk->nverts; k++) {
             int32_t q = sk->particle[k];
@@ -4113,8 +4208,41 @@ static void update(Scene *s, double t, int all)
     if (scene_failed(s)) return;
     parade_sync(s, t);
     if (scene_failed(s)) return;
+#ifdef RAMPAGE_XBOX
+    /* An instance none of whose items the last frame's culling kept (the people, the army and the animated props of
+     * the rest of the block) has its bones posed one frame in four, not every frame: nothing shows them, and what
+     * reads a bone of one out of sight (a unit's muzzle) gets it at most three frames old. A monster always. */
+    static uint8_t *inst_seen;
+    static uint32_t inst_seen_c, pose_frame;
+    int have_seen = 0;
+    pose_frame++;
+    {
+        extern uint8_t *g_xbox_item_seen;
+        extern uint32_t g_xbox_item_seen_n;
+        if (!all && s->ninstances && g_xbox_item_seen && g_xbox_item_seen_n == s->nitems) {
+            if (inst_seen_c < s->ninstances) {
+                uint8_t *grown = realloc(inst_seen, s->ninstances);
+                if (grown) {
+                    inst_seen = grown;
+                    inst_seen_c = s->ninstances;
+                }
+            }
+            if (inst_seen_c >= s->ninstances) {
+                memset(inst_seen, 0, s->ninstances);
+                for (uint32_t k = 0; k < s->nitems; k++)
+                    if (g_xbox_item_seen[k] && (uint32_t)s->items[k].instance < s->ninstances)
+                        inst_seen[s->items[k].instance] = 1;
+                have_seen = 1;
+            }
+        }
+    }
+#endif
     for (uint32_t i = 0; i < s->ninstances; i++) {
         Instance *in = &s->instances[i];
+#ifdef RAMPAGE_XBOX
+        if (have_seen && !inst_seen[i] && ((pose_frame + i) & 3u) && scene_monster_slot(s, (int)i) < 0)
+            continue;
+#endif
         if (in->hidden && !all && scene_monster_slot(s, (int)i) < 0)
             continue;                                /* not drawn: not posed (a gone person's, unit's or edible's look,
                                                       * an animation's look no longer played: posed again when shown,
@@ -4130,6 +4258,11 @@ static void update(Scene *s, double t, int all)
     }
     /* Poses and IK are final here. Nothing in this serial loop may re-enter skinning or change a pose. */
     const Instance *last_skin_instance = NULL;
+#ifdef RAMPAGE_XBOX
+    static uint32_t skin_frame;
+    skin_frame++;
+    int gpu_waited = 0;
+#endif
     for (uint32_t i = 0; i < s->nitems; i++) {
         DrawItem *it = &s->items[i];
         Instance *in = &s->instances[it->instance];
@@ -4138,6 +4271,43 @@ static void update(Scene *s, double t, int all)
         if (in->hidden && !all && scene_monster_slot(s, it->instance) < 0)
             continue;                                /* (nor skinned) */
         if (it->skin) {
+#ifdef RAMPAGE_XBOX
+            /* A skin the last frame's culling left out is not posed (the people and the army of the whole block were,
+             * a third of the scene's time on the console): it keeps its last pose, a frame old when it comes into
+             * sight. A monster's always is, and any skin's first. */
+            extern uint8_t *g_xbox_item_seen;
+            extern uint32_t g_xbox_item_seen_n;
+            int monster = scene_monster_slot(s, it->instance) >= 0;
+            if (it->skin->cloth)
+                it->skin->gpu_skin = 0;              /* (its vertices follow the simulation) */
+            /* The GPU poses this one from the instance's bones as it draws it (render_gl.c, skin.vs.cg): nothing to
+             * do here. Posing the monsters and the people was the largest single cost of a frame. */
+            if (it->skin->gpu_skin > 0) {
+                it->world = in->base;
+                if (monster)
+                    it->world.m[12] += monster_sway(s, scene_monster_slot(s, it->instance));
+                continue;
+            }
+            if (!all && it->skin->posed && i < g_xbox_item_seen_n && !g_xbox_item_seen[i] && !monster) {
+                it->world = in->base;
+                continue;
+            }
+            /* The people, the army and the other small skins in sight are posed on alternate frames, half of them
+             * each frame (their walk is drawn at half the frame rate); a monster every frame. */
+            if (!all && it->skin->posed && !monster && ((skin_frame + i) & 1u)) {
+                it->world = in->base;
+                continue;
+            }
+            if (!skin_arrays(it->skin)) {
+                it->world = in->base;
+                continue;
+            }
+            if (it->skin->gpu && !gpu_waited) {      /* (posed into memory the GPU reads: once it is idle) */
+                xbox_gpu_idle();
+                gpu_waited = 1;
+            }
+            it->skin->posed = 1;
+#endif
             skin_item(s, in, it, in != last_skin_instance);
             last_skin_instance = in;
             it->world = in->base;
@@ -4531,9 +4701,12 @@ static Skin *new_skin(const Mesh *m)
         n > SIZE_MAX / (3 * sizeof(float))) goto failed;
     sk->bones = calloc(n, sizeof *sk->bones);
     sk->weights = calloc(n, sizeof *sk->weights);
-    sk->pos = calloc(3 * n, sizeof(float));
-    sk->nrm = calloc(3 * n, sizeof(float));
-    if (!sk->bones || !sk->weights || !sk->pos || !sk->nrm) goto failed;
+#ifdef RAMPAGE_XBOX
+    sk->gpu_skin = 1;                                /* (the GPU poses it: no posed arrays unless it cannot) */
+    if (!sk->bones || !sk->weights) goto failed;
+#else
+    if (!sk->bones || !sk->weights || !skin_arrays(sk)) goto failed;
+#endif
     return sk;
 failed:
     skin_free(sk);

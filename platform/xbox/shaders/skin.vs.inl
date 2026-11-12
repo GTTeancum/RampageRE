@@ -1,0 +1,151 @@
+// cgc version 3.1.0013, build date Apr 18 2012
+// command line args: -profile vp20
+// source file: skin.vs.cg
+//vendor NVIDIA Corporation
+//version 3.1.0.13
+//profile vp20
+//program main
+//semantic main.screen
+//semantic main.eye
+//semantic main.ambient
+//semantic main.ldir
+//semantic main.lcol
+//semantic main.tscale
+//semantic main.bones
+//var float4 I.pos : $vin.POSITION : ATTR0 : 0 : 1
+//var float4 I.weight : $vin.TEXCOORD2 : TEXCOORD2 : 0 : 1
+//var float3 I.norm : $vin.NORMAL : ATTR2 : 0 : 1
+//var float4 I.col : $vin.COLOR0 : ATTR3 : 0 : 1
+//var float4 I.tex : $vin.TEXCOORD0 : TEXCOORD0 : 0 : 1
+//var float4 I.bone : $vin.TEXCOORD1 : TEXCOORD1 : 0 : 1
+//var float4x4 screen :  : c[0], 4 : 1 : 1
+//var float4 eye[0] :  : c[82] : 2 : 1
+//var float4 eye[1] :  : c[83] : 2 : 1
+//var float4 eye[2] :  : c[84] : 2 : 1
+//var float4 ambient :  : c[85] : 3 : 1
+//var float4 ldir[0] :  : c[86] : 4 : 1
+//var float4 ldir[1] :  : c[87] : 4 : 1
+//var float4 ldir[2] :  : c[88] : 4 : 1
+//var float4 lcol[0] :  : c[89] : 5 : 1
+//var float4 lcol[1] :  : c[90] : 5 : 1
+//var float4 lcol[2] :  : c[91] : 5 : 1
+//var float4 tscale :  : c[92] : 6 : 1
+//var float3x4 bones[0] :  : c[4], 3 : 7 : 1
+//var float3x4 bones[1] :  : c[7], 3 : 7 : 1
+//var float3x4 bones[2] :  : c[10], 3 : 7 : 1
+//var float3x4 bones[3] :  : c[13], 3 : 7 : 1
+//var float3x4 bones[4] :  : c[16], 3 : 7 : 1
+//var float3x4 bones[5] :  : c[19], 3 : 7 : 1
+//var float3x4 bones[6] :  : c[22], 3 : 7 : 1
+//var float3x4 bones[7] :  : c[25], 3 : 7 : 1
+//var float3x4 bones[8] :  : c[28], 3 : 7 : 1
+//var float3x4 bones[9] :  : c[31], 3 : 7 : 1
+//var float3x4 bones[10] :  : c[34], 3 : 7 : 1
+//var float3x4 bones[11] :  : c[37], 3 : 7 : 1
+//var float3x4 bones[12] :  : c[40], 3 : 7 : 1
+//var float3x4 bones[13] :  : c[43], 3 : 7 : 1
+//var float3x4 bones[14] :  : c[46], 3 : 7 : 1
+//var float3x4 bones[15] :  : c[49], 3 : 7 : 1
+//var float3x4 bones[16] :  : c[52], 3 : 7 : 1
+//var float3x4 bones[17] :  : c[55], 3 : 7 : 1
+//var float3x4 bones[18] :  : c[58], 3 : 7 : 1
+//var float3x4 bones[19] :  : c[61], 3 : 7 : 1
+//var float3x4 bones[20] :  : c[64], 3 : 7 : 1
+//var float3x4 bones[21] :  : c[67], 3 : 7 : 1
+//var float3x4 bones[22] :  : c[70], 3 : 7 : 1
+//var float3x4 bones[23] :  : c[73], 3 : 7 : 1
+//var float3x4 bones[24] :  : c[76], 3 : 7 : 1
+//var float3x4 bones[25] :  : c[79], 3 : 7 : 1
+//var float4 main.pos : $vout.POSITION : HPOS : -1 : 1
+//var float4 main.col : $vout.COLOR0 : COL0 : -1 : 1
+//var float main.fog : $vout.FOG : FOGC : -1 : 1
+//var float4 main.tex0 : $vout.TEXCOORD0 : TEX0 : -1 : 1
+//const c[93] = 0 1 3
+// 87 instructions, 0 R-regs
+0x00000000, 0x0a00141b, 0x08361100, 0x201407f8,
+0x00000000, 0x00601455, 0x08361554, 0x580007f8,
+0x00000000, 0x0057a01b, 0x0554186c, 0x282007f8,
+0x00000000, 0x01a00000, 0x2436106c, 0x207007f8,
+0x00000000, 0x0a00141b, 0x08361000, 0x200407f8,
+0x00000000, 0x00601400, 0x0836146c, 0x140007f8,
+0x00000000, 0x0057a055, 0x0554186c, 0x283007f8,
+0x00000000, 0x00acc41b, 0x0c36106c, 0x220007fa,
+0x00000000, 0x00ac841b, 0x0c36106c, 0x280007fa,
+0x00000000, 0x00aca41b, 0x0c36106c, 0x240007fa,
+0x00000000, 0x01a00000, 0x3436106c, 0x207007f8,
+0x00000000, 0x00401655, 0x0836086c, 0x2e0007f8,
+0x00000000, 0x00acc41b, 0x0c36106c, 0x221007fa,
+0x00000000, 0x00aca41b, 0x0c36106c, 0x241007fa,
+0x00000000, 0x00ac841b, 0x0c36106c, 0x281007fa,
+0x00000000, 0x00801600, 0x0836286c, 0x1e1007f8,
+0x00000000, 0x0a00141b, 0x08361200, 0x202407f8,
+0x00000000, 0x006014aa, 0x08361554, 0x980007f8,
+0x00000000, 0x0057a000, 0x0554186c, 0x212007f8,
+0x00000000, 0x01a000c0, 0x2436106c, 0x207007f8,
+0x00000000, 0x0a00141b, 0x08361300, 0x200407f8,
+0x00000000, 0x006014ff, 0x0836146c, 0x140007f8,
+0x00000000, 0x0057a055, 0x0554186c, 0x211007f8,
+0x00000000, 0x00acc41b, 0x0c36106c, 0x220007fa,
+0x00000000, 0x00aca41b, 0x0c36106c, 0x240007fa,
+0x00000000, 0x00ac841b, 0x0c36106c, 0x280007fa,
+0x00000000, 0x008016aa, 0x0836086c, 0x5e0007f8,
+0x00000000, 0x01a000c0, 0x1436106c, 0x207007f8,
+0x00000000, 0x00acc41b, 0x0c36106c, 0x221007fa,
+0x00000000, 0x00aca41b, 0x0c36106c, 0x241007fa,
+0x00000000, 0x00ac841b, 0x0c36106c, 0x281007fa,
+0x00000000, 0x008016ff, 0x0836286c, 0x1e1007f8,
+0x00000000, 0x01a00000, 0x2436106c, 0x207007f8,
+0x00000000, 0x00b6401b, 0x1436186c, 0x280007f8,
+0x00000000, 0x00b6801b, 0x1436186c, 0x220007f8,
+0x00000000, 0x00b6601b, 0x1436186c, 0x240007f8,
+0x00000000, 0x00a0001b, 0x0436086c, 0x210007f8,
+0x00000000, 0x0800001b, 0x08361300, 0x100107f8,
+0x00000000, 0x004000ff, 0x0436086c, 0x2e0007f8,
+0x00000000, 0x00b6c01b, 0x0436186c, 0x210007f8,
+0x00000000, 0x0157a0ff, 0x0436186c, 0x281007f8,
+0x00000000, 0x00b7001b, 0x0436186c, 0x210007f8,
+0x00000000, 0x00572000, 0x1436186c, 0x2e1007f8,
+0x00000000, 0x00b6e01b, 0x0436186c, 0x242007f8,
+0x00000000, 0x0076a01b, 0x1436106c, 0x3e0007f8,
+0x00000000, 0x0157a055, 0x2436186c, 0x281007f8,
+0x00000000, 0x00974000, 0x1436186c, 0x1e0007f8,
+0x00000000, 0x0157a01b, 0x0400186c, 0x210007f8,
+0x00000000, 0x009760ff, 0x0436186c, 0x1e0007f8,
+0x00000000, 0x0040061b, 0x0836086c, 0x2e0007f8,
+0x00000000, 0x0137a01b, 0x04aa186c, 0x2e0007f8,
+0x00000000, 0x0157a01b, 0x0400186c, 0x2e0007f8,
+0x00000000, 0x0060071b, 0x0836106c, 0x1e1007f8,
+0x00000000, 0x0037a055, 0x0c36106c, 0x210007f8,
+0x00000000, 0x0020001b, 0x0836106c, 0x2e0007f8,
+0x00000000, 0x00ecc01b, 0x0436186c, 0x222007fa,
+0x00000000, 0x00ec801b, 0x0436186c, 0x282007fa,
+0x00000000, 0x00eca01b, 0x0436186c, 0x242007fa,
+0x00000000, 0x01a00000, 0x3436106c, 0x207007f8,
+0x00000000, 0x00ecc01b, 0x0436186c, 0x223007fa,
+0x00000000, 0x00eca01b, 0x0436186c, 0x243007fa,
+0x00000000, 0x00ec801b, 0x0436186c, 0x283007fa,
+0x00000000, 0x00401655, 0x0836486c, 0x2e2007f8,
+0x00000000, 0x01a000c0, 0x2436106c, 0x207007f8,
+0x00000000, 0x00801600, 0x0836686c, 0x9e2007f8,
+0x00000000, 0x00ecc01b, 0x0436186c, 0x223007fa,
+0x00000000, 0x00eca01b, 0x0436186c, 0x243007fa,
+0x00000000, 0x00ec801b, 0x0436186c, 0x283007fa,
+0x00000000, 0x008016aa, 0x0836686c, 0x9e2007f8,
+0x00000000, 0x01a000c0, 0x1436106c, 0x207007f8,
+0x00000000, 0x00ecc01b, 0x0c36086c, 0x223007fa,
+0x00000000, 0x00eca01b, 0x0436186c, 0x243007fa,
+0x00000000, 0x00ec801b, 0x0436186c, 0x283007fa,
+0x00000000, 0x008016ff, 0x0836686c, 0x9e0007f8,
+0x00000000, 0x0037a055, 0x0c36106c, 0x210007f8,
+0x00000000, 0x00ec601b, 0x0436186c, 0x212007f8,
+0x00000000, 0x00ec401b, 0x0436186c, 0x222007f8,
+0x00000000, 0x00ec201b, 0x0436186c, 0x242007f8,
+0x00000000, 0x0400001b, 0x08361300, 0x901107f8,
+0x00000000, 0x00ec001b, 0x0436186c, 0x282007f8,
+0x00000000, 0x0040001b, 0x25fe286c, 0x2070e800,
+0x00000000, 0x0096a61b, 0x15fe186c, 0x2070e818,
+0x00000000, 0x0020001b, 0x2436106c, 0x20701800,
+0x00000000, 0x002000ff, 0x2436106c, 0x20708828,
+0x00000000, 0x0057921b, 0x0836186c, 0x2070c848,
+0x00000000, 0x0037a011, 0x0c36106c, 0x20703848,
+0x00000000, 0x0020061b, 0x0836106c, 0x20701819,

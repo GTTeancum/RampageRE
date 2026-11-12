@@ -1,0 +1,82 @@
+diff --git a/nv2a_helper.c b/nv2a_helper.c
+index c92950d..dbe2524 100644
+--- a/nv2a_helper.c
++++ b/nv2a_helper.c
+@@ -9,22 +9,38 @@ extern void pb_reset_drain_guard(unsigned phase);
+  * buffer engine encountered invalid data", seen on a real Xbox past
+  * head + 0x82000). Before each draw, a frame close to the end drains the GPU
+  * and restarts at the head, as glFlipNV2A does every frame. */
+-#define GLI_PUSHBUFFER_SIZE (512u * 1024u) /* PBKIT_PUSHBUFFER_SIZE; pb_size is never called */
++/* pbkit's default, PBKIT_PUSHBUFFER_SIZE. An application that calls pb_size before glContextInit must build this
++ * with the same size: a push buffer several frames long is then restarted (and the GPU drained) only every few
++ * frames. Not the default: on a 64 MiB console the memory is worth more to the static arrays. */
++#define GLI_PUSHBUFFER_SIZE (512u * 1024u)
+ #define GLI_PUSHBUFFER_MARGIN (64u * 1024u) /* state and setup methods between two checks */
+ static uint8_t *gli_pushbuffer_start; /* pbkit's head once the first reset has run */
++static GLboolean gli_pushbuffer_restart_due; /* a frame ended: restart before the next draw */
+ 
+ static void gli_pushbuffer_restart(void)
+ {
+     pb_reset_drain_guard(1);
+     pb_reset();
+     pb_reset_drain_guard(2);
++    gliStaticArraysCollect(); /* the GPU is idle: released static arrays can go */
+     uint32_t *head = pb_begin();
+     pb_end(head);
+     gli_pushbuffer_start = (uint8_t *)head;
+ }
+ 
++/* pbkit's last defence (pb_room_hook): a block begun with the buffer nearly full, where no draw's
++ * gliPushbufferReserve came first (a level's loading sends its state and texture work with no draw
++ * between, and after a frame's end the restart is still due). */
++static void gli_pushbuffer_room(void)
++{
++    gli_pushbuffer_restart();
++    gli_pushbuffer_restart_due = GL_FALSE;
++}
++
+ void gliPushbufferReserve(size_t bytes)
+ {
++    extern void (*pb_room_hook)(void);
++    pb_room_hook = gli_pushbuffer_room;
+     uint32_t *put = pb_begin();
+     pb_end(put);
+     if (!gli_pushbuffer_start)  /* before the first frame's reset: pb_init's few methods are not counted */
+@@ -32,8 +48,10 @@ void gliPushbufferReserve(size_t bytes)
+     size_t used = (size_t)((uint8_t *)put - gli_pushbuffer_start);
+     if (bytes > GLI_PUSHBUFFER_SIZE - GLI_PUSHBUFFER_MARGIN)
+         bytes = GLI_PUSHBUFFER_SIZE - GLI_PUSHBUFFER_MARGIN; /* one draw this large overflows anyway */
+-    if (used > GLI_PUSHBUFFER_SIZE - GLI_PUSHBUFFER_MARGIN - bytes)
++    if (used > GLI_PUSHBUFFER_SIZE - GLI_PUSHBUFFER_MARGIN - bytes || (gli_pushbuffer_restart_due && used)) {
+         gli_pushbuffer_restart();
++    }
++    gli_pushbuffer_restart_due = GL_FALSE;
+ }
+ 
+ static int gl_swap_interval = 1;
+@@ -117,18 +135,13 @@ void glFlipNV2A()
+     pb = pb_push1(pb, NV097_SET_STENCIL_TEST_ENABLE, context->pixel_ops_state.stencil_test_enabled);
+     pb_end(pb);
+ 
+-    pb_reset_drain_guard(1);
+-    pb_reset();
+-
+-    /* Preserve the post-reset GET/PUT and PGRAPH busy check. This is not
+-     * an immutable completion ticket for CPU-dispatched GPU callbacks. */
+-    pb_reset_drain_guard(2);
+-    gliStaticArraysCollect(); /* the GPU is idle: released static arrays can go */
+-    {
+-        uint32_t *head = pb_begin();
+-        pb_end(head);
+-        gli_pushbuffer_start = (uint8_t *)head;
+-    }
++    /* The frame's end does not restart the push buffer. The restart drains the GPU, and the GPU still
++     * has the end of this frame to draw (at 1280 x 720 about a quarter of the frame time): made here,
++     * the CPU stood still for all of it. It is made before the next frame's first draw instead
++     * (gliPushbufferReserve), after the application's own work for that frame, which the GPU's
++     * remaining work then overlaps. The little that is sent in between (a clear, state) fits the
++     * margin gliPushbufferReserve keeps. */
++    gli_pushbuffer_restart_due = GL_TRUE;
+ 
+     if (gl_swap_interval > 0) {
+         /* pbkit shows the finished frame at a vertical blank by itself (pb_finished). Waiting here only

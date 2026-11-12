@@ -8,6 +8,7 @@
 #endif
 #include <stdio.h>
 #include <string.h>
+#include <windows.h>
 #include <SDL.h>
 #include <hal/video.h>
 #include <pbkit/pbkit.h>
@@ -26,6 +27,16 @@ void gliStagingDestroy(void);
 
 static int context_live;
 static int display_width, display_height;
+static int logical_width;                /* the width the game lays its picture out for: 640, or 853 on a 16:9 screen */
+int xbox_pixel_width(void) { return display_width; }
+int xbox_pixel_height(void) { return display_height; }
+
+/* the GPU has drawn all it was sent: memory it reads may be written again (the posed meshes, src/city.c) */
+void xbox_gpu_idle(void)
+{
+    if (!context_live) return;
+    while (pb_busy()) NtYieldExecution();
+}
 
 static void APIENTRY_GL4ES framebuffer_size(int *width, int *height)
 {
@@ -55,6 +66,12 @@ int win_open(Window *w, const char *title, int width, int height, int hidden)
     /* A fixed low-memory target works on all retail cable/region combinations.
      * Settings may still contain a desktop resolution; never let that allocate
      * an accidental 1080p framebuffer on the console. */
+    /* 640 x 480 pixels on every console: the stock 64 MB has no room for more (1280 x 720 was drawn correctly and
+     * ran out of memory with four monsters). nxdk picks the scan from the console's settings and cable: interlaced
+     * (480i) on the standard cables, progressive (480p) on component with 480p enabled. With Widescreen set on the
+     * dashboard the same pixels are stretched over a 16:9 screen by the television, so the picture is drawn for
+     * that shape: the game is told a window 853 wide (its camera and HUD are laid out for it, as for any wide
+     * window) and the renderer maps it onto the 640 pixels (xbox_pixel_width). */
     display_width = 640;
     display_height = 480;
     if (!XVideoSetMode(display_width, display_height, 32, REFRESH_DEFAULT)) {
@@ -74,7 +91,8 @@ int win_open(Window *w, const char *title, int width, int height, int hidden)
     initialize_gl4es();
     context_live = 1;
     glSwapInterval(1);
-    w->width = display_width;
+    logical_width = XVideoGetEncoderSettings() & VIDEO_WIDESCREEN ? 853 : display_width;
+    w->width = logical_width;
     w->height = display_height;
     w->focused = 1;
     glViewport(0, 0, display_width, display_height);
@@ -175,7 +193,7 @@ void win_mode(Window *w, int width, int height, int full)
 {
     (void)width; (void)height; (void)full;
     if (w && context_live) {
-        w->width = display_width;
+        w->width = logical_width;
         w->height = display_height;
     }
 }

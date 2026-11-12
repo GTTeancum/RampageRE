@@ -12,6 +12,16 @@
  * guarantees the direction flag is clear on entry. */
 #ifdef RAMPAGE_XBOX
 #include <stddef.h>
+/* (the functions themselves: not the macros of xbox_builtins.h) */
+#undef memcpy
+#undef memmove
+#undef memset
+#undef memcmp
+#undef strlen
+#undef sqrtf
+#undef sqrt
+#undef fabsf
+#undef fabs
 
 void *memcpy(void *dst, const void *src, size_t n)
 {
@@ -60,8 +70,20 @@ size_t strlen(const char *s)
 int memcmp(const void *a, const void *b, size_t n)
 {
     const unsigned char *p = a, *q = b;
+    for (; n >= 4; n -= 4, p += 4, q += 4) {             /* whole words while they are equal */
+        unsigned x, y;
+        __builtin_memcpy(&x, p, 4);
+        __builtin_memcpy(&y, q, 4);
+        if (x != y) break;
+    }
     for (; n; n--, p++, q++)
         if (*p != *q) return *p < *q ? -1 : 1;
     return 0;
 }
+
+/* The library's square roots are unoptimised x87 thunks, and nxdk compiles with -fno-builtin, so every sqrtf in the
+ * game was a call into one. All three are defined: the library keeps them in one object. */
+float sqrtf(float x) { return __builtin_sqrtf(x); }
+double sqrt(double x) { return __builtin_sqrt(x); }
+long double sqrtl(long double x) { return __builtin_sqrtl(x); }
 #endif

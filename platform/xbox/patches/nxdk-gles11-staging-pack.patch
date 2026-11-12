@@ -1,0 +1,35 @@
+diff --git a/gles_staging.c b/gles_staging.c
+index 1bae944..cb7eb6d 100644
+--- a/gles_staging.c
++++ b/gles_staging.c
+@@ -31,6 +31,12 @@ static uint32_t frame_staged_bytes[2];
+ static uint32_t cur_staged_bytes;
+ static uint32_t frame_idx;
+ static volatile uint32_t *staging_fence;
++static GLboolean gli_staging_page_pad;
++
++void gliStagingPagePad(GLboolean on)
++{
++    gli_staging_page_pad = on;
++}
+ 
+ /* ---- Static client arrays ----------------------------------------------
+  * A client array is normally copied into the staging arena on every draw
+@@ -639,9 +645,14 @@ GLboolean gliStageClientArrays(GLint first, GLsizei vertex_count)
+     /* Keep independent draws on separate pages. Xemu's OpenGL vertex uploader
+      * clears guest-RAM dirty bits at page granularity: later CPU stores to a
+      * shared page can otherwise be missed while the GPU consumes an earlier
+-     * draw. A whole page belongs to one draw until the arena fence completes. */
+-    size_t pad = ((arena->used + 4095u) & ~(size_t)4095u) - arena->used;
+-    if (pad) arena_alloc(arena, pad);
++     * draw. A whole page belongs to one draw until the arena fence completes.
++     * Only when asked for (gliStagingPagePad): the NV2A itself reads what is there, and a page for
++     * every draw (some hundreds a frame, most of a few hundred bytes) filled the arena several times
++     * a frame on the console, each refill a wait for an idle GPU. */
++    if (gli_staging_page_pad) {
++        size_t pad = ((arena->used + 4095u) & ~(size_t)4095u) - arena->used;
++        if (pad) arena_alloc(arena, pad);
++    }
+     cur_staged_bytes += arena->used - used_before;
+     if (range_count > 0 || st_used_this_draw) {
+         pb = pb_push1(pb, NV097_BREAK_VERTEX_BUFFER_CACHE, 0);

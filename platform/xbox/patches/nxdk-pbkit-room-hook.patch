@@ -1,0 +1,33 @@
+diff --git a/lib/pbkit/pbkit.c b/lib/pbkit/pbkit.c
+index bd6e31e..0f740af 100644
+--- a/lib/pbkit/pbkit.c
++++ b/lib/pbkit/pbkit.c
+@@ -104,6 +104,14 @@ static  uint32_t        *pb_Put=NULL;   //where next command+params are to be wr
+ #define PB_KICK_BYTES 4096u
+ static  uint32_t        *pb_Kicked=NULL; //pb_Put as last given to the GPU
+ static  int             pb_kick_batching=0;
++/* pbkit never checks for room. A caller that restarts the push buffer itself sets this: it is called,
++ * at passive level and not from within itself, by the pb_begin that finds less than PB_ROOM_BYTES left
++ * before the tail, and must leave the buffer restarted (pb_reset). The last defence, for the blocks
++ * that are sent with no draw between them (a level's loading); a caller's own, earlier check is what
++ * normally restarts it. */
++#define PB_ROOM_BYTES (24u*1024u)
++void                    (*pb_room_hook)(void)=NULL;
++static  int             pb_in_room_hook=0;
+ 
+ static  float           pb_CpuFrequency;
+ 
+@@ -1810,6 +1818,13 @@ void pb_reset(void)
+ 
+ uint32_t *pb_begin(void)
+ {
++    if (pb_room_hook && !pb_in_room_hook && pb_kick_batching && pb_Put &&
++        (DWORD)pb_Put-(DWORD)pb_Head+PB_ROOM_BYTES>pb_Size && KeGetCurrentIrql()==PASSIVE_LEVEL)
++    {
++        pb_in_room_hook=1;
++        pb_room_hook();
++        pb_in_room_hook=0;
++    }
+ #ifdef DBG
+     if (pb_Put>=pb_Tail) debugPrint("ERROR! Push buffer overflow! Use pb_reset more often or enlarge push buffer!\n");
+ 

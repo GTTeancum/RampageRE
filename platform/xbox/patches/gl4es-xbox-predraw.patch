@@ -1,0 +1,37 @@
+diff --git a/src/gl/drawing.c b/src/gl/drawing.c
+index 498ecc5a..17abb132 100644
+--- a/src/gl/drawing.c
++++ b/src/gl/drawing.c
+@@ -1621,3 +1621,32 @@ void APIENTRY_GL4ES gl4es_glDrawElementsInstancedBaseVertex(GLenum mode, GLsizei
+ }
+ AliasExport(void,glDrawElementsInstancedBaseVertex,,(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei primcount, GLint basevertex));
+ AliasExport(void,glDrawElementsInstancedBaseVertex,ARB,(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei primcount, GLint basevertex));
++
++/* Xbox (RampageRE): the application is about to draw arrays that are already in GPU memory straight
++ * through the backend (nxdk-gles11 gliDirectDraw), without glDrawElements. What a draw here does
++ * first is done for it: a pending batch is flushed and the texture units are realized, so the
++ * backend has the state the application set. Returns 0 when the draw needs this library after
++ * all, and the application then draws through glDrawElements: a display list is being compiled,
++ * unit 0's texture wants its coordinates changed (a non power of two texture, a texture matrix
++ * this library applies itself), or another unit is in use. */
++int gl4es_xbox_predraw(void)
++{
++    if (glstate->list.pending)
++        gl4es_flush();
++    if (glstate->list.active || glstate->render_mode == GL_SELECT || glstate->polygon_mode == GL_POINT)
++        return 0;
++    if (glstate->raster.bm_drawing)
++        bitmap_flush();
++    realize_textures(1);
++    const GLint itarget = get_target(glstate->enable.texture[0]);
++    if (itarget >= 0) {
++        if (!IS_TEX2D(glstate->enable.texture[0]) && IS_ANYTEX(glstate->enable.texture[0]))
++            return 0;
++        if (tex_setup_needchange(itarget))
++            return 0;
++    }
++    for (int aa = 1; aa < hardext.maxtex; aa++)
++        if (get_target(glstate->enable.texture[aa]) >= 0)
++            return 0;
++    return 1;
++}
