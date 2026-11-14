@@ -1,0 +1,22 @@
+--- a/gles_xbox_direct.c
++++ b/gles_xbox_direct.c
+@@ -451,6 +451,11 @@
+     pb = xgu_set_transform_program_start(pb, four ? SKIN_N2 : 0);
+     pb = xgu_set_transform_execution_mode(pb, XGU_PROGRAM, XGU_RANGE_MODE_PRIVATE);
+     pb = xgu_set_transform_program_cxt_write_enable(pb, false);
++    /* The program lights the vertices itself. On a real NV2A the fixed-function lighting stage, left enabled,
++     * still runs behind a vertex program and replaces its colours with what it makes of state it was never given:
++     * each skinned model came out black one frame and washed out the next (seen on a console; xemu ignores the
++     * enable in program mode). Direct3D switches it off whenever a vertex shader is set; so does this. */
++    pb = xgu_set_lighting_enable(pb, false);
+     pb = direct_common_arrays(pb, c, pos, nrm, uv, col);
+     pb = xgu_set_vertex_data_array_format(pb, XGU_TEXCOORD1_ARRAY, XGU_SHORT, 4, 4 * sizeof(int16_t));
+     pb = xgu_set_vertex_data_array_offset(pb, XGU_TEXCOORD1_ARRAY, (const void *)((uintptr_t)bone & 0x03FFFFFFu));
+@@ -460,6 +465,7 @@
+     direct_elements16(idx, (unsigned int)count);
+     pb = pb_begin();                /* the fixed-function pipeline again, the two extra arrays off */
+     pb = xgu_set_transform_execution_mode(pb, XGU_FIXED, XGU_RANGE_MODE_PRIVATE);
++    pb = xgu_set_lighting_enable(pb, lit ? true : false);   /* (as the fixed-function state has it) */
+     pb = direct_attrib_off(pb, XGU_TEXCOORD1_ARRAY);
+     pb = direct_attrib_off(pb, XGU_TEXCOORD2_ARRAY);
+     pb_end(pb);

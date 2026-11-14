@@ -1085,9 +1085,37 @@ static void try_exact_palette(Renderer *r)
 
 #ifdef RAMPAGE_XBOX
 int g_xbox_direct_p8 = 1;                /* --xoff p8: every texture expanded to full colour first, as before */
+int g_xbox_p8_mips = 1;                  /* the 8-bit world textures with their smaller levels (--xoff mips: without).
+                                          * The studio's Xbox build has full chains; without them the GPU reads a
+                                          * whole 256 x 256 texture for a wall a few pixels high */
+/* test builds' --xskip N: kinds of drawing left out, to measure on a console what each costs. 1 the sky, 2 the
+ * street, 4 the opaque batches, 8 the blended batches, 16 the items of the main pass, 32 the effects, 64 the HUD,
+ * 128 the shadows, 256 the water, 512 the main pass's skinned items, 1024 its others. Always 0 in a normal build. */
+int g_xbox_skip;
+#ifdef RAMPAGE_XBOX_TEST_ARGS
+#define XSKIP(bit) (g_xbox_skip & (bit))
+#else
+#define XSKIP(bit) 0
+#endif
+/* How much of the picture the world's effects may blend over in one frame before draw_fx thins them, in hundredths
+ * of a 1280 x 720 screen (--xfxbudget N; 0: never thinned). Measured on a console at 1280 x 720 (four monsters, Las
+ * Vegas, 34 windows of 5 s): a frame takes 27.2 ms + 2.5 ms for each screen the effects cover, and they cover 2 to 9
+ * (a single frame up to 28) while buildings come down. 200 keeps such a frame near 32 ms. At 640 x 480 the same
+ * number of pixels is six screens. */
+int g_xbox_fx_budget = 200;
+/* Above 480 lines the budget follows the frame: what the rest of the frame takes is measured (the frame's time less
+ * FX_SCREEN_MS for each screen of effects drawn in it, averaged over about a second), and the effects get what is
+ * left of g_xbox_fx_frame_ms (--xfxframe N; 0: the fixed budget), between 0.4 and 1.5 of g_xbox_fx_budget. A street
+ * that alone takes 31 ms leaves them under a screen, one that takes 26 over two. Not at 480 lines, where the frame's
+ * time is the game's own work and thinner smoke would buy nothing. */
+int g_xbox_fx_frame_ms = 32;
+#define FX_SCREEN_MS 2.5f                /* a screen of blended effects at 1280 x 720 on a console's GPU (measured) */
+int g_xbox_sky_late = 1;                 /* the sky after the street and the batched buildings, behind them by the
+                                          * depth test (--xoff skylate: first, over the whole screen, as the PS2) */
 #endif
 #if defined(RAMPAGE_XBOX) && defined(RAMPAGE_XBOX_EXACT_PALETTE)
-extern GLboolean gliTexturePalette8(GLsizei width, GLsizei height, const GLubyte *indices, const GLubyte *palette_rgba);
+extern GLboolean gliTexturePalette8(GLsizei width, GLsizei height, const GLubyte *indices, const GLubyte *palette_rgba,
+                                    GLboolean mips);
 
 /* The PS2's world textures are 8-bit with a palette, and that is what the Xbox's GPU stores them as. They used to
  * go there the long way round: expanded to full colour, uploaded, then (try_exact_palette) the GPU waited for, the
@@ -1119,7 +1147,7 @@ static GLuint xbox_texture_p8(Renderer *r, const Bundle *b, uint32_t name)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
     /* the image's size and format for gl4es and the driver, no pixels; then the storage itself */
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-    GLboolean ok = gliTexturePalette8(w, h, index, &pal[0][0]);
+    GLboolean ok = gliTexturePalette8(w, h, index, &pal[0][0], g_xbox_p8_mips ? GL_TRUE : GL_FALSE);
     free(index);
     if (!ok) {                                       /* (no memory, or not the storage expected: the ordinary way) */
         glDeleteTextures(1, &id);
@@ -2118,7 +2146,7 @@ static void bat_frame(Renderer *r, double t)
                     b->failed = 0;
                 }
             }
-            if (b->nidx && !bg->key.blend)
+            if (b->nidx && !bg->key.blend && !XSKIP(4))
                 bat_draw(r, &bg->key, b);
         }
     }
@@ -2132,6 +2160,8 @@ static void bat_frame(Renderer *r, double t)
  * lie on walls that are there by now; among themselves they are drawn in no particular order, as the parts were */
 static void bat_draw_blended(Renderer *r)
 {
+    if (XSKIP(8))
+        return;
     for (uint32_t g = 0; g < r->nbgroup; g++) {
         BatGroup *bg = &r->bgroup[g];
         if (!bg->key.blend)
@@ -3293,6 +3323,10 @@ static void draw_part(Renderer *r, const SceneMesh *sm, const Skin *skin, uint32
  * 0x50002), texture flags 0x11 (bit 0: CLAMP_1 REPEAT on S and T, 0x26AA20) */
 static void draw_water(Renderer *r, const Scene *s, const Camera *cam)
 {
+#ifdef RAMPAGE_XBOX
+    if (XSKIP(256))
+        return;
+#endif
     XS_END();
     float *uv = r->water_uv;
     glDisable(GL_LIGHTING);
@@ -3586,6 +3620,10 @@ static void draw_hud(Renderer *r, const Scene *s, int width, int height, double 
  * the game, drawn before the monster; here the monster is already drawn) */
 static void draw_shadows(Renderer *r, int pass)
 {
+#ifdef RAMPAGE_XBOX
+    if (XSKIP(128))
+        return;
+#endif
     XS_END();
     const Scene *s = r->scene;
     const ShadowList *l = s->shadows;
@@ -3668,9 +3706,116 @@ static void draw_shadows(Renderer *r, int pass)
  * the 287 effects have one, and none shows through the buildings there [G: the game's effects drawn in the world's
  * order, the draw not traced]. Here it is tested at its depth pulled towards the eye by its size, so what it starts
  * in (the car, the street under it) does not cut it */
+#ifdef RAMPAGE_XBOX
+/* draw_fx's thinning (g_xbox_fx_budget). Two quads that are one particle drawn again (fx.c: int.multiple_render). */
+static inline int fx_same(const FxQuad *a, const FxQuad *b)
+{
+    return a->tex == b->tex && a->b == b->b && a->additive == b->additive && a->ztest == b->ztest &&
+           memcmp(a, b, offsetof(FxQuad, b)) == 0;
+}
+
+/* The share of the screen a quad covers, near enough: its box about its middle, cut at the screen's edges. M the
+ * view matrix, px and py the projection's two scales. */
+static float fx_share(const FxQuad *q, const float *M, float px, float py)
+{
+    float ex = M[0] * q->pos[0] + M[4] * q->pos[1] + M[8] * q->pos[2] + M[12];
+    float ey = M[1] * q->pos[0] + M[5] * q->pos[1] + M[9] * q->pos[2] + M[13];
+    float ez = -(M[2] * q->pos[0] + M[6] * q->pos[1] + M[10] * q->pos[2] + M[14]);
+    float hw, hh, fill = 1;                                /* half the box in the camera's plane; how much of it is quad */
+    if (q->kind == FXQ_BILLBOARD) {
+        if (ez < 0.1f)
+            return 0;                                      /* (behind the camera: all of it) */
+        hw = q->size[0] * 0.5f;
+        hh = q->size[1] * 0.5f;
+    } else {
+        const float *a = q->axis[0], *b = q->axis[1];
+        float ax = fabsf(M[0] * a[0] + M[4] * a[1] + M[8] * a[2]), ay = fabsf(M[1] * a[0] + M[5] * a[1] + M[9] * a[2]);
+        if (q->kind == FXQ_FLAT) {
+            hw = ax + fabsf(M[0] * b[0] + M[4] * b[1] + M[8] * b[2]);
+            hh = ay + fabsf(M[1] * b[0] + M[5] * b[1] + M[9] * b[2]);
+        } else {                                           /* a streak: its length by its width, in a box that holds it */
+            float w = q->size[1] * 0.5f, len = sqrtf(ax * ax + ay * ay);
+            hw = ax + w;
+            hh = ay + w;
+            fill = hw * hh > 0 ? (len + w) * w / (hw * hh) : 0;
+            if (fill > 1)
+                fill = 1;
+        }
+        if (ez < 0.1f)
+            ez = 0.1f;                                     /* (through the camera's plane: as large as the screen lets it) */
+    }
+    float k = 1 / ez, cx = px * ex * k, cy = py * ey * k, sw = px * hw * k, sh = py * hh * k;
+    float x0 = cx - sw, x1 = cx + sw, y0 = cy - sh, y1 = cy + sh;
+    if (x0 < -1) x0 = -1;
+    if (x1 > 1) x1 = 1;
+    if (y0 < -1) y0 = -1;
+    if (y1 > 1) y1 = 1;
+    return x1 > x0 && y1 > y0 ? (x1 - x0) * (y1 - y0) * 0.25f * fill : 0;
+}
+
+/* 1 - (1 - a)^n, n >= 1: the alpha of one quad that hides what n quads of alpha a over each other hide (between
+ * whole n, the straight line). */
+static inline float fx_denser(float a, float n)
+{
+    if (a >= 1)
+        return 1;
+    if (a <= 0)
+        return 0;
+    if (n > 64)
+        n = 64;
+    int whole = (int)n;
+    float left = 1 - a, p = left;
+    for (int i = 1; i < whole; i++)
+        p *= left;
+    return 1 - p * (1 - (n - (float)whole) * a);
+}
+#endif
+
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+/* test builds: how much of the picture the effects' quads cover (their overdraw is what a console's GPU pays for at
+ * 1280 x 720), by texture, for main.c's line every 5 s. In screens: 1.0 is every pixel blended once. */
+typedef struct { uint32_t tex; int add; float px; unsigned n; } FxStatTex;
+static struct {
+    unsigned frames, quads, faint, near, merged;
+    float px, big, peak, asked, keep, budget, rest;
+    FxStatTex t[24];
+} fxs;
+void rnd_fx_stats(char *out, size_t cap)
+{
+    float f = fxs.frames ? 1.0f / fxs.frames : 0;
+    int n = snprintf(out, cap, "quads=%.0f screens=%.2f big=%.2f peak=%.2f faint=%.0f near=%.1f asked=%.2f keep=%.2f "
+                     "merged=%.0f budget=%.2f rest_ms=%.1f", fxs.quads * f, fxs.px * f, fxs.big * f, fxs.peak,
+                     fxs.faint * f, fxs.near * f, fxs.asked * f, fxs.keep * f, fxs.merged * f, fxs.budget * f, fxs.rest);
+    for (int pick = 0; pick < 6 && n > 0 && (size_t)n < cap; pick++) {
+        int best = -1;
+        for (int i = 0; i < 24; i++)
+            if (fxs.t[i].n && (best < 0 || fxs.t[i].px > fxs.t[best].px))
+                best = i;
+        if (best < 0)
+            break;
+        n += snprintf(out + n, cap - n, " %08lx%s:%.2f/%.0f", (unsigned long)fxs.t[best].tex, fxs.t[best].add ? "+" : "",
+                      fxs.t[best].px * f, fxs.t[best].n * f);
+        fxs.t[best].n = 0;
+    }
+    memset(&fxs, 0, sizeof fxs);
+}
+#endif
+
 static void draw_fx(Renderer *r, const FxQuad *fx, int nfx, const Camera *cam, float fog_start, float fog_end, int world)
 {
     XS_END();
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+    float fxs_pm[16], fxs_frame = 0;
+    {
+        float P[16], V[16];
+        glGetFloatv(GL_PROJECTION_MATRIX, P);
+        glGetFloatv(GL_MODELVIEW_MATRIX, V);
+        for (int c0 = 0; c0 < 4; c0++)
+            for (int r0 = 0; r0 < 4; r0++)
+                fxs_pm[c0 * 4 + r0] = P[r0] * V[c0 * 4] + P[4 + r0] * V[c0 * 4 + 1] + P[8 + r0] * V[c0 * 4 + 2] +
+                                      P[12 + r0] * V[c0 * 4 + 3];
+    }
+#endif
     float M[16];
     glGetFloatv(GL_MODELVIEW_MATRIX, M);
     float right[3] = { M[0], M[4], M[8] }, up[3] = { M[1], M[5], M[9] };
@@ -3688,10 +3833,73 @@ static void draw_fx(Renderer *r, const FxQuad *fx, int nfx, const Camera *cam, f
                                                             * looked up once, not for each of a thousand quads) */
     uint32_t last_tex = 0;
     GLuint last_id = 0;
+    /* The world's effects within what the GPU has time to blend (g_xbox_fx_budget). The game's smoke and dust are
+     * hundreds of soft quads over each other, sized for a PS2 that fills pixels several times faster than this
+     * console and had a third of the pixels of 1280 x 720; a building coming down covers the screen nine times over
+     * and the frame takes twice as long. When this frame's quads cover more than the budget, a share of the
+     * particles is left out, the same ones from frame to frame (FxQuad.key; those next to go are faded, so none
+     * pops), and the ones drawn are made as much denser as it takes to hide what all of them hid (fx_denser; an
+     * additive quad as much brighter). A particle the game draws several times over (int.multiple_render) is
+     * drawn once, denser the same way. Never under a fifth of them; back up slowly, down at once. */
+    int govern = world && g_xbox_fx_budget > 0;
+    float keep = 1;
+    if (govern) {
+        float P[16], total = 0;
+        glGetFloatv(GL_PROJECTION_MATRIX, P);
+        for (int i = 0; i < nfx; i++)
+            if (!i || !fx_same(&fx[i], &fx[i - 1]))
+                total += fx_share(&fx[i], M, P[0], P[5]);
+        float budget = (float)g_xbox_fx_budget * 0.01f * (1280.0f * 720.0f) /
+                       ((float)xbox_pixel_width() * (float)xbox_pixel_height());
+        static float keep_was = 1, rest_ms = 27.0f, drawn;
+        static double frame_at;
+        if (g_xbox_fx_frame_ms > 0 && xbox_pixel_height() > 480) {
+            double at = win_time();
+            float took = (float)((at - frame_at) * 1000.0);
+            frame_at = at;
+            if (took > 10.0f && took < 100.0f)             /* (not a load, nor the first frame) */
+                rest_ms += (took - FX_SCREEN_MS * drawn - rest_ms) * 0.05f;
+            float room = ((float)g_xbox_fx_frame_ms - rest_ms) / FX_SCREEN_MS;
+            budget = room < 0.4f * budget ? 0.4f * budget : room > 1.5f * budget ? 1.5f * budget : room;
+        }
+        float want = total > budget ? budget / total : 1;
+        if (want < 0.2f)
+            want = 0.2f;
+        keep = want < keep_was ? want : fminf(want, keep_was + 0.02f);
+        keep_was = keep;
+        drawn = total * keep;
+#ifdef RAMPAGE_XBOX_TEST_ARGS
+        fxs.asked += total;
+        fxs.keep += keep;
+        fxs.budget += budget;
+        fxs.rest = rest_ms;
+#endif
+    }
     qb_begin();
 #endif
     for (int i = 0; i < nfx; i++) {
         const FxQuad *q = &fx[i];
+#ifdef RAMPAGE_XBOX
+        float fx_weight = 1, fx_times = 1;                 /* (above) this quad's fade, and how many quads it stands for */
+        if (govern) {
+            int run = 1;
+            while (i + run < nfx && fx_same(&fx[i + run], q))
+                run++;
+            i += run - 1;
+            fx_times = (float)run;
+#ifdef RAMPAGE_XBOX_TEST_ARGS
+            fxs.merged += run - 1;
+#endif
+            if (keep < 1) {
+                float h = (float)q->key * (1.0f / 65536.0f);
+                if (h >= keep)
+                    continue;
+                if (h > 0.8f * keep)
+                    fx_weight = (keep - h) / (0.2f * keep);
+                fx_times /= 0.9f * keep;                   /* (the faded fifth counts for half) */
+            }
+        }
+#endif
 #ifdef RAMPAGE_XBOX
         GLuint id = 0;
         if (q->b) {
@@ -3816,8 +4024,28 @@ static void draw_fx(Renderer *r, const FxQuad *fx, int nfx, const Camera *cam, f
                 f = (fog_end - d) * fog_k;
                 f = f < 0 ? 0 : f > 1 ? 1 : f;
             }
-            a[k] = q->col[3] * f;
+            a[k] = f;
         }
+        float qa = q->col[3];
+        const float *qcol = q->col;
+#ifdef RAMPAGE_XBOX
+        float denser[3];
+        if (fx_times > 1) {
+            if (q->additive) {                             /* (added: n quads are one n times as bright) */
+                qa *= fx_times;
+                if (qa > 1) {
+                    for (int k = 0; k < 3; k++)
+                        denser[k] = fminf(q->col[k] * qa, 1.0f);
+                    qcol = denser;
+                    qa = 1;
+                }
+            } else
+                qa = fx_denser(qa, fx_times);
+        }
+        qa *= fx_weight;
+#endif
+        for (int k = 0; k < 4; k++)
+            a[k] *= qa;
         if (world && !q->ztest) {                          /* (above: tested in front of what it starts in) */
             float pull = 0;
             for (int k = 0; k < 4; k++) {                  /* (the farthest corner: one root, of the largest square) */
@@ -3833,14 +4061,60 @@ static void draw_fx(Renderer *r, const FxQuad *fx, int nfx, const Camera *cam, f
             }
         }
         static const int UV[4][2] = { { 0, 1 }, { 2, 1 }, { 2, 3 }, { 0, 3 } };
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+        if (world) {                                       /* (above: the share of the screen this quad covers) */
+            float sx[4], sy[4], share = 0;
+            int front = 1;
+            for (int k = 0; k < 4 && front; k++) {
+                const float *m = fxs_pm;
+                float cw = m[3] * c[k][0] + m[7] * c[k][1] + m[11] * c[k][2] + m[15];
+                if (cw <= 0.05f) { front = 0; break; }
+                sx[k] = (m[0] * c[k][0] + m[4] * c[k][1] + m[8] * c[k][2] + m[12]) / cw;
+                sy[k] = (m[1] * c[k][0] + m[5] * c[k][1] + m[9] * c[k][2] + m[13]) / cw;
+            }
+            if (!front) {
+                share = 0.5f;                              /* (through the camera's plane: counted as half a screen) */
+                fxs.near++;
+            } else {
+                float area = 0, x0 = sx[0], x1 = sx[0], y0 = sy[0], y1 = sy[0];
+                for (int k = 0; k < 4; k++) {
+                    int j = (k + 1) & 3;
+                    area += sx[k] * sy[j] - sx[j] * sy[k];
+                    if (sx[k] < x0) x0 = sx[k];
+                    if (sx[k] > x1) x1 = sx[k];
+                    if (sy[k] < y0) y0 = sy[k];
+                    if (sy[k] > y1) y1 = sy[k];
+                }
+                area = fabsf(area) * 0.5f;
+                float box = (x1 - x0) * (y1 - y0);
+                float cx0 = x0 < -1 ? -1 : x0, cx1 = x1 > 1 ? 1 : x1, cy0 = y0 < -1 ? -1 : y0, cy1 = y1 > 1 ? 1 : y1;
+                if (box > 0 && cx1 > cx0 && cy1 > cy0)
+                    share = area * ((cx1 - cx0) * (cy1 - cy0) / box) * 0.25f;
+            }
+            fxs.quads++;
+            if (a[0] <= 8 / 255.0f && a[1] <= 8 / 255.0f && a[2] <= 8 / 255.0f && a[3] <= 8 / 255.0f)
+                fxs.faint++;
+            fxs.px += share;
+            fxs_frame += share;
+            if (share > 1 / 16.0f)
+                fxs.big += share;
+            int slot = 0;
+            while (slot < 23 && fxs.t[slot].n && (fxs.t[slot].tex != q->tex || fxs.t[slot].add != (q->additive != 0)))
+                slot++;
+            fxs.t[slot].tex = q->tex;
+            fxs.t[slot].add = q->additive != 0;
+            fxs.t[slot].px += share;
+            fxs.t[slot].n++;
+        }
+#endif
 #ifdef RAMPAGE_XBOX
         for (int k = 0; k < 4; k++)
-            qb_vertex(k, c[k][0], c[k][1], c[k][2], q->uv[UV[k][0]], q->uv[UV[k][1]], q->col, a[k]);
+            qb_vertex(k, c[k][0], c[k][1], c[k][2], q->uv[UV[k][0]], q->uv[UV[k][1]], qcol, a[k]);
         qb_next();
 #else
         glBegin(GL_QUADS);
         for (int k = 0; k < 4; k++) {
-            glColor4f(q->col[0], q->col[1], q->col[2], a[k]);
+            glColor4f(qcol[0], qcol[1], qcol[2], a[k]);
             glTexCoord2f(q->uv[UV[k][0]], q->uv[UV[k][1]]);
             glVertex3fv(c[k]);
         }
@@ -3850,6 +4124,13 @@ static void draw_fx(Renderer *r, const FxQuad *fx, int nfx, const Camera *cam, f
 #ifdef RAMPAGE_XBOX
     qb_end();
     XS_TEXTURE_BOUND();
+#endif
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+    if (world) {
+        fxs.frames++;
+        if (fxs_frame > fxs.peak)
+            fxs.peak = fxs_frame;
+    }
 #endif
     glDisable(GL_POLYGON_OFFSET_FILL);
     if (fogged)
@@ -3950,7 +4231,50 @@ void rnd_frame(Renderer *r, const Window *w, const Camera *cam, double t, int fo
     /* the sky first, around the camera (0x2A53E0): x 0.01 at the camera's (x, y, 0.99 z), the depth test off
      * (GS TEST 0x31001) and no fog (PRIM.FGE cleared for its state 0xB), so it is a background that nothing shows
      * through and that hides nothing */
-    if (s->sky >= 0) {
+#ifdef RAMPAGE_XBOX
+    /* The sky after the street and the batched buildings (below), which needs it behind them by its depth. The game
+     * draws it a hundredth of its size about a point just under the camera with the depth test off; the same
+     * picture comes from any size k drawn about (camera x, camera y, camera z (1 - k)): every point of it stays in
+     * the same direction from the camera. So it is drawn large, its farthest point 2,700 units away (the far plane
+     * is at 3,000), with the ordinary depth test. Not when its nearest point would then be closer than 1,200 units
+     * (a sky that is not a dome about the camera): first and untested, as before. */
+    float sky_k = 0;
+    if (g_xbox_sky_late && s->sky >= 0) {
+        float dmin = 1e30f, dmax = 0;
+        for (uint32_t i = 0; i < s->nitems; i++) {
+            const DrawItem *it = &s->items[i];
+            if (it->instance != s->sky || it->skin || it->mesh >= s->nmeshes)
+                continue;
+            const Mesh *m = &s->meshes[it->mesh].mesh;
+            const float *W = it->world.m;
+            for (uint32_t q = 0; q < m->nparts; q++)
+                for (uint32_t v = 0; v < m->parts[q].nverts; v++) {
+                    const float *a = m->parts[q].pos + 3 * v;
+                    float x = W[0] * a[0] + W[4] * a[1] + W[8] * a[2] + W[12];
+                    float y = W[1] * a[0] + W[5] * a[1] + W[9] * a[2] + W[13];
+                    float z = W[2] * a[0] + W[6] * a[1] + W[10] * a[2] + W[14] - cam->pos[2];
+                    float d = x * x + y * y + z * z;
+                    if (d < dmin) dmin = d;
+                    if (d > dmax) dmax = d;
+                }
+        }
+        if (dmax > 0) {
+            float k = 2700.0f / sqrtf(dmax);
+            if (k * sqrtf(dmin) >= 1200.0f)
+                sky_k = k;
+        }
+    }
+    int sky_late = sky_k > 0;
+#else
+    int sky_late = 0;
+#endif
+#ifdef RAMPAGE_XBOX
+    if (XSKIP(1))
+        sky_late = 0;
+    if (s->sky >= 0 && !sky_late && !XSKIP(1)) {
+#else
+    if (s->sky >= 0 && !sky_late) {
+#endif
         glDisable(GL_DEPTH_TEST);
         glDepthMask(GL_FALSE);
         glDisable(GL_FOG);
@@ -4000,6 +4324,34 @@ void rnd_frame(Renderer *r, const Window *w, const Camera *cam, double t, int fo
             memcpy(r->bat_amb, amb, sizeof r->bat_amb);
             r->bat_own = 0;
             bat_frame(r, t);
+            if (sky_late) {
+                /* The sky now, not first. Drawn first it is a textured fill of the whole screen that the street and
+                 * the buildings then cover almost entirely: at 1280 x 720 close to a million pixels a frame the
+                 * console's GPU has no time for. Here it is drawn after the street and the batched buildings, at
+                 * its distance (sky_k, above) and tested against what is there, so it costs only where it shows;
+                 * its depth is still not written, and what comes after (monsters, people, the blended parts, the
+                 * effects) is drawn over it as before. */
+                glLoadMatrixf(view_mv);
+                glDepthMask(GL_FALSE);
+                glDisable(GL_FOG);
+                for (uint32_t i = 0; i < s->nitems; i++) {
+                    const DrawItem *it = &s->items[i];
+                    if (it->instance != s->sky)
+                        continue;
+                    glPushMatrix();
+                    glTranslatef(cam->pos[0], cam->pos[1], (1.0f - sky_k) * cam->pos[2]);
+                    glScalef(sky_k, sky_k, sky_k);
+                    glMultMatrixf(it->world.m);
+                    draw_mesh(r, &s->meshes[it->mesh], it->skin, t);
+                    glPopMatrix();
+                }
+                XS_END();
+                glDepthMask(GL_TRUE);
+                if (fogged)
+                    glEnable(GL_FOG);
+                glLoadMatrixf(view_mv);
+                xbox_mv_loaded = 0;
+            }
         }
 #endif
         for (uint32_t i = 0; i < s->nitems; i++) {
@@ -4007,6 +4359,10 @@ void rnd_frame(Renderer *r, const Window *w, const Camera *cam, double t, int fo
             const Instance *in = &s->instances[it->instance];
             if (in->hidden || it->instance == s->sky || (it->instance == s->ground_inst) != !pass)
                 continue;
+#ifdef RAMPAGE_XBOX
+            if (XSKIP(pass ? 16 : 2) || (pass && XSKIP(it->skin ? 512 : 1024)))
+                continue;
+#endif
 #ifdef RAMPAGE_XBOX
             int seen = pass && i < g_xbox_item_seen_n ? g_xbox_item_seen[i] : item_seen(r, it, view_mv, tx, ty);
             if (i < g_xbox_item_seen_n)
@@ -4134,7 +4490,11 @@ void rnd_frame(Renderer *r, const Window *w, const Camera *cam, double t, int fo
     glDisableClientState(GL_TEXTURE_COORD_ARRAY);
     glDisableClientState(GL_COLOR_ARRAY);
     glDisable(GL_CULL_FACE);
-    if (s->nfx)                                            /* the effects' particles, over the world */
+#ifdef RAMPAGE_XBOX
+    if (s->nfx && !XSKIP(32))
+#else
+    if (s->nfx)
+#endif                                            /* the effects' particles, over the world */
         draw_fx(r, s->fx, s->nfx, cam, fogged ? fog_near : 0, fogged ? fog_far : 0, 1);
     if (s->nspheres) {                                     /* the overlay: three great circles per sphere */
         glDisable(GL_LIGHTING);
@@ -4160,6 +4520,10 @@ void rnd_frame(Renderer *r, const Window *w, const Camera *cam, double t, int fo
         glColor3f(1, 1, 1);
     }
     postfx_end();                                          /* the HUD (and the shell's 3D layers in it) stay sharp */
+#ifdef RAMPAGE_XBOX
+    if (s->nhud && !XSKIP(64))
+#else
     if (s->nhud)
+#endif
         draw_hud(r, s, w->width, w->height, t);
 }

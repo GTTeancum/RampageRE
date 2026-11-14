@@ -9487,12 +9487,26 @@ static int viewer_main(int argc, char **argv)
             else if (!strcmp(n, "rigid")) g_xbox_rigid = 0;
             else if (!strcmp(n, "twobuf")) { extern int g_xbox_two_buffers; g_xbox_two_buffers = 0; }
             else if (!strcmp(n, "p8")) { extern int g_xbox_direct_p8; g_xbox_direct_p8 = 0; }
+            else if (!strcmp(n, "mips")) { extern int g_xbox_p8_mips; g_xbox_p8_mips = 0; }
+            else if (!strcmp(n, "skylate")) { extern int g_xbox_sky_late; g_xbox_sky_late = 0; }
             else if (!strcmp(n, "batpace")) { extern int g_xbox_batch_pace; g_xbox_batch_pace = 0; }
             else if (!strcmp(n, "meshdrop")) { extern int g_xbox_mesh_drop; g_xbox_mesh_drop = 0; }
             else if (!strcmp(n, "longpb")) { extern int g_xbox_long_pushbuffer; g_xbox_long_pushbuffer = 0; }
             else if (!strcmp(n, "texdrop")) { extern int g_xbox_tex_drop; g_xbox_tex_drop = 0; }
             else if (!strcmp(n, "glyphs")) { extern int g_xbox_glyphs; g_xbox_glyphs = 0; }
             printf("xbox test switch off: %s\n", n);
+        }
+        else if (strcmp(argv[i], "--xfxbudget") == 0 && i + 1 < argc) {  /* (render_gl.c g_xbox_fx_budget) */
+            extern int g_xbox_fx_budget;
+            g_xbox_fx_budget = atoi(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--xfxframe") == 0 && i + 1 < argc) {   /* (render_gl.c g_xbox_fx_frame_ms) */
+            extern int g_xbox_fx_frame_ms;
+            g_xbox_fx_frame_ms = atoi(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--xskip") == 0 && i + 1 < argc) {  /* (test builds: render_gl.c g_xbox_skip) */
+            extern int g_xbox_skip;
+            g_xbox_skip = atoi(argv[++i]);
         }
         else if (strcmp(argv[i], "--xvideo") == 0 && i + 1 < argc) { /* the picture, whatever the dashboard says: 480
                                                       * (4:3), 481 (480 lines drawn for a 16:9 screen), 720 */
@@ -9503,6 +9517,7 @@ static int viewer_main(int argc, char **argv)
             extern int g_xbox_sound_preload;
             const char *n = argv[++i];
             if (!strcmp(n, "sndpre")) g_xbox_sound_preload = 1;
+            else if (!strcmp(n, "twobuf")) { extern int g_xbox_two_buffers; g_xbox_two_buffers = 1; }
             printf("xbox test switch on: %s\n", n);
         }
 #endif
@@ -10379,6 +10394,12 @@ leave_world:
                     printf("xbox textures images=%lu asked_kb=%lu held_kb=%lu\n", (unsigned long)tm[1],
                            (unsigned long)(tm[2] / 1024), (unsigned long)(tm[3] / 1024));
                 }
+                {                                    /* what the effects covered (render_gl.c rnd_fx_stats) */
+                    extern void rnd_fx_stats(char *out, size_t cap);
+                    char line[400];
+                    rnd_fx_stats(line, sizeof line);
+                    printf("xbox fx %s\n", line);
+                }
                 {                                    /* the most one frame staged (of the 2 MiB arena's two frames) */
                     extern volatile uint32_t gli_staging_peak;
                     printf("xbox staging frame_peak_kb=%lu\n", (unsigned long)(gli_staging_peak / 1024));
@@ -10444,13 +10465,27 @@ int main(int argc, char **argv)                      /* (Android: SDL_main, andr
     /* Test builds only (CMake RAMPAGE_XBOX_TEST_ARGS): an XBE gets no command line, so a fixed one is built in,
      * e.g. "Chicago 1 --players 4 --autoplay --ap-seed 1". Space separated, no quoting. */
     static char test_line[] = RAMPAGE_XBOX_TEST_ARGS;
-    static char *test_argv[32];
+    static char *test_argv[64];
     int test_argc = 0;
     test_argv[test_argc++] = argc > 0 ? argv[0] : "default.xbe";
     for (char *p = strtok(test_line, " "); p && test_argc < 31; p = strtok(NULL, " "))
         test_argv[test_argc++] = p;
-    test_argv[test_argc] = NULL;
     printf("xbox test command line: %s\n", RAMPAGE_XBOX_TEST_ARGS);
+    {   /* and the words of E:\UDATA\RampageRE\xbox_args.txt after them (as the normal build's, below): one test
+         * build then runs every picture mode and switch on a console, by copying a text file to it */
+        static char more_text[512];
+        plat_xbox_home();
+        FILE *more = fopen("E:\\UDATA\\RampageRE\\xbox_args.txt", "rb");
+        if (more) {
+            size_t got = fread(more_text, 1, sizeof more_text - 1, more);
+            fclose(more);
+            more_text[got] = 0;
+            printf("xbox test command line, from xbox_args.txt: %s\n", more_text);
+            for (char *p = strtok(more_text, " \t\r\n"); p && test_argc < 63; p = strtok(NULL, " \t\r\n"))
+                test_argv[test_argc++] = p;
+        }
+    }
+    test_argv[test_argc] = NULL;
     return viewer_main(test_argc, test_argv);
 #elif defined RAMPAGE_XBOX
     /* The console gives an XBE no command line. A text file in the game's save folder stands in for one, so a path

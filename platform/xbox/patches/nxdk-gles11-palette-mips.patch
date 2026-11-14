@@ -1,0 +1,82 @@
+--- a/gles_texture.c
++++ b/gles_texture.c
+@@ -1655,7 +1655,8 @@
+  * The caller has just given the texture an empty full-colour image of that size (glTexImage2D with no pixels) and
+  * has not drawn with it, so nothing the GPU was sent refers to the storage replaced here. GL_FALSE leaves the
+  * texture as it was (the caller uploads full colour). */
+-GLboolean gliTexturePalette8(GLsizei width, GLsizei height, const GLubyte *indices, const GLubyte *palette_rgba)
++GLboolean gliTexturePalette8(GLsizei width, GLsizei height, const GLubyte *indices, const GLubyte *palette_rgba,
++                             GLboolean mips)
+ {
+     gli_context_t *context = gliGetContext();
+     GLuint unit = context->texture_environment.server_active_texture - GL_TEXTURE0;
+@@ -1668,11 +1669,58 @@
+         texture->data_width != width || texture->data_height != height || width > 4096 || height > 4096)
+         return GL_FALSE;
+     size_t count = (size_t)width * (size_t)height;
+-    size_t palette_offset = (count + 63u) & ~(size_t)63u;
++    /* With mips: every smaller level after the first, each swizzled on its own, as the GPU reads a chain
++     * (gliGenSwizzledMipmaps lays a full-colour one out the same way). A level's texel is one of the four it
++     * stands for: the one whose colour is nearest their average, so the palette stays the image's own. */
++    GLuint chain = (GLuint)count;
++    uint8_t levels = 1;
++    if (mips)
++        gliCalcMipmapChain((GLuint)width, (GLuint)height, 1, &chain, &levels);
++    size_t palette_offset = ((size_t)chain + 63u) & ~(size_t)63u;
+     size_t size = palette_offset + 1024;
+     GLubyte *data = MmAllocateContiguousMemoryEx(size, 0, 0x03FFAFFF, 0x1000, PAGE_READWRITE | PAGE_WRITECOMBINE);
+     if (!data) return GL_FALSE;
+     swizzle_rect(indices, (unsigned)width, (unsigned)height, data, (unsigned)width, 1);
++    if (levels > 1) {
++        GLubyte *level = GLI_MALLOC(count / 2u + 1u), *next = level ? level + count / 4u + 1u : NULL;
++        const GLubyte *src = indices;
++        GLubyte *at = data + count;
++        GLuint w = (GLuint)width, h = (GLuint)height;
++        if (!level) levels = 1;
++        while (levels > 1 && (w > 1 || h > 1)) {
++            GLuint nw = w > 1 ? w / 2 : 1, nh = h > 1 ? h / 2 : 1;
++            GLubyte *dst = src == level ? next : level;
++            for (GLuint y = 0; y < nh; y++) {
++                for (GLuint x = 0; x < nw; x++) {
++                    GLuint x1 = 2 * x + 1 < w ? 2 * x + 1 : 2 * x, y1 = 2 * y + 1 < h ? 2 * y + 1 : 2 * y;
++                    if (w == 1) x1 = 0;
++                    if (h == 1) y1 = 0;
++                    GLuint x0 = w == 1 ? 0 : 2 * x, y0 = h == 1 ? 0 : 2 * y;
++                    GLubyte q[4] = { src[y0 * w + x0], src[y0 * w + x1], src[y1 * w + x0], src[y1 * w + x1] };
++                    int sum[4] = { 0, 0, 0, 0 };
++                    for (int k = 0; k < 4; k++)
++                        for (int c = 0; c < 4; c++)
++                            sum[c] += palette_rgba[4u * q[k] + c];
++                    int best = 0, best_d = 0x7FFFFFFF;
++                    for (int k = 0; k < 4; k++) {
++                        int d = 0;
++                        for (int c = 0; c < 4; c++) {
++                            int e = 4 * palette_rgba[4u * q[k] + c] - sum[c];
++                            d += e * e;
++                        }
++                        if (d < best_d) { best_d = d; best = k; }
++                    }
++                    dst[y * nw + x] = q[best];
++                }
++            }
++            swizzle_rect(dst, nw, nh, at, nw, 1);
++            at += nw * nh;
++            src = dst;
++            w = nw;
++            h = nh;
++        }
++        if (level) GLI_FREE(level);
++    }
+     uint32_t *palette = (uint32_t *)(data + palette_offset);
+     for (unsigned i = 0; i < 256; ++i) {
+         const GLubyte *c = palette_rgba + 4u * i; /* stored as the GPU's A8R8G8B8 words */
+@@ -1687,6 +1735,9 @@
+     texture->pitch = texture->data_width;
+     texture->palette_offset = palette_offset;
+     texture->format = (XguTexFormatColor)NV097_SET_TEXTURE_FORMAT_COLOR_SZ_I8_A8R8G8B8;
++    texture->mipmap_levels = levels;
++    if (levels > 1)
++        object->min_filter = GL_LINEAR_MIPMAP_NEAREST; /* (the frontend above still believes GL_LINEAR) */
+     object->texture_object_dirty = GL_TRUE;
+     return GL_TRUE;
+ }

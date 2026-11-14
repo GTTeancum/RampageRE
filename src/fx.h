@@ -98,6 +98,8 @@ typedef struct {
     const Bundle *b;
     uint32_t tex;
     int additive, ztest;
+    uint16_t key;    /* the same for a particle as long as it lives, spread evenly over 0 .. 65535 (what a renderer
+                      * that must thin the quads chooses by: render_gl.c draw_fx on Xbox) */
 } FxQuad;
 /* the quads of every live particle, emitter by emitter, an emitter's particles by texture and the newest first (the
  * game's list order, 0x211970; it does not sort by depth); returns the count (at most max). XForm particles are not

@@ -2248,6 +2248,7 @@ static int quads_of(const FxWorld *w, int slot, FxQuad *out, int max)
             q->tex = ntex ? d->tex[p->tex] : 0;
             q->additive = additive;
             q->ztest = ztest;
+            q->key = (uint16_t)(((uint32_t)pi * 2654435761u) >> 16);
             for (int k = 1; k < repeat && n < max; k++)   /* int.multiple_render: drawn that many times */
                 out[n++] = *q;
             if (n >= max)

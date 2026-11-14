@@ -227,10 +227,25 @@ void plat_xbox_memory_tick(void)
     fflush(stdout);
 #endif
 }
+/* The console's audio processor (the MCPX APU, registers at 0xFE800000) belongs to whatever ran before: a dashboard
+ * or game that played sound through it. It mixes into pages of RAM it was told about, and this program never uses
+ * it (its sound goes to the AC97 interface directly), so nothing here would ever tell it to stop. A harness run
+ * launched over a running dashboard came up with five pages of its own code overwritten by six-channel sound
+ * frames and died on an illegal instruction. The voice processor's frame counter is switched off and both DSPs are
+ * put in reset before anything is allocated: the state a cold start leaves it in. */
+static void quiet_apu(void)
+{
+    volatile uint32_t *apu = (volatile uint32_t *)0xFE800000;
+    apu[0x2000 / 4] &= ~0x18u;                       /* NV_PAPU_SECTL: XCNTMODE off */
+    apu[0x3FFFC / 4] = 0;                            /* NV_PAPU_GPRST: the global processor and its DSP in reset */
+    apu[0x5FFFC / 4] &= ~2u;                         /* NV_PAPU_EPRST: the encode processor's DSP in reset */
+}
+
 void plat_xbox_home(void)
 {
     if (home_ready) return;
     home_ready = 1;
+    quiet_apu();
     if (!nxIsDriveMounted('E')) nxMountDrive('E', "\\Device\\Harddisk0\\Partition1");
     if (nxIsDriveMounted('E')) {
         CreateDirectoryA("E:\\UDATA", NULL);

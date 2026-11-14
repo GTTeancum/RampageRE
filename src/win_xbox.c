@@ -12,6 +12,7 @@
 #include <windows.h>
 #include <SDL.h>
 #include <hal/video.h>
+#include <xboxkrnl/xboxkrnl.h>
 #include <pbkit/pbkit.h>
 #include <GL/gl.h>
 #include <gl4esinit.h>
@@ -35,7 +36,10 @@ void gliStaticKeepFree(uint32_t bytes);   /* (nxdk-gles11-static-fit.patch) */
 static int context_live;
 int g_xbox_video;                        /* 0: by the dashboard's settings. A test build's --xvideo: 480 (4:3), 481
                                           * (480 drawn for a 16:9 screen), 720 */
-int g_xbox_two_buffers = 1;              /* 1280 x 720 with a front and one back buffer (--xoff twobuf: three) */
+int g_xbox_two_buffers;                  /* 1280 x 720 with a front and one back buffer (--xon twobuf). Off: with
+                                          * two buffers a frame that takes longer than a refresh interval waits
+                                          * for the next one, and a console's 1280 x 720 frame of 36 ms was shown
+                                          * at 20 a second instead of 26 */
 int g_xbox_long_pushbuffer = 1;          /* a 2 MiB push buffer, several frames long, as the game's own Xbox build has
                                           * (--xoff longpb: pbkit's 512 KiB, restarted and the GPU waited for every
                                           * frame) */
@@ -49,6 +53,47 @@ void xbox_gpu_idle(void)
 {
     if (!context_live) return;
     while (pb_busy()) NtYieldExecution();
+}
+
+/* pbkit puts the depth buffer in the screen XVideoSetMode allocates (pb_depth_on_boot_screen) only when that screen
+ * starts on a 16 KiB boundary, as the GPU's tiled surfaces must; XVideoSetMode asks for 4 KiB. The kernel hands out
+ * contiguous memory from the top of what is free, so a few pages taken first put the screen on the boundary: where
+ * the screen would land is tried, and the remainder to the boundary is kept as padding (12 KiB at most). On a real
+ * console the screen landed off the boundary and 1280 x 720 paid for a fourth screen, 3.5 MiB, that it does not
+ * have room for; in xemu it happened to land on it.
+ * Called before XVideoSetMode with the mode's size. The picture the last program left for the reboot is given back
+ * first, as XVideoSetMode itself does, so that it does not move the screen afterwards. */
+static void *boot_pad;
+static void boot_screen_align(int width, int height)
+{
+    if (boot_pad) {
+        MmFreeContiguousMemory(boot_pad);
+        boot_pad = NULL;
+    }
+    PVOID previous = AvGetSavedDataAddress();
+    if (previous) {
+        MmPersistContiguousMemory(previous, MmQueryAllocationSize(previous), FALSE);
+        MmFreeContiguousMemory(previous);
+        AvSetSavedDataAddress(NULL);
+    }
+    SIZE_T size = (SIZE_T)width * (SIZE_T)height * 4u;
+    void *probe = MmAllocateContiguousMemoryEx(size, 0, 0x7FFFFFFF, 0x1000, PAGE_READWRITE | PAGE_WRITECOMBINE);
+    if (!probe)
+        return;
+    SIZE_T off = (SIZE_T)((uintptr_t)probe & 0x3FFFu);
+    MmFreeContiguousMemory(probe);
+    if (off)
+        boot_pad = MmAllocateContiguousMemoryEx(off, 0, 0x7FFFFFFF, 0x1000, PAGE_READWRITE);
+}
+
+static unsigned long used_kb(void)
+{
+    MM_STATISTICS st;
+    memset(&st, 0, sizeof st);
+    st.Length = sizeof st;
+    if (!NT_SUCCESS(MmQueryStatistics(&st)) || st.AvailablePages > st.TotalPhysicalPages)
+        return 0;
+    return (unsigned long)(st.TotalPhysicalPages - st.AvailablePages) * 4ul;
 }
 
 static void APIENTRY_GL4ES framebuffer_size(int *width, int *height)
@@ -96,12 +141,18 @@ int win_open(Window *w, const char *title, int width, int height, int hidden)
         while (XVideoListModes(&vm, 32, REFRESH_DEFAULT, &at))
             if (vm.width == 1280 && vm.height == 720) want_720 = 1;
     }
+    unsigned long before_kb = used_kb();
+    if (want_720)
+        boot_screen_align(1280, 720);
     if (want_720 && XVideoSetMode(1280, 720, 32, REFRESH_DEFAULT)) {
         display_width = 1280;
         display_height = 720;
-    } else if (!XVideoSetMode(display_width, display_height, 32, REFRESH_DEFAULT)) {
-        fprintf(stderr, "Xbox: cannot set 640x480x32 display mode.\n");
-        return -1;
+    } else {
+        boot_screen_align(display_width, display_height);
+        if (!XVideoSetMode(display_width, display_height, 32, REFRESH_DEFAULT)) {
+            fprintf(stderr, "Xbox: cannot set 640x480x32 display mode.\n");
+            return -1;
+        }
     }
     if (display_height == 720 && g_xbox_two_buffers)
         pb_back_buffers(1);
@@ -110,13 +161,13 @@ int win_open(Window *w, const char *title, int width, int height, int hidden)
     pb_depth_on_boot_screen(1);
     /* The GPU draws a frame while the next is being sent: with pbkit's 512 KiB the buffer is restarted every frame,
      * and a restart waits for the GPU to finish everything first. */
-    if (g_xbox_long_pushbuffer)
-        gliPushbufferSize(2u * 1024u * 1024u);
+    if (g_xbox_long_pushbuffer)                      /* (1 MiB at 1280 x 720: the third screen buffer needs the room) */
+        gliPushbufferSize(display_height == 720 ? 1024u * 1024u : 2u * 1024u * 1024u);
     /* The GPU's store of static meshes stops growing when 8 MiB of RAM are left for what is loaded later. At
      * 1280 x 720 the frame buffers have taken 6 MiB more than at 640 x 480, and what is loaded later is the same:
-     * the reserve there is 5 MiB, so the store has room for the level's meshes. */
+     * the reserve there is 3.5 MiB, so the store has room for the level's meshes. */
     if (display_height == 720)
-        gliStaticKeepFree(5u * 1024u * 1024u);
+        gliStaticKeepFree(3u * 1024u * 1024u + 512u * 1024u);
     if (SDL_InitSubSystem(SDL_INIT_TIMER | SDL_INIT_EVENTS) != 0) {
         fprintf(stderr, "Xbox: SDL event/timer initialization failed: %s\n", SDL_GetError());
         return -1;
@@ -129,6 +180,8 @@ int win_open(Window *w, const char *title, int width, int height, int hidden)
     glContextInit(display_width, display_height);
     initialize_gl4es();
     context_live = 1;
+    fprintf(stdout, "Xbox video: screen at %p, display memory %lu KB (screens, depth, push buffer, staging)\n",
+            (void *)XVideoGetFB(), used_kb() - before_kb);
     glSwapInterval(1);
     int wide = g_xbox_video == 481 || (g_xbox_video != 480 && (XVideoGetEncoderSettings() & VIDEO_WIDESCREEN));
     logical_width = display_height == 720 ? display_width : wide ? 853 : display_width;

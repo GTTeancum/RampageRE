@@ -1,0 +1,53 @@
+--- a/nv2a_helper.c
++++ b/nv2a_helper.c
+@@ -55,8 +55,31 @@
+     gli_pushbuffer_restart_due = GL_FALSE;
+ }
+ 
++/* A finished frame is shown at a vertical blank. pbkit then hands out the next buffer to draw into without looking
++ * whether it is still the one on screen: with a front and one back buffer it always is until that blank, with two
++ * back buffers whenever frames are finished faster than the display shows them. Drawing into it is seen as
++ * tearing across the picture on a real console (an emulator presents whole frames and shows none). So before a
++ * frame's first clear or draw the buffer about to be drawn into must have left the screen; the CRT controller's
++ * start address says which buffer is shown. After the Perfect Dark Xbox port's nv2a_acquire_back_buffer.
++ * It waits blank by blank (the blank handler makes the swap), and never more than six of them: a swap that does
++ * not come is a torn frame, not a hang. */
++static GLboolean gli_back_buffer_unchecked; /* a frame was ended: the next buffer has not been looked at yet */
++
++void gliBackBufferAcquire(void)
++{
++    if (!gli_back_buffer_unchecked) return;
++    gli_back_buffer_unchecked = GL_FALSE;
++    uint32_t target = (uint32_t)(uintptr_t)pb_back_buffer() & 0x03FFFFFFu;
++    DWORD from = pb_get_vbl_counter();
++    while ((*(volatile uint32_t *)(0xFD000000u + 0x00600800u) & 0x03FFFFFFu) == target) { /* NV_PCRTC_START */
++        if ((DWORD)(pb_get_vbl_counter() - from) > 6u) break;
++        pb_wait_for_vbl();
++    }
++}
++
+ void gliPushbufferReserve(size_t bytes)
+ {
++    gliBackBufferAcquire();
+     extern void (*pb_room_hook)(void);
+     pb_room_hook = gli_pushbuffer_room;
+     uint32_t *put = pb_begin();
+@@ -143,6 +166,7 @@
+     while (pb_finished()) {
+         NtYieldExecution();
+     }
++    gli_back_buffer_unchecked = GL_TRUE;
+ 
+     // Reset bits that pb_finished changes
+     uint32_t *pb = pb_begin();
+--- a/gles_core.c
++++ b/gles_core.c
+@@ -494,6 +494,8 @@
+ 
+ GL_API void GL_APIENTRY glClear(GLbitfield mask)
+ {
++    extern void gliBackBufferAcquire(void);
++    gliBackBufferAcquire(); /* (the frame's first write to its buffer is usually this) */
+     gli_context_t *context = gliGetContext();
+ 
+     const uint32_t fmt_color = (context->current_surface_format & NV097_SET_SURFACE_FORMAT_COLOR) >> 0;

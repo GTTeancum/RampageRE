@@ -252,6 +252,124 @@ The batch rebuild is still the largest item inside the frame routine in the fram
 routine there); it now happens in fewer frames. Whether the 16:9 picture holds 60 and 1280x720 holds 30 is for a
 console to say.
 
+## On the console (2026-11-14)
+
+The first runs on real hardware: the test build (four computer-controlled monsters, King of the City in Las Vegas,
+five minutes) launched through the debug monitor, logs copied off, frames read out of the console's memory.
+Lowest / median / highest over 5-second windows:
+
+| Picture | Frame rate | Free RAM at worst | Notes |
+|---|---|---|---|
+| 640x480 4:3 | 38 / 47 / 59 | 13.9 MB | three screen buffers, with the scan-out guard |
+| 640x480 for a 16:9 screen | 36 / 45 / 57 | 14.5 MB | the same |
+| 1280x720, two buffers, no guard | 20 / 27 / 39 | 8.3 MB | heavy tearing on the television (the owner's report) |
+| 1280x720, two buffers, scan-out guard | 17 / 21 / 29 | 8.0 MB | a frame over 1/30 s waits for the next refresh: 20 a second |
+
+xemu had shown 35-60 in every mode: a real console is about half as fast as xemu on this PC at 640x480, and
+1280x720 costs the real GPU about 15 ms a frame that xemu does not charge.
+
+What the console showed that xemu could not:
+
+- **Tearing.** pbkit hands out the next buffer to draw into without looking whether it is on screen. With a front
+  and one back buffer it always is until the blank; the GPU-side wait written for that (`NV097_FLIP_STALL`) does
+  not hold the GPU back on real hardware. `gliBackBufferAcquire` (patches/nxdk-gles11-scanout-guard.patch, after
+  the Perfect Dark Xbox port's `nv2a_acquire_back_buffer`) waits, before a frame's first clear or draw, until the
+  buffer about to be drawn into has left the screen. A frame read out of memory never shows a tear: only the
+  television does.
+- **The depth buffer's screen.** `pb_depth_on_boot_screen` needs the screen `XVideoSetMode` allocates on a 16 KiB
+  boundary; on the console it was not, and 1280x720 paid 3.5 MB for a fourth screen (5 MB free, the vertex store
+  refused thousands of times). `win_xbox.c` `boot_screen_align` pads the allocation onto the boundary: 8 MB free,
+  no refusals.
+- **A crash at the first launch.** Launched over a running dashboard, the build died on an illegal instruction with
+  five 4 KiB pages of its own code overwritten by six-channel sound frames. Not seen again after a cold reboot.
+  The audio processor (MCPX APU) is suspected: this program never touches it, so `plat_xbox.c` `quiet_apu` now
+  switches its voice processor off and puts its DSPs in reset at startup. Unproven.
+- **Monsters flickering between black and washed out.** The fixed-function lighting stage, left enabled, still
+  runs behind a vertex program on a real NV2A and replaces the program's colours; xemu ignores the enable in
+  program mode. Found by switching the program's inputs off one at a time from `xbox_args.txt` on the console
+  (lighting, colour, normals, fog: none helped) and then the lighting enable (steady in twelve frames out of
+  twelve). `gliSkinDraw` now switches it off for its draw, as Direct3D does for any vertex shader
+  (patches/nxdk-gles11-skin-lighting-off.patch).
+- The game's save folder (`E:\UDATA\RampageRE` to the game) is `xV:\RampageRE` to the debug tools, whose own `xE:`
+  is another folder. `xbox_args.txt` there works (the 640x480 runs above were made with it).
+
+Where that leaves the targets: 640x480 4:3 holds above 30 on the console. The 16:9 picture is in the 40s, not 60.
+1280x720 without tearing is 20; it needs either frames under 1/30 s (the GPU's part of the frame is the cost
+there) or a third screen buffer (3.5 MB, of the 8 that are free).
+(Both were done: the section after this one.)
+
+## 1280x720 at 30 (2026-11-14, on the console)
+
+Same test (four computer-controlled monsters, Las Vegas), lowest / median / highest over 5-second windows outside
+the block loads:
+
+| Build | 1280x720 | Free RAM at worst |
+|---|---|---|
+| three screen buffers, scan-out guard | 23 / 26 / 33 | not noted |
+| + mip levels for the 8-bit textures, the sky drawn late | 20 / 27.6 / 41 | 4.8 MB |
+| + the effects thinned to a fixed two screens | 26.7 / 31.5 / 41.1 | 5.4 MB |
+| + the effects' budget following the frame | **30.1 / 32.0 / 41.4** | 4.2 MB |
+
+640x480 with the last build: 35 / 43 / 58 (as before, within what two runs differ by).
+
+What was written:
+
+- **Three screen buffers at 1280x720 by default** (`--xon twobuf` for two). With two, a frame over 1/30 s waits a
+  whole refresh for its buffer to leave the screen. The third costs 3.5 MB: the push buffer is 1 MiB at 720 lines
+  (2 MiB at 480), and the vertex store keeps 3.5 MiB free.
+- **Mip levels for the 8-bit textures** (patches/nxdk-gles11-palette-mips.patch; `--xoff mips`).
+- **The sky after the street and the batched buildings** (`--xoff skylate`), at its real distance and depth-tested,
+  so it is filled only where it shows. A first version that pushed it to the far plane with `glDepthRange` drew
+  nothing at all on the console.
+- **Test builds: `--xskip N`** leaves kinds of drawing out (render_gl.c `g_xbox_skip`), to measure on the console
+  what each costs.
+
+What each kind of drawing costs a 1280x720 frame on the console (first block, ms a frame; the frame is the GPU's
+there, so these are GPU costs; "nothing drawn" is the refresh, 17 ms):
+
+| Left out | Frame, ms | Saved |
+|---|---|---|
+| nothing | 36.5 | |
+| the effects | 27.5 | 9.0 |
+| the main pass's items | 30.2 | 6.3 (with the effects out too: 8.2, of which skinned 2.6, the others 5.0) |
+| the opaque batches | 33.2 | 3.3 |
+| the sky | 34.7 | 1.8 |
+| the blended batches | 34.9 | 1.6 |
+| the street | 35.3 | 1.2 |
+| the shadows | 35.3 | 1.2 |
+| the HUD | 36.2 | 0.3 |
+
+At 640x480 the effects cost 0.8 ms and the items 3.9: there the frame is the game's own work, and the GPU has
+time to spare.
+
+**The effects are the 1280x720 problem.** A test build logs how much of the screen the effects' quads cover
+(`xbox fx` lines). Over 34 windows: frame = 27.2 ms + 2.5 ms for each screen covered (correlation 0.92), and the
+smoke and dust of falling buildings cover 2 to 9 screens (one frame up to 28). The game's effects are hundreds
+of soft quads over each other, sized for a PS2 that fills several times faster and has a third of the pixels.
+Not blending the faintest texels (alpha reference 8/255) measured no gain.
+
+`draw_fx` now keeps the world's effects inside a budget (render_gl.c `g_xbox_fx_budget`, `--xfxbudget N` in
+hundredths of a 1280x720 screen, 0: off; default 200):
+
+- When a frame's quads would cover more, a share of the particles is left out: the same ones from frame to frame
+  (`FxQuad.key`, from the particle's slot), those next to go faded, never under a fifth drawn; the share comes
+  back slowly and drops at once.
+- The quads drawn are made denser by what it takes to hide what all of them hid (`fx_denser`: one quad of alpha
+  1 - (1 - a)^n for n of alpha a; an additive quad n times as bright).
+- A particle the game draws several times over (`int.multiple_render`) is drawn once, denser the same way.
+- Above 480 lines the budget follows the frame (`g_xbox_fx_frame_ms`, `--xfxframe N`, default 32, 0: the fixed
+  budget): what the rest of the frame takes is measured, and the effects get what is left of 32 ms, between 0.8
+  and 3 screens. The first block's street alone takes 31 ms and leaves them under a screen; later blocks take 23
+  to 26 and leave two to three.
+- At 640x480 the same pixel budget is six screens, which only the largest clouds reach.
+
+Seen in frames read off the console with the budget on and off: the dust and smoke of hits look the same. Not
+seen side by side: a whole building's cloud at its thickest (the two runs do not play alike), and anything that
+shows only in motion.
+
+What is left of a 1280x720 frame without effects is 27 ms; the unskinned items of the main pass (cars, debris,
+damaged buildings' own parts) are 5 ms of it and the next thing to look at.
+
 ### Not written
 
 - Building walls in fixed buffers rewritten one building a frame (the studio's design): the port's changed parts
