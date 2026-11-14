@@ -127,13 +127,115 @@ static int gx_decode(const BdpEntry *e, uint8_t **rgba, int *w_out, int *h_out)
     return 0;
 }
 
+static int ps2_decode(const Bundle *b, const BdpEntry *e, const uint8_t *px, uint8_t **rgba, int *w_out, int *h_out);
+
+/* an 8-bit texture's 256 colours as RGBA (d its header: the palette's name index at 0x20), 0 without one */
+static int ps2_palette(const Bundle *b, const uint8_t *d, uint8_t pal[256][4])
+{
+    uint32_t pal_name = rd32(d + 0x20);
+    const char *pn = bdp_name(b, pal_name);
+    const BdpEntry *pe = bdp_entry(b, pal_name);
+    if (strcmp(pn, "_Alpha8") == 0 || strcmp(pn, "_Intensity8") == 0) {
+        int alpha = pn[1] == 'A';
+        for (int i = 0; i < 256; i++) {
+            pal[i][0] = pal[i][1] = pal[i][2] = alpha ? 255 : (uint8_t)i;
+            pal[i][3] = alpha ? (uint8_t)i : 255;
+        }
+        return 1;
+    }
+    if (pe && pe->type == ET_PALETTE && pe->size2 >= 1024 && pe->data2) {
+        for (int i = 0; i < 256; i++) {          /* CSM1: entries 8-15 and 16-23 of each 32 swapped */
+            const uint8_t *c = pe->data2 + 4 * ((i & ~0x18) | ((i & 8) << 1) | ((i & 16) >> 1));
+            pal[i][0] = c[0]; pal[i][1] = c[1]; pal[i][2] = c[2]; pal[i][3] = alpha2(c[3]);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+#ifdef RAMPAGE_XBOX
+/* An 8-bit texture as it is stored: its indices in rows and its 256 colours, the pair tex_decode expands to RGBA.
+ * The Xbox's GPU takes exactly this (an 8-bit texture with a palette), so the renderer hands it over unexpanded.
+ * TEX_DECODE_OK: *index is a malloc'd width x height bytes. TEX_DECODE_ERROR for any texture that is not 8-bit
+ * (the caller decodes it as before), and for one with a replacement picture (texpack_xbox.c). */
+int tex_indexed(const Bundle *b, const BdpEntry *e, uint8_t **index, uint8_t pal[256][4], int *w_out, int *h_out)
+{
+    extern int xtp_find(const char *name);
+    if (!e || b->wii || e->type != ET_TEXTURE || e->size < 0x24 || !e->size2 || (!e->data2 && (!e->at2 || !b->src)))
+        return TEX_DECODE_ERROR;
+    const uint8_t *d = e->data;
+    int psm = d[4], flags = d[7], w = rd16(d + 8), h = rd16(d + 10);
+    size_t pixels = (size_t)w * h;
+    if (psm != 0x13 || w <= 0 || h <= 0 || pixels > e->size2 || xtp_find(bdp_name(b, e->name)) >= 0 ||
+        !ps2_palette(b, d, pal))
+        return TEX_DECODE_ERROR;
+    uint8_t *out = malloc(pixels), *fetched = NULL;
+    if (!out)
+        return TEX_DECODE_NOMEM;
+    const uint8_t *px = e->data2;
+    if (!px) {                                           /* a lean bundle's: from the disc (as tex_decode) */
+        if (flags & 0x40) {
+            fetched = malloc(e->size2);
+            if (!fetched) {
+                free(out);
+                return TEX_DECODE_NOMEM;
+            }
+        }
+        /* rows as they are: read straight into the result */
+        if (vol_read_range(b->src, &b->src_file, e->at2, fetched ? fetched : out, fetched ? e->size2 : pixels) != 0) {
+            free(fetched);
+            free(out);
+            return TEX_DECODE_ERROR;
+        }
+        px = fetched;
+    }
+    if (flags & 0x40)
+        unswizzle8(px, out, w, h);
+    else if (px)
+        memcpy(out, px, pixels);
+    free(fetched);
+    *index = out;
+    *w_out = w;
+    *h_out = h;
+    return TEX_DECODE_OK;
+}
+#endif
+
 int tex_decode(const Bundle *b, const BdpEntry *e, uint8_t **rgba, int *w_out, int *h_out)
 {
     if (e && b->wii && e->type == ET_TEXTURE && e->data2)
         return gx_decode(e, rgba, w_out, h_out);
-    if (!e || e->type != ET_TEXTURE || e->size < 0x24 || !e->data2)
+    if (!e || e->type != ET_TEXTURE || e->size < 0x24)
         return -1;
-    const uint8_t *d = e->data, *px = e->data2;
+#ifdef RAMPAGE_XBOX
+    {                                                    /* a replacement picture of that name (the Xbox buttons) */
+        extern int xtp_find(const char *name);
+        extern int xtp_decode(int i, uint8_t **rgba, int *w, int *h);
+        int k = xtp_find(bdp_name(b, e->name));
+        if (k >= 0) {
+            int got = xtp_decode(k, rgba, w_out, h_out);
+            if (got == 0) return TEX_DECODE_OK;
+            if (got == -2) return TEX_DECODE_NOMEM;
+        }                                                /* (unreadable: the bundle's own) */
+    }
+#endif
+    if (!e->data2) {                                     /* a lean bundle's (bdp_open): its pixels are on the disc */
+        if (!e->at2 || !e->size2 || !b->src)
+            return -1;
+        uint8_t *px = malloc(e->size2);
+        if (!px)
+            return TEX_DECODE_NOMEM;
+        int result = vol_read_range(b->src, &b->src_file, e->at2, px, e->size2) == 0
+                         ? ps2_decode(b, e, px, rgba, w_out, h_out) : TEX_DECODE_ERROR;
+        free(px);
+        return result;
+    }
+    return ps2_decode(b, e, e->data2, rgba, w_out, h_out);
+}
+
+static int ps2_decode(const Bundle *b, const BdpEntry *e, const uint8_t *px, uint8_t **rgba, int *w_out, int *h_out)
+{
+    const uint8_t *d = e->data;
     int psm = d[4], flags = d[7], w = rd16(d + 8), h = rd16(d + 10);
     size_t pixels = (size_t)w * h;
     /* The swizzle offsets and pixel loops use int; byte counts must also fit size_t. */
@@ -146,21 +248,7 @@ int tex_decode(const Bundle *b, const BdpEntry *e, uint8_t **rgba, int *w_out, i
         return TEX_DECODE_NOMEM;
     if (psm == 0x13) {
         uint8_t pal[256][4];
-        uint32_t pal_name = rd32(d + 0x20);
-        const char *pn = bdp_name(b, pal_name);
-        const BdpEntry *pe = bdp_entry(b, pal_name);
-        if (strcmp(pn, "_Alpha8") == 0 || strcmp(pn, "_Intensity8") == 0) {
-            int alpha = pn[1] == 'A';
-            for (int i = 0; i < 256; i++) {
-                pal[i][0] = pal[i][1] = pal[i][2] = alpha ? 255 : (uint8_t)i;
-                pal[i][3] = alpha ? (uint8_t)i : 255;
-            }
-        } else if (pe && pe->type == ET_PALETTE && pe->size2 >= 1024) {
-            for (int i = 0; i < 256; i++) {      /* CSM1: entries 8-15 and 16-23 of each 32 swapped */
-                const uint8_t *c = pe->data2 + 4 * ((i & ~0x18) | ((i & 8) << 1) | ((i & 16) >> 1));
-                pal[i][0] = c[0]; pal[i][1] = c[1]; pal[i][2] = c[2]; pal[i][3] = alpha2(c[3]);
-            }
-        } else {
+        if (!ps2_palette(b, d, pal)) {
             free(out);
             return -1;
         }

@@ -39,7 +39,13 @@ static int diagnostic(FILE *f, const char *fmt, va_list ap)
         plat_xbox_vsnprintf(text, (size_t)n + 1, fmt, copy);
         va_end(copy);
     }
+    /* The kernel debug channel is slow with a debugger attached (a network round trip a line): errors always,
+     * ordinary log lines only in test builds. */
+#ifdef RAMPAGE_XBOX_TEST_ARGS
     if (f == stdout || f == stderr) DbgPrint("%s", text);
+#else
+    if (f == stderr) DbgPrint("%s", text);
+#endif
     int write = (f != stdout && f != stderr) || (f == stdout && stdout_ready) || (f == stderr && stderr_ready);
     int ok = !write || fwrite(text, 1, (size_t)n, f) == (size_t)n;
     if (text != small) free(text);
@@ -64,18 +70,31 @@ int plat_xbox_fprintf(FILE *f, const char *fmt, ...)
     return n;
 }
 
+/* One pass, no library calls: the game compares names (properties, bundle entries, sounds) all the time, and
+ * two strlen calls plus a tolower call a character were several percent of a frame. "C" locale lower case. */
+static inline int lower_c(unsigned char c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
 int plat_xbox_strnicmp(const char *a, const char *b, size_t n)
 {
-    for (size_t i = 0; i < n; ++i) {
-        int x = tolower((unsigned char)a[i]), y = tolower((unsigned char)b[i]);
-        if (x != y || !x || !y) return x - y;
+    const unsigned char *p = (const unsigned char *)a, *q = (const unsigned char *)b;
+    for (; n; --n, ++p, ++q) {
+        if (*p != *q) {
+            int x = lower_c(*p), y = lower_c(*q);
+            if (x != y) return x - y;
+        }
+        if (!*p) return 0;
     }
     return 0;
 }
 int plat_xbox_stricmp(const char *a, const char *b)
 {
-    size_t an = strlen(a), bn = strlen(b);
-    return plat_xbox_strnicmp(a, b, (an < bn ? an : bn) + 1);
+    const unsigned char *p = (const unsigned char *)a, *q = (const unsigned char *)b;
+    for (;; ++p, ++q) {
+        if (*p != *q) {
+            int x = lower_c(*p), y = lower_c(*q);
+            if (x != y) return x - y;
+        }
+        if (!*p) return 0;
+    }
 }
 
 /* Keep all paths absolute; nxdk has no process working directory. */
@@ -195,7 +214,18 @@ void plat_xbox_memory_tick(void)
     reported_at = now; reported = 1;
     plat_xbox_printf("xbox physical_memory total_kb=%lu used_kb=%lu available_kb=%lu peak_sampled_kb=%lu\n",
            total_kb, used_kb, free_kb, peak_kb);
+#ifdef RAMPAGE_XBOX_TEST_ARGS
+    /* the kernel's own split; what is left over is GPU (contiguous) memory and page tables */
+    {
+        unsigned long heap_kb = st.VirtualMemoryBytesCommitted / 1024ul;
+        unsigned long cache_kb = st.CachePagesCommitted * 4ul, pool_kb = st.PoolPagesCommitted * 4ul;
+        unsigned long stack_kb = st.StackPagesCommitted * 4ul, image_kb = st.ImagePagesCommitted * 4ul;
+        unsigned long named = heap_kb + cache_kb + pool_kb + stack_kb + image_kb;
+        plat_xbox_printf("xbox memory_split heap_kb=%lu file_cache_kb=%lu pool_kb=%lu stack_kb=%lu image_kb=%lu gpu_and_other_kb=%lu\n",
+               heap_kb, cache_kb, pool_kb, stack_kb, image_kb, used_kb > named ? used_kb - named : 0ul);
+    }
     fflush(stdout);
+#endif
 }
 void plat_xbox_home(void)
 {
@@ -213,7 +243,10 @@ void plat_xbox_home(void)
             stdout_ready = freopen(path, "w", stdout) != NULL;
         if (plat_xbox_path("rampage.err", path, sizeof path, 1))
             stderr_ready = freopen(path, "w", stderr) != NULL;
-        if (stdout_ready) setvbuf(stdout, NULL, _IOLBF, 0);
+        /* The log is buffered whole: a line written to the hard disk in the middle of play is a hitch.
+         * It reaches the disk when the buffer fills, at exit, and every 5 s in test builds (memory tick). */
+        static char log_buffer[32768];
+        if (stdout_ready) setvbuf(stdout, log_buffer, _IOFBF, sizeof log_buffer);
         if (stderr_ready) setvbuf(stderr, NULL, _IONBF, 0);
     }
     plat_xbox_memory_tick();

@@ -104,6 +104,11 @@ typedef struct {
  * in it: they are meshes (fx_meshes). */
 int fx_quads(const FxWorld *w, FxQuad *out, int max);
 int fx_quads_of(const FxWorld *w, int id, FxQuad *out, int max);   /* the same for one effect */
+/* the sine and cosine of an angle (radians), for a quad's rot. On Xbox, where the library's sinf and cosf are slow
+ * software calls, from the effects' 128-step sine table: within 0.0003 of them (under 0.002 for any angle below 14 000
+ * radians); elsewhere the library's own. fx.c turns its flat quads and meshes with it; a renderer may turn a billboard
+ * with it (rot is 0 for every particle of an emitter that does not rotate: cosine 1, sine 0, nothing to ask) */
+void fx_sincos(float a, float *s, float *c);
 
 /* ---- XForm particles: tumbling meshes (debris: soda cans, bean cans, girders, the Midway letters, smoke stack rings).
  * Their shapes (shapes.name) are models of the bundles: a ".pwk" model (type 16) "<name>.pwk" and its meshes, the type-0

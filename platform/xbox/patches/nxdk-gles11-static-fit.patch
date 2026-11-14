@@ -1,0 +1,135 @@
+diff --git a/gles_staging.c b/gles_staging.c
+index b5b0054..49e717c 100644
+--- a/gles_staging.c
++++ b/gles_staging.c
+@@ -55,16 +55,29 @@ void gliStagingPagePad(GLboolean on)
+ #define ST_MAX_CHUNKS 96
+ #define ST_SLOTS 16384u
+ #define ST_PENDING 1024
+-#define ST_KEEP_FREE_PAGES 2048u /* never take a chunk that leaves less than 8 MiB of RAM */
++#define ST_KEEP_FREE_PAGES st_keep_free_pages
++static uint32_t st_keep_free_pages = 2048u; /* never take a chunk that leaves less than this of RAM: 8 MiB */
++
++/* The reserve of free RAM the store leaves for everything else (textures and levels loaded later), in bytes. The
++ * default suits 640 x 480; an application whose frame buffers take more of the 64 MiB and whose loading needs
++ * less can lower it. */
++void gliStaticKeepFree(uint32_t bytes)
++{
++    st_keep_free_pages = bytes / 4096u;
++}
+ #define ST_KEEP_LOW_BYTES (512u * 1024u) /* nor one that leaves no 512 KiB run of GPU-addressable RAM */
+ typedef struct st_node { struct st_node *next; uint32_t off, size; int used; } st_node_t;
+-typedef struct { uint8_t *base; st_node_t *nodes; } st_chunk_t;
++/* free: the chunk's free bytes in all (a request larger than that cannot fit: the chunk's list is not walked);
++ * first_free: no free node lies before this one in the list (NULL: unknown, walk from the head) */
++typedef struct { uint8_t *base; st_node_t *nodes; uint32_t free; st_node_t *first_free; } st_chunk_t;
+ typedef struct { const void *src; uint8_t *dst; uint32_t bytes; const void *owner; } st_entry_t;
+ static st_chunk_t st_chunks[ST_MAX_CHUNKS];
+ static st_entry_t *st_table;
+ static uint32_t st_live, st_tombs;
+ static uint8_t *st_pending[ST_PENDING];
++static uint32_t st_pending_frame[ST_PENDING]; /* the frame each was released in (gliStaticArraysFrames) */
+ static int st_npending;
++static uint32_t st_frame_now; /* the frame being sent: how many have been ended */
+ static GLboolean st_hint, st_used_this_draw;
+ /* the arrays made by gliStaticArrayAlloc: a pointer into one of them (a part of a posed mesh, drawn from
+  * its first vertex) is in GPU memory as it stands */
+@@ -100,10 +113,18 @@ static uint8_t *st_alloc(uint32_t size)
+             if (!ch->base) { free(n); return NULL; }
+             n->next = NULL; n->off = 0; n->size = ST_CHUNK_BYTES; n->used = 0;
+             ch->nodes = n;
++            ch->free = ST_CHUNK_BYTES;
++            ch->first_free = n;
+             gli_static_stats[4]++;
+         }
+-        for (st_node_t *n = ch->nodes; n; n = n->next) {
+-            if (n->used || n->size < size) continue;
++        /* A level's store is a thousand arrays in a few dozen chunks, most of them full: a frame that remakes a few
++         * dozen arrays walked every node of every chunk for each. */
++        if (ch->free < size) continue;
++        st_node_t *seen_free = NULL;
++        for (st_node_t *n = ch->first_free ? ch->first_free : ch->nodes; n; n = n->next) {
++            if (n->used) continue;
++            if (!seen_free) seen_free = n;
++            if (n->size < size) continue;
+             if (n->size > size) {
+                 st_node_t *rest = malloc(sizeof *rest);
+                 if (!rest) return NULL;
+@@ -111,8 +132,12 @@ static uint8_t *st_alloc(uint32_t size)
+                 n->next = rest; n->size = size;
+             }
+             n->used = 1;
++            ch->free -= size;
++            /* the first free node is this one's remainder if this was the first, else the one seen first */
++            ch->first_free = seen_free == n ? n->next : seen_free;
+             return ch->base + n->off;
+         }
++        if (seen_free) ch->first_free = seen_free;
+     }
+     return NULL;
+ }
+@@ -127,6 +152,8 @@ static void st_free(uint8_t *p)
+         for (st_node_t *n = ch->nodes; n; prev = n, n = n->next) {
+             if (n->off != off) continue;
+             n->used = 0;
++            ch->free += n->size;
++            ch->first_free = NULL; /* nodes are merged and freed below: found again by the next walk from the head */
+             if (n->next && !n->next->used) {
+                 st_node_t *x = n->next;
+                 n->size += x->size; n->next = x->next; free(x);
+@@ -157,12 +184,32 @@ void gliStaticArraysCollect(void)
+     if (st_npending) st_collect();
+ }
+ 
++/* Called at each frame's end with how many frames have been ended and how many of them the GPU has drawn to their
++ * end. A copy released while frame F was being sent can only be read by frames up to F, so it is freed as soon as
++ * the GPU has finished F, without waiting for the GPU to be idle: with a push buffer several frames long the
++ * restart that used to free them comes only every few frames, and a frame's worth of remade copies and quad
++ * chunks piled up meanwhile. */
++void gliStaticArraysFrames(uint32_t sent, uint32_t done)
++{
++    st_frame_now = sent;
++    int n = 0;
++    while (n < st_npending && (int32_t)(done - st_pending_frame[n]) > 0) st_free(st_pending[n++]);
++    if (n) {
++        st_npending -= n;
++        for (int i = 0; i < st_npending; i++) {
++            st_pending[i] = st_pending[i + n];
++            st_pending_frame[i] = st_pending_frame[i + n];
++        }
++    }
++}
++
+ static void st_release(uint8_t *dst)
+ {
+     if (st_npending == ST_PENDING) {
+         st_wait_idle();
+         st_collect();
+     }
++    st_pending_frame[st_npending] = st_frame_now;
+     st_pending[st_npending++] = dst;
+ }
+ 
+@@ -285,7 +332,7 @@ void gliStaticArraysClear(void)
+         st_chunk_t *ch = &st_chunks[c];
+         for (st_node_t *n = ch->nodes; n;) { st_node_t *x = n->next; free(n); n = x; }
+         if (ch->base) MmFreeContiguousMemory(ch->base);
+-        ch->base = NULL; ch->nodes = NULL;
++        ch->base = NULL; ch->nodes = NULL; ch->first_free = NULL; ch->free = 0;
+     }
+     free(st_table);
+     st_table = NULL;
+@@ -369,8 +416,13 @@ void gliStagingDestroy(void)
+     }
+ }
+ 
++/* the most a frame has staged since the application last cleared it (a test build's log: how much of the arena
++ * the game needs) */
++volatile uint32_t gli_staging_peak;
++
+ void gliStagingFrameEnd(void)
+ {
++    if (cur_staged_bytes > gli_staging_peak) gli_staging_peak = cur_staged_bytes;
+     frame_staged_bytes[frame_idx++ & 1] = cur_staged_bytes;
+     cur_staged_bytes = 0;
+ 

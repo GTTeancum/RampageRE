@@ -408,11 +408,120 @@ int collide_pair(const CollideObj *a, const CollideObj *b, float normal[3], floa
 
 /* ---------------------------------------------------------------- the world */
 
+/* The queries' short lists. A query's own test of an object is what it always was; the cells only leave out objects
+ * that test could not have passed, and those left are walked in index order, so the answers and their order are the
+ * same. The cells are strips of the block along x and along y (anything past the ends counts in the end ones); an
+ * object is in every strip that its sphere reaches, the sphere taken wider than any of the tests take it:
+ *   - the sphere and box queries go by the world centre and the shape's radius;
+ *   - the ray goes by the shape itself, in the object's frame: its sphere, or its box (within |half| of the centre),
+ *     which is that far from the world centre only while the matrix is a turn. One that is not (within 0.001), or
+ *     that holds no number, is in every strip.
+ * The margins are far above what the tests' own rounding can add: a ray's sphere test can take a sphere wider by
+ * about 0.003 x the ray's length (the root of 1e-5 of the squared distance, the float error of b^2 - a c), so the
+ * object is taken 3% and 0.25 wider and the ray 1% of its length and 0.25. */
+#define CELL_X0 (-64.0f)                             /* the strips' start and width: x -64 .. 64 by 8 */
+#define CELL_XS 8.0f
+#define CELL_Y0 (-24.0f)                             /* y -24 .. 72 by 6 */
+#define CELL_YS 6.0f
+
+/* the strip v is in: one before the first, or not a number, in the first for a low end and the last for a high end */
+static int cell_lo(float v, float origin, float size)
+{
+    float f = (v - origin) / size;
+    if (!(f >= 1))
+        return 0;
+    return f < COLLIDE_CELLS - 1 ? (int)f : COLLIDE_CELLS - 1;
+}
+static int cell_hi(float v, float origin, float size)
+{
+    float f = (v - origin) / size;
+    if (!(f < COLLIDE_CELLS - 1))
+        return COLLIDE_CELLS - 1;
+    return f >= 1 ? (int)f : 0;
+}
+
+/* object i's sphere in the world and its strips, from its matrix and shape as they are now (placed: it has strips) */
+static void bound_set(CollideWorld *w, int i, int placed)
+{
+    const CollideObj *o = &w->o[i];
+    float *b = w->bound[i];
+    shape_world_centre(o, b);
+    b[3] = o->shape.radius;
+    const float *m = o->m, *lc = o->shape.centre;
+    uint8_t c[4] = { 0, COLLIDE_CELLS - 1, 0, COLLIDE_CELLS - 1 }, *old = w->cell[i];
+    float ra = fabsf(o->shape.radius), rb = o->shape.type == COLLIDE_SPHERE ? ra : sqrtf(dot3(o->shape.half, o->shape.half));
+    if (ra < BIG && rb < BIG && fabsf(dot3(m, m) - 1) <= 0.001f && fabsf(dot3(m + 3, m + 3) - 1) <= 0.001f &&
+        fabsf(dot3(m + 6, m + 6) - 1) <= 0.001f && fabsf(dot3(m, m + 3)) <= 0.001f && fabsf(dot3(m, m + 6)) <= 0.001f &&
+        fabsf(dot3(m + 3, m + 6)) <= 0.001f) {
+        float wide = 1.03f * (ra > rb ? ra : rb) + 0.01f * (fabsf(lc[0]) + fabsf(lc[1]) + fabsf(lc[2])) + 0.25f;
+        float px = wide + 0.0001f * fabsf(b[0]), py = wide + 0.0001f * fabsf(b[1]);
+        c[0] = (uint8_t)cell_lo(b[0] - px, CELL_X0, CELL_XS);
+        c[1] = (uint8_t)cell_hi(b[0] + px, CELL_X0, CELL_XS);
+        c[2] = (uint8_t)cell_lo(b[1] - py, CELL_Y0, CELL_YS);
+        c[3] = (uint8_t)cell_hi(b[1] + py, CELL_Y0, CELL_YS);
+    }
+    w->stamp++;
+    uint32_t bit = 1u << (i & 31);
+    int at = i >> 5;
+    if (placed) {
+        if (memcmp(old, c, sizeof c) == 0)
+            return;
+        for (int k = old[0]; k <= old[1]; k++)
+            w->in_x[k][at] &= ~bit;
+        for (int k = old[2]; k <= old[3]; k++)
+            w->in_y[k][at] &= ~bit;
+    }
+    for (int k = c[0]; k <= c[1]; k++)
+        w->in_x[k][at] |= bit;
+    for (int k = c[2]; k <= c[3]; k++)
+        w->in_y[k][at] |= bit;
+    memcpy(old, c, sizeof c);
+}
+
+/* the objects in the strips that x lo[0] .. hi[0] and y lo[1] .. hi[1] reach, a bit each; returns the words in use */
+static int cells_reach(const CollideWorld *w, const float lo[2], const float hi[2], uint32_t set[COLLIDE_WORDS])
+{
+    int n = (w->no + 31) >> 5;
+    int x0 = cell_lo(lo[0], CELL_X0, CELL_XS), x1 = cell_hi(hi[0], CELL_X0, CELL_XS);
+    int y0 = cell_lo(lo[1], CELL_Y0, CELL_YS), y1 = cell_hi(hi[1], CELL_Y0, CELL_YS);
+    for (int k = 0; k < n; k++) {
+        uint32_t x = 0, y = 0;
+        for (int j = x0; j <= x1; j++)
+            x |= w->in_x[j][k];
+        for (int j = y0; j <= y1; j++)
+            y |= w->in_y[j][k];
+        set[k] = x & y;
+    }
+    return n;
+}
+
+/* the same for the sphere c, r (the sphere query's, and the box query's own sphere) */
+static int cells_sphere(const CollideWorld *w, const float c[3], float r, uint32_t set[COLLIDE_WORDS])
+{
+    float lo[2], hi[2];
+    for (int k = 0; k < 2; k++) {
+        float p = fabsf(r) + 0.01f + 0.0001f * (fabsf(c[k]) + fabsf(r));
+        lo[k] = c[k] - p;
+        hi[k] = c[k] + p;
+    }
+    return cells_reach(w, lo, hi, set);
+}
+
+static int low_bit(uint32_t v)                       /* the lowest bit set of v, which is not 0 */
+{
+    static const uint8_t at[32] = { 0, 1, 28, 2, 29, 14, 24, 3, 30, 22, 20, 15, 25, 17, 4, 8,
+                                    31, 27, 13, 23, 21, 19, 16, 7, 26, 12, 18, 6, 11, 5, 10, 9 };
+    return at[((v & (0u - v)) * 0x077CB531u) >> 27];
+}
+
 void collide_begin(CollideWorld *w, float back_row)
 {
     w->no = w->nb = 0;
     w->nrow[0] = w->nrow[1] = 0;
     w->back_row = back_row;
+    memset(w->in_x, 0, sizeof w->in_x);
+    memset(w->in_y, 0, sizeof w->in_y);
+    w->stamp++;
 }
 
 int collide_add(CollideWorld *w, const CollideShape *s, const float m[12], uint32_t flags, int tag, int kind)
@@ -428,7 +537,14 @@ int collide_add(CollideWorld *w, const CollideShape *s, const float m[12], uint3
     o->building = -1;
     o->mv = NULL;
     o->mvm = o->mvel = NULL;
+    bound_set(w, w->no, 0);
     return w->no++;
+}
+
+void collide_moved(CollideWorld *w, int obj)
+{
+    if (w && obj >= 0 && obj < w->no)
+        bound_set(w, obj, 1);
 }
 
 int collide_add_building(CollideWorld *w, const float min[3], const float max[3], int row, int state, int falling, int tag)
@@ -534,20 +650,37 @@ int collide_ray(const CollideWorld *w, const float start[3], const float dir[3],
                 goto done;
         }
     }
-    for (int i = 0; i < w->no; i++) {
-        const CollideObj *o = &w->o[i];
-        if (!(o->flags & include) || (o->flags & exclude))
-            continue;
-        float t, n[3];
-        if (collide_obj_ray(o, start, dir, maxt, &t, n)) {
-            hit->t = t;
-            copy3(hit->normal, n);
-            hit->obj = i;
-            got = 1;
-            maxt = t;
-            if (any)
-                break;
+    {
+        /* the objects in the strips the ray crosses, from its start to its end at maxt (the street's hit, if it had
+         * one): each asked as before, in index order, so the nearest, a tie's last and `any`'s first are the same */
+        uint32_t set[COLLIDE_WORDS];
+        float e[3], lo[2], hi[2], len = 0;
+        for (int k = 0; k < 3; k++) {
+            e[k] = start[k] + dir[k] * maxt;
+            len += fabsf(e[k] - start[k]);
         }
+        for (int k = 0; k < 2; k++) {
+            float p = 0.25f + 0.01f * len + 0.0001f * (fabsf(start[k]) + fabsf(e[k]));
+            lo[k] = (start[k] < e[k] ? start[k] : e[k]) - p;   /* (an end that is no number stays none: every strip) */
+            hi[k] = (start[k] > e[k] ? start[k] : e[k]) + p;
+        }
+        int nw = cells_reach(w, lo, hi, set), stop = 0;
+        for (int k = 0; k < nw && !stop; k++)
+            for (uint32_t bits = set[k]; bits && !stop; bits &= bits - 1) {
+                int i = 32 * k + low_bit(bits);
+                const CollideObj *o = &w->o[i];
+                if (!(o->flags & include) || (o->flags & exclude))
+                    continue;
+                float t, n[3];
+                if (collide_obj_ray(o, start, dir, maxt, &t, n)) {
+                    hit->t = t;
+                    copy3(hit->normal, n);
+                    hit->obj = i;
+                    got = 1;
+                    maxt = t;
+                    stop = any;
+                }
+            }
     }
 done:
     if (got)
@@ -560,18 +693,22 @@ int collide_sphere_query(const CollideWorld *w, const float c[3], float r, uint3
                          int *out, int nmax)
 {
     int n = 0;
-    for (int i = 0; i < w->no && n < nmax; i++) {
-        const CollideObj *o = &w->o[i];
-        if (!(o->flags & include) || (o->flags & exclude))
-            continue;
-        float oc[3], d[3];
-        shape_world_centre(o, oc);
-        for (int k = 0; k < 3; k++)
-            d[k] = oc[k] - c[k];
-        float rr = r + o->shape.radius;
-        if (dot3(d, d) < rr * rr)
-            out[n++] = i;
-    }
+    uint32_t set[COLLIDE_WORDS];
+    int nw = cells_sphere(w, c, r, set);
+    for (int j = 0; j < nw && n < nmax; j++)
+        for (uint32_t bits = set[j]; bits && n < nmax; bits &= bits - 1) {
+            int i = 32 * j + low_bit(bits);
+            const CollideObj *o = &w->o[i];
+            if (!(o->flags & include) || (o->flags & exclude))
+                continue;
+            const float *oc = w->bound[i];           /* its centre in the world and its radius, as kept */
+            float d[3];
+            for (int k = 0; k < 3; k++)
+                d[k] = oc[k] - c[k];
+            float rr = r + oc[3];
+            if (dot3(d, d) < rr * rr)
+                out[n++] = i;
+        }
     return n;
 }
 
@@ -585,26 +722,30 @@ int collide_box_query(const CollideWorld *w, const float min[3], const float max
     }
     float r = sqrtf(dot3(h, h));
     int n = 0;
-    for (int i = 0; i < w->no && n < nmax; i++) {
-        const CollideObj *o = &w->o[i];
-        if (!(o->flags & include) || (o->flags & exclude))
-            continue;
-        float oc[3], d[3];
-        shape_world_centre(o, oc);
-        for (int k = 0; k < 3; k++)
-            d[k] = oc[k] - c[k];
-        float rr = r + o->shape.radius;
-        if (dot3(d, d) > rr * rr)
-            continue;
-        int in = 1;
-        for (int k = 0; k < 3 && in; k++) {          /* 0x101C20: the turned box's half sizes in the world */
-            float e = fabsf(o->m[k]) * o->shape.half[0] + fabsf(o->m[3 + k]) * o->shape.half[1] +
-                      fabsf(o->m[6 + k]) * o->shape.half[2];
-            in = fabsf(d[k]) <= e + h[k];
+    uint32_t set[COLLIDE_WORDS];
+    int nw = cells_sphere(w, c, r, set);
+    for (int j = 0; j < nw && n < nmax; j++)
+        for (uint32_t bits = set[j]; bits && n < nmax; bits &= bits - 1) {
+            int i = 32 * j + low_bit(bits);
+            const CollideObj *o = &w->o[i];
+            if (!(o->flags & include) || (o->flags & exclude))
+                continue;
+            const float *oc = w->bound[i];
+            float d[3];
+            for (int k = 0; k < 3; k++)
+                d[k] = oc[k] - c[k];
+            float rr = r + oc[3];
+            if (dot3(d, d) > rr * rr)
+                continue;
+            int in = 1;
+            for (int k = 0; k < 3 && in; k++) {      /* 0x101C20: the turned box's half sizes in the world */
+                float e = fabsf(o->m[k]) * o->shape.half[0] + fabsf(o->m[3 + k]) * o->shape.half[1] +
+                          fabsf(o->m[6 + k]) * o->shape.half[2];
+                in = fabsf(d[k]) <= e + h[k];
+            }
+            if (in)
+                out[n++] = i;
         }
-        if (in)
-            out[n++] = i;
-    }
     return n;
 }
 
@@ -1177,11 +1318,75 @@ void collide_matrix_to16(const float m[12], float w16[16])
     }
 }
 
+/* A flying object's short list. Each of its sub-steps (up to 50 a frame) asked the whole world which objects its
+ * sphere reaches; now the objects whose spheres reach a ball about the rest of its way this frame are gathered once
+ * (in index order), and a sub-step whose own sphere lies inside that ball asks only those, by the same test. Nothing
+ * outside the ball can pass that test, so each sub-step meets the same objects in the same order (the first 32). A
+ * sub-step that has left the ball (a bounce, an exchange) or that finds the world changed by another hand (stamp: an
+ * object added or moved that is not this mover's doing) gathers again, about where it is then. */
+typedef struct {
+    uint16_t obj[COLLIDE_MAX_OBJ]; int n;
+    float c[3], r;                                   /* the ball */
+    uint32_t stamp;                                  /* the world's when it was gathered, kept up with our own moves */
+    int ok;
+} MoverNear;
+
+/* c, ro: the shape's sphere now; pos its object's place; left: the frame's time still to go; step: a sub-step's way */
+static void near_gather(const CollideWorld *w, MoverNear *nr, const float c[3], float ro, const float pos[3],
+                        const CollideMover *mv, float left, float step)
+{
+    float e[3], off[3];
+    for (int k = 0; k < 3; k++) {                    /* where it will be, falling, if it meets nothing */
+        e[k] = mv->vel[k] * left;
+        off[k] = c[k] - pos[k];
+    }
+    e[2] -= 0.5f * mv->gravity * left * left;
+    for (int k = 0; k < 3; k++)
+        nr->c[k] = c[k] + 0.5f * e[k];
+    /* half the way, the arc's sag off the straight line, the swing of a centre that is off the object's place as it
+     * turns, and a sub-step to spare */
+    nr->r = fabsf(ro) + 0.5f * sqrtf(dot3(e, e)) + 0.125f * fabsf(mv->gravity) * left * left + 2 * sqrtf(dot3(off, off)) +
+            fabsf(step) + 0.05f + 0.00001f * (fabsf(c[0]) + fabsf(c[1]) + fabsf(c[2]));
+    nr->n = 0;
+    nr->stamp = w->stamp;
+    nr->ok = 1;
+    /* taken wider than a sub-step's test can reach from inside the ball (its rounding is some 1e-7 of the sizes) */
+    float rg = 1.001f * nr->r + 0.01f + 0.00001f * (fabsf(nr->c[0]) + fabsf(nr->c[1]) + fabsf(nr->c[2]));
+    if (!(rg < 1e15f)) {                             /* no ball to speak of: every object, as before */
+        for (int i = 0; i < w->no; i++)
+            nr->obj[nr->n++] = (uint16_t)i;
+        return;
+    }
+    uint32_t set[COLLIDE_WORDS];
+    int nw = cells_sphere(w, nr->c, rg, set);
+    for (int j = 0; j < nw; j++)
+        for (uint32_t bits = set[j]; bits; bits &= bits - 1) {
+            int i = 32 * j + low_bit(bits);
+            const float *b = w->bound[i];
+            float d[3] = { b[0] - nr->c[0], b[1] - nr->c[1], b[2] - nr->c[2] }, lim = rg + 1.001f * fabsf(b[3]);
+            if (!(fabsf(b[3]) < 1e15f) || !(dot3(d, d) >= lim * lim))
+                nr->obj[nr->n++] = (uint16_t)i;
+        }
+}
+
+/* object i's kept sphere again after this mover wrote its matrix: a change of its own, which its list allows for */
+static void near_moved(CollideWorld *w, MoverNear *nr, int i)
+{
+    int own = nr->stamp == w->stamp;
+    bound_set(w, i, 1);
+    if (own)
+        nr->stamp = w->stamp;
+}
+
 int collide_mover_step_ex(CollideWorld *w, CollideMover *mv, float m[12], int self, float dt, uint32_t exclude,
                           CollideContactFn fn, void *user)
 {
     float r = mv->radius, f23 = 0.75f * r, vmax = dt > 0 ? 50 * f23 / dt : BIG, left = dt;
     int contacts = 0;
+    MoverNear nr;
+    nr.ok = nr.n = 0;                                /* gathered at the first sub-step */
+    nr.stamp = 0;
+    nr.r = nr.c[0] = nr.c[1] = nr.c[2] = 0;
     if (dt <= 0)
         return 0;
     do {
@@ -1212,9 +1417,24 @@ int collide_mover_step_ex(CollideWorld *w, CollideMover *mv, float m[12], int se
         if (self >= 0 && self < w->no) {             /* 0x287430: the objects its shape reaches */
             CollideObj *o = &w->o[self];
             memcpy(o->m, m, sizeof o->m);
-            float c[3];
-            shape_world_centre(o, c);
-            int near[32], nn = collide_sphere_query(w, c, o->shape.radius, ~0u, exclude, near, 32);
+            near_moved(w, &nr, self);
+            float c[3], ro = o->shape.radius, in = nr.ok ? nr.r - fabsf(ro) : -1, dc[3];
+            copy3(c, w->bound[self]);                /* its shape's centre in the world */
+            for (int k = 0; k < 3; k++)
+                dc[k] = c[k] - nr.c[k];
+            if (!nr.ok || nr.stamp != w->stamp || !(in >= 0 && dot3(dc, dc) <= in * in))
+                near_gather(w, &nr, c, ro, m + 9, mv, left, f23);
+            /* collide_sphere_query(w, c, ro, ~0u, exclude, near, 32) over the short list */
+            int near[32], nn = 0;
+            for (int j = 0; j < nr.n && nn < 32; j++) {
+                int i = nr.obj[j];
+                const float *b = w->bound[i];
+                if (!w->o[i].flags || (w->o[i].flags & exclude))
+                    continue;
+                float d[3] = { b[0] - c[0], b[1] - c[1], b[2] - c[2] }, rr = ro + b[3];
+                if (dot3(d, d) < rr * rr)
+                    near[nn++] = i;
+            }
             for (int i = 0; i < nn; i++) {
                 if (near[i] == self)
                     continue;
@@ -1230,6 +1450,8 @@ int collide_mover_step_ex(CollideWorld *w, CollideMover *mv, float m[12], int se
                     }
                     exchange(other, o, mv, m, N, p, p2);
                     memcpy(o->m, m, sizeof o->m);
+                    near_moved(w, &nr, near[i]);     /* both pushed apart: where the world keeps them */
+                    near_moved(w, &nr, self);
                 } else
                     collide_mover_contact(mv, m, p, n);   /* off a static one, as 0x285E90's one-mover case */
                 if (fn)

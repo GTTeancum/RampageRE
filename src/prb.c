@@ -18,7 +18,7 @@ static void group_memo_forget(void);
 
 int book_open(Book *bk, const Bundle *b)
 {
-    group_memo_forget();
+    prb_forget();
     for (uint32_t i = 0; i < b->nentries; i++)
         if (b->entries[i].type == ET_BOOK) {
             bk->d = b->entries[i].data;
@@ -125,8 +125,84 @@ static Group parent_of(Group g)
     return none;
 }
 
-/* the group (g or a parent) whose own records hold `key`, and the first such record */
+#ifdef RAMPAGE_XBOX
+/* find() walks a group's records and then its parents' comparing names, and the game asks the same questions
+ * every frame for every person, vehicle and shadow (CollisionRadius, Mass, ...; most are not set and miss through
+ * the whole parent chain). The answers, misses too, are remembered by the book, the group and the key. Like the
+ * group memo they are all forgotten when a book is opened, and when a bundle is freed (prb_forget, from
+ * bdp_free): an answer may point into a parent's book in another bundle. */
+#define FIND_MEMO 2048
+static struct {
+    const uint8_t *d;                    /* the book asked, NULL: empty */
+    uint32_t at, hash;
+    char key[36];
+    int found;
+    Group where;
+    Record rec;
+} find_memo[FIND_MEMO];
+static int find_memo_used;
+
+static void find_memo_clear(void)
+{
+    if (find_memo_used) {
+        memset(find_memo, 0, sizeof find_memo);
+        find_memo_used = 0;
+    }
+}
+
+static int find_walk(Group g, const char *key, Group *where, Record *out);
+
 static int find(Group g, const char *key, Group *where, Record *out)
+{
+    if (!g.at || !g.book || !g.book->d)
+        return 0;
+    uint32_t hash = 2166136261u, len = 0;
+    for (const unsigned char *c = (const unsigned char *)key; *c; c++, len++)
+        hash = (hash ^ (uint32_t)(*c >= 'A' && *c <= 'Z' ? *c + 32 : *c)) * 16777619u;
+    if (len >= sizeof find_memo[0].key)
+        return find_walk(g, key, where, out);
+    const uint8_t *d = g.book->d;
+    unsigned slot = (hash ^ g.at * 2654435761u ^ (uint32_t)(uintptr_t)d >> 4) & (FIND_MEMO - 1);
+    if (find_memo[slot].d == d && find_memo[slot].at == g.at && find_memo[slot].hash == hash &&
+        _stricmp(find_memo[slot].key, key) == 0) {
+        if (find_memo[slot].found) {         /* 1: in g itself (the caller's Group: its Book may be a copy that is
+                                              * gone by now), 2: in a parent (a Book the resolver's owner keeps) */
+            *where = find_memo[slot].found == 1 ? g : find_memo[slot].where;
+            *out = find_memo[slot].rec;
+        }
+        return find_memo[slot].found != 0;
+    }
+    Group w = { NULL, 0 };
+    Record r = { 0, NULL, 0 };
+    int found = find_walk(g, key, &w, &r);   /* (may open a parent's book: every memo is cleared, then this is kept) */
+    find_memo[slot].d = d;
+    find_memo[slot].at = g.at;
+    find_memo[slot].hash = hash;
+    memcpy(find_memo[slot].key, key, len + 1);
+    find_memo[slot].found = !found ? 0 : w.book == g.book && w.at == g.at ? 1 : 2;
+    find_memo[slot].where = w;
+    find_memo[slot].rec = r;
+    find_memo_used = 1;
+    if (found) {
+        *where = w;
+        *out = r;
+    }
+    return found;
+}
+#define find_body find_walk
+#else
+#define find_memo_clear() ((void)0)
+#define find_body find
+#endif
+
+void prb_forget(void)
+{
+    group_memo_forget();
+    find_memo_clear();
+}
+
+/* the group (g or a parent) whose own records hold `key`, and the first such record */
+static int find_body(Group g, const char *key, Group *where, Record *out)
 {
     for (int depth = 0; g.at && depth < 16; depth++) {
         for (uint32_t i = 0, n = group_count(g); i < n; i++) {

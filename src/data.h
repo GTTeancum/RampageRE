@@ -44,6 +44,11 @@ enum { ET_MESH = 0, ET_RAW = 2, ET_TREE = 3, ET_ANIM = 4, ET_MATERIAL = 6, ET_TE
 typedef struct {
     uint16_t index; uint8_t type, extra; uint32_t name; const uint8_t *data, *data2; uint32_t size, size2;
     uint8_t wii;                                         /* the Wii's (Bundle.wii): mesh_read takes its own path */
+    uint32_t at2;                                        /* a lean bundle's texture or mesh (bdp_open, the Xbox):
+                                                          * data2 is NULL and its size2 bytes are at this offset of
+                                                          * the bundle's file (Bundle.src), read when it is decoded
+                                                          * (tex_decode) or parsed (bdp_payload) */
+    const void *owner;                                   /* its Bundle (which is not moved once loaded) */
 } BdpEntry;
 typedef struct {
     uint8_t *file; uint32_t file_size;
@@ -57,10 +62,21 @@ typedef struct {
      * tables and MONSTER_DATA into the PS2's layout, so they read as the PS2's, and its textures' headers (u32 kind,
      * u32 GX format, u16 width, height, mips: tex_decode reads their GX pixels) */
     int wii;
+    const Vol *src; VolFile src_file;                    /* a lean bundle's file (bdp_open), NULL: all in memory */
+    uint32_t *name_slot; uint32_t name_mask;             /* the Xbox's: bdp_find_name's hash table (name index + 1,
+                                                          * 0 empty), NULL: the names are compared one by one */
 } Bundle;
 /* 0 takes ownership of file. On failure b is cleared and the caller still owns
  * file; Wii conversion may have modified its bytes, so discard rather than retry. */
 int bdp_load(Bundle *b, uint8_t *file, uint32_t size);
+/* the VOL's bundle of that name, read and loaded: 0 = ok (bdp_free it), -1 absent or unreadable (b cleared). On the
+ * Xbox the image is lean: without the textures' pixels, which tex_decode reads from the disc (bundle.c lean_open) */
+int bdp_open(Bundle *b, const Vol *v, const char *name);
+/* an entry's payload (data2) wherever it is: in memory, or for a lean bundle's mesh read from the disc into one
+ * buffer that the next such call reuses (so: parse it before asking for another's). NULL when it cannot be read.
+ * bdp_payload_release gives that buffer back (after a level's loading). */
+const uint8_t *bdp_payload(const BdpEntry *e);
+void bdp_payload_release(void);
 void bdp_free(Bundle *b);
 const char *bdp_name(const Bundle *b, uint32_t i);        /* name i without its leading 0x13 */
 const BdpEntry *bdp_entry(const Bundle *b, uint32_t name_index);   /* the entry with that name, NULL if none */
@@ -74,6 +90,11 @@ int bdp_find_name(const Bundle *b, const char *name);    /* name index of a name
  * Only TEX_DECODE_NOMEM is transient; absent, unsupported or invalid data returns TEX_DECODE_ERROR. */
 enum { TEX_DECODE_OK = 0, TEX_DECODE_ERROR = -1, TEX_DECODE_NOMEM = -2 };
 int tex_decode(const Bundle *b, const BdpEntry *e, uint8_t **rgba, int *w, int *h);
+#ifdef RAMPAGE_XBOX
+/* an 8-bit texture unexpanded: its indices in rows (malloc'd, w x h bytes) and its 256 RGBA colours; the same
+ * results as tex_decode, TEX_DECODE_ERROR for a texture that is not 8-bit (tex.c) */
+int tex_indexed(const Bundle *b, const BdpEntry *e, uint8_t **index, uint8_t pal[256][4], int *w, int *h);
+#endif
 
 /* ---- meshes (types 0 and 17): one strip per part, triangulated */
 typedef struct {
@@ -150,6 +171,15 @@ const char *group_name(Group g);
 /* lookups follow ParentPropertySet = "Group:Book" through the books the resolver can load */
 typedef Group (*BookResolver)(void *ctx, const char *book, const char *group);
 void prb_set_resolver(BookResolver r, void *ctx);
+void prb_forget(void);                               /* a bundle is freed or loaded: remembered lookups go (Xbox) */
+/* "Type|" + key into k (cap bytes), as snprintf("%s%s") would, without the formatter: asked every frame */
+static inline void prb_typed_key(char *k, size_t cap, const char *type, const char *key)
+{
+    size_t n = 0;
+    while (*type && n + 1 < cap) k[n++] = *type++;
+    while (*key && n + 1 < cap) k[n++] = *key++;
+    k[n] = 0;
+}
 int  group_get(Group g, const char *key, Record *out);   /* 1 = found (in g or a parent) */
 Group group_sub(Group g, const char *key);                /* a group-valued key */
 const char *group_str(Group g, const char *key);          /* a name-valued key, NULL if absent */
@@ -180,6 +210,10 @@ typedef struct {
     uint32_t kind, bones, skeleton;                      /* skeleton: name index of the node tree it drives */
     float duration;                                      /* seconds */
     const uint8_t **trans, **rot;                        /* kind 2: per bone its tracks; kind 1: trans = per bone its record */
+    /* kind 2: a cell in rot's block that points at the clip's cursors while it has them (anim.c: where each track
+     * was last sampled, made at the first sample, dropped to make room for others'). A copied Clip shares it as it
+     * shares trans and rot; what a sample returns never depends on it. */
+    struct ClipCursor **cursor;
 } Clip;
 int clip_read(const BdpEntry *e, Clip *c);               /* 0 = ok; -1 clears and frees partial output */
 void clip_free(Clip *c);

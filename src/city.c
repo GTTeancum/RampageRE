@@ -22,6 +22,14 @@ void xbox_gpu_idle(void);
 #include <ctype.h>
 #include "plat.h"
 #include "city.h"
+
+/* The world's fixed 1/30 s steps: what a frame may have to catch up. The console runs at most two steps in a frame
+ * and carries under one over (the Xbox prototype's rule, docs/xbox_proto/GAME_SIDE.md, 0xa5480; vehicle.c). */
+#ifdef RAMPAGE_XBOX
+#define STEP_ACC_MAX ((1.0f / 30) * 2.999f)
+#else
+#define STEP_ACC_MAX 0.25f
+#endif
 #include "ik.h"
 #include "look.h"
 #include "rail.h"
@@ -83,15 +91,64 @@ Mat4 mat_trs_z(float x, float y, float z, float deg)
     return m;
 }
 
-Mat4 mat_tq(const float t[3], const float q[4])
+/* The posing's own forms of mat_tq and mat_mul, through pointers: a Mat4 by value was copied in and out for every node
+ * of every tree posed, and for every bone of a skin's palette. out may be a or b. */
+static void mat_tq_to(float *m, const float t[3], const float q[4])
 {
     float x = -q[0], y = -q[1], z = -q[2], w = q[3];   /* stored for row vectors: the conjugate for column vectors */
-    Mat4 m = mat_identity();
-    m.m[0] = 1 - 2 * (y * y + z * z); m.m[4] = 2 * (x * y - z * w);     m.m[8] = 2 * (x * z + y * w);
-    m.m[1] = 2 * (x * y + z * w);     m.m[5] = 1 - 2 * (x * x + z * z); m.m[9] = 2 * (y * z - x * w);
-    m.m[2] = 2 * (x * z - y * w);     m.m[6] = 2 * (y * z + x * w);     m.m[10] = 1 - 2 * (x * x + y * y);
-    m.m[12] = t[0]; m.m[13] = t[1]; m.m[14] = t[2];
+    m[0] = 1 - 2 * (y * y + z * z); m[4] = 2 * (x * y - z * w);     m[8] = 2 * (x * z + y * w);
+    m[1] = 2 * (x * y + z * w);     m[5] = 1 - 2 * (x * x + z * z); m[9] = 2 * (y * z - x * w);
+    m[2] = 2 * (x * z - y * w);     m[6] = 2 * (y * z + x * w);     m[10] = 1 - 2 * (x * x + y * y);
+    m[12] = t[0]; m[13] = t[1]; m[14] = t[2];
+    m[3] = m[7] = m[11] = 0; m[15] = 1;
+}
+
+Mat4 mat_tq(const float t[3], const float q[4])
+{
+    Mat4 m;
+    mat_tq_to(m.m, t, q);
     return m;
+}
+
+/* mat_mul's sum as it stands */
+static void mat_mul_to(float *out, const float *a, const float *b)
+{
+    float r[16];
+    for (int c = 0; c < 4; c++)
+        for (int row = 0; row < 4; row++) {
+            float s = 0;
+            for (int k = 0; k < 4; k++)
+                s += a[k * 4 + row] * b[c * 4 + k];
+            r[c * 4 + row] = s;
+        }
+    memcpy(out, r, sizeof r);
+}
+
+/* a x b where b's last row is 0 0 0 1 (a pose: mat_tq's, a turn's, a tree's node, a skeleton's inverse bind): a's
+ * last column is added to the fourth column and multiplied by nothing. */
+static void mat_mul_affine(float *out, const float *a, const float *b)
+{
+#ifdef RAMPAGE_XBOX
+    /* four rows at a time: a's columns are in registers before a column of out is written */
+    __m128 a0 = _mm_loadu_ps(a), a1 = _mm_loadu_ps(a + 4), a2 = _mm_loadu_ps(a + 8), a3 = _mm_loadu_ps(a + 12);
+    for (int c = 0; c < 4; c++) {
+        __m128 s = _mm_add_ps(_mm_add_ps(_mm_mul_ps(a0, _mm_set1_ps(b[c * 4])), _mm_mul_ps(a1, _mm_set1_ps(b[c * 4 + 1]))),
+                              _mm_mul_ps(a2, _mm_set1_ps(b[c * 4 + 2])));
+        _mm_storeu_ps(out + c * 4, c == 3 ? _mm_add_ps(s, a3) : s);
+    }
+#else
+    /* mat_mul's sum to the bit: it starts from 0 as that does (0 + -0 is +0), and the terms left out were +-0 added
+     * to a sum that is never -0, and a's last column x 1. */
+    float r[16];
+    for (int c = 0; c < 4; c++)
+        for (int row = 0; row < 4; row++) {
+            float s = 0;
+            for (int k = 0; k < 3; k++)
+                s += a[k * 4 + row] * b[c * 4 + k];
+            r[c * 4 + row] = c == 3 ? s + a[12 + row] : s;
+        }
+    memcpy(out, r, sizeof r);
+#endif
 }
 
 /* ---------------------------------------------------------------- books */
@@ -163,13 +220,8 @@ static LoadedBook *load_book(City *c, const char *name)
     /* Populate an unused/negative stable slot in place: Book.b points into it.
      * Never move a successful slot, and publish ok only after both readers succeed. */
     memset(lb, 0, sizeof *lb);
-    uint32_t size;
-    uint8_t *data = vol_read(c->vol, file, &size);
-    if (!data) goto failed;
-    if (bdp_load(&lb->b, data, size) != 0) {
-        free(data);                                /* failed reader leaves input caller-owned */
+    if (bdp_open(&lb->b, c->vol, file) != 0)
         goto failed;
-    }
     if (book_open(&lb->book, &lb->b) != 0) {
         bdp_free(&lb->b);
         goto failed;
@@ -274,10 +326,7 @@ City *city_open_checked(const Vol *vol, const char *name, int *load_failed_out)
     City *previous = active_city;
     c->vol = vol;
     snprintf(c->name, sizeof c->name, "%s", name);
-    uint32_t size;
-    uint8_t *data = vol_read(vol, file, &size);
-    if (!data || bdp_load(&c->bundle, data, size) != 0) {
-        free(data);
+    if (bdp_open(&c->bundle, vol, file) != 0) {
         c->load_failed = 1;
         goto failed;
     }
@@ -425,8 +474,14 @@ static void skin_free(Skin *sk)
     free(sk->particle);
 #ifdef RAMPAGE_XBOX
     if (sk->gpu) {                                   /* (released once the GPU is idle) */
-        gliStaticArrayRemove(sk->pos, sk);
-        gliStaticArrayRemove(sk->nrm, sk);
+        for (int k = 0; k < sk->ring_n; k++) {
+            gliStaticArrayRemove(sk->ring_pos[k], sk);
+            gliStaticArrayRemove(sk->ring_nrm[k], sk);
+        }
+        if (!sk->ring_n) {
+            gliStaticArrayRemove(sk->pos, sk);
+            gliStaticArrayRemove(sk->nrm, sk);
+        }
         sk->pos = sk->nrm = NULL;
     }
 #endif
@@ -684,7 +739,7 @@ static int flag_new(City *c, Scene *s, const char *model, Group cb, Mat4 place, 
     if (!m.parts || !cp) goto failed;
     for (int k = 0; k < np; k++) {
         int status = me->wii ? (cp[k].nverts ? 0 : -1) :
-            cloth_mesh_part(cl, k, me->data, me->size, me->data2, me->size2, &cp[k]);
+            cloth_mesh_part(cl, k, me->data, me->size, bdp_payload(me), bdp_payload(me) ? me->size2 : 0, &cp[k]);
         if (status == -2) goto failed;
         if (status != 0) continue;
         MeshPart *p = &m.parts[m.nparts++];
@@ -1127,6 +1182,15 @@ Group city_book_group_wii(City *c, const char *book, const char *name)
     return g.at ? g : city_book_group(c, book, name);
 }
 
+#ifdef RAMPAGE_XBOX
+/* city_shape_box parses every mesh of the shape for its box, and the army, the bosses and the rubble ask in play.
+ * A shape's box does not change while its city is loaded: the answers are kept (the last 48 shapes asked for). */
+static struct {
+    const City *c; const uint8_t *file; int n, next;
+    struct { char key[64]; float min[3], max[3]; int found; } e[48];
+} box_memo;
+#endif
+
 int city_shape_box(City *c, const char *shape, float min[3], float max[3])
 {
     char key[64];
@@ -1136,6 +1200,24 @@ int city_shape_box(City *c, const char *shape, float min[3], float max[3])
     key[n] = 0;
     if (n > 4 && strcmp(key + n - 4, ".pwk") == 0)
         key[n - 4] = 0;
+#ifdef RAMPAGE_XBOX
+    if (box_memo.c != c || box_memo.file != c->bundle.file) {   /* another city, or this one loaded again */
+        box_memo.c = c;
+        box_memo.file = c->bundle.file;
+        box_memo.n = box_memo.next = 0;
+    }
+    for (int i = 0; i < box_memo.n; i++)
+        if (strcmp(box_memo.e[i].key, key) == 0) {
+            memcpy(min, box_memo.e[i].min, sizeof box_memo.e[i].min);
+            memcpy(max, box_memo.e[i].max, sizeof box_memo.e[i].max);
+            return box_memo.e[i].found ? 0 : -1;
+        }
+    int memo_slot = box_memo.next;
+    box_memo.next = (box_memo.next + 1) % 48;
+    if (box_memo.n < 48) box_memo.n++;
+    memcpy(box_memo.e[memo_slot].key, key, sizeof key);
+    box_memo.e[memo_slot].found = -1;                    /* (filled in at the end; a failed parse is not kept) */
+#endif
     int found = 0;
     for (int k = 0; k < 3; k++) {
         min[k] = 1e30f;
@@ -1156,6 +1238,11 @@ int city_shape_box(City *c, const char *shape, float min[3], float max[3])
                 }
         mesh_free(&m);
     }
+#ifdef RAMPAGE_XBOX
+    memcpy(box_memo.e[memo_slot].min, min, sizeof box_memo.e[memo_slot].min);
+    memcpy(box_memo.e[memo_slot].max, max, sizeof box_memo.e[memo_slot].max);
+    box_memo.e[memo_slot].found = found;
+#endif
     return found ? 0 : -1;
 }
 
@@ -3292,18 +3379,14 @@ static void lighting(City *c, Scene *s, Group ld)
 {
     const char *file = group_str(ld, "text|LightFile");
     if (scene_failed(s)) return;
-    uint32_t size;
-    uint8_t *data = vol_read(c->vol, "common.bdp", &size);
     Bundle common;
-    if (data && bdp_load(&common, data, size) == 0) {
+    if (bdp_open(&common, c->vol, "common.bdp") == 0) {
         for (uint32_t i = 0; i < common.nentries; i++) {
             const BdpEntry *e = &common.entries[i];
             if (e->type == ET_RAW && _stricmp(bdp_name(&common, e->name), file ? file : "default_lights.txt") == 0)
                 read_lights(s, (const char *)e->data, e->size);
         }
         bdp_free(&common);
-    } else {
-        free(data);
     }
     for (int k = 0; k < 3; k++)
         s->cube_tint[k] = group_num(ld, k == 0 ? "CubeTintR" : k == 1 ? "CubeTintG" : "CubeTintB", 192);
@@ -3755,6 +3838,7 @@ static void root_unturn(float t[3], float q[4], float deg)
 
 static void pose_instance(Scene *s, Instance *in, double t)
 {
+    in->pose_serial++;
     int mk = scene_monster_slot(s, (int)(in - s->instances));
     const SceneMonster *sm = mk >= 0 ? &s->mon[mk] : NULL;
     float w = in->held && in->blend_left > 0 && in->blend_time > 0 ? in->blend_left / in->blend_time : 0;
@@ -3803,7 +3887,9 @@ static void pose_instance(Scene *s, Instance *in, double t)
             memcpy(in->pose[i], tr, sizeof tr);
             memcpy(in->pose[i] + 3, q, sizeof q);
         }
-        Mat4 local = mat_tq(tr, q);
+        /* (every product below has a pose on its right, last row 0 0 0 1: mat_mul_affine) */
+        Mat4 local;
+        mat_tq_to(local.m, tr, q);
         for (int k = 0; k < in->nturn; k++)          /* [R 0x298980] local = R x pose (row vectors): R first */
             if (in->turn[k].node == (int)i && in->turn[k].angle != 0) {
                 Mat4 r = mat_identity();
@@ -3813,20 +3899,25 @@ static void pose_instance(Scene *s, Instance *in, double t)
                 } else {                             /* 0x101730: rows (1, 0, 0), (0, c, s), (0, -s, c) */
                     r.m[5] = c; r.m[6] = sn; r.m[9] = -sn; r.m[10] = c;
                 }
-                local = mat_mul(local, r);
+                mat_mul_affine(local.m, local.m, r.m);
             }
         int p = nd->parent;
-        in->node[i] = p >= 0 && (uint32_t)p < i ? mat_mul(in->node[p], local) : local;
+        if (p >= 0 && (uint32_t)p < i)
+            mat_mul_affine(in->node[i].m, in->node[p].m, local.m);
+        else
+            in->node[i] = local;
         if (sm && (sm->look_yaw != 0 || sm->look_pitch != 0)) {
             if ((int)i == sm->look_neck) {           /* model x Rz(yaw) (row vectors): about up, at the neck */
                 Mat4 r = mat_trs_z(0, 0, 0, sm->look_yaw * 57.2957795f), m = in->node[i];
                 float t[3] = { m.m[12], m.m[13], m.m[14] };
                 m.m[12] = m.m[13] = m.m[14] = 0;
-                m = mat_mul(r, m);
+                mat_mul_affine(m.m, r.m, m.m);
                 m.m[12] = t[0]; m.m[13] = t[1]; m.m[14] = t[2];
                 in->node[i] = m;
-            } else if ((int)i == sm->look_head)      /* Rz(-pitch) x model (row vectors): about its own z */
-                in->node[i] = mat_mul(in->node[i], mat_trs_z(0, 0, 0, -sm->look_pitch * 57.2957795f));
+            } else if ((int)i == sm->look_head) {    /* Rz(-pitch) x model (row vectors): about its own z */
+                Mat4 r = mat_trs_z(0, 0, 0, -sm->look_pitch * 57.2957795f);
+                mat_mul_affine(in->node[i].m, in->node[i].m, r.m);
+            }
         }
     }
 }
@@ -3838,9 +3929,11 @@ static uint32_t skin_palette(const Instance *in, Mat4 *palette)
 {
     uint32_t nb = in->tree.n < 256 ? in->tree.n : 256;
     for (uint32_t j = 0; j < nb; j++) {
-        Mat4 ib;
-        memcpy(ib.m, in->tree.nodes[j].inverse_bind, sizeof ib.m);
-        palette[j] = mat_mul(in->node[j], ib);
+        const TreeNode *nd = &in->tree.nodes[j];
+        if (nd->has_bind)                            /* a skeleton's: tree.c gives it the last row 0 0 0 1 */
+            mat_mul_affine(palette[j].m, in->node[j].m, nd->inverse_bind);
+        else
+            mat_mul_to(palette[j].m, in->node[j].m, nd->inverse_bind);
     }
     if (in->mirrored) {                              /* the game mirrors the pose (0x194BA0); for a mesh that is
                                                         symmetric this is S x the other side's matrix x S, S the
@@ -3880,6 +3973,30 @@ static int skin_arrays(Skin *sk)
         sk->gpu = 1;
         memset(sk->pos, 0, sizeof(float) * 3 * n);
         memset(sk->nrm, 0, sizeof(float) * 3 * n);
+        /* Two more pairs, posed into in turn: the pair the queued frames are drawn from is never the one being
+         * written, so nothing waits for the GPU (a monster's hair is such a skin, in sight in every frame: the wait
+         * held the CPU until the GPU had drawn the frame before). No room for them: the one pair and the wait. */
+        sk->ring_pos[0] = sk->pos;
+        sk->ring_nrm[0] = sk->nrm;
+        sk->ring_n = 1;
+        for (int k = 1; k < 3; k++) {
+            float *rp = gliStaticArrayAlloc(sizeof(float) * 3 * n, sk);
+            float *rn = rp ? gliStaticArrayAlloc(sizeof(float) * 3 * n, sk) : NULL;
+            if (!rp || !rn) {
+                if (rp) gliStaticArrayRemove(rp, sk);
+                break;
+            }
+            memset(rp, 0, sizeof(float) * 3 * n);
+            memset(rn, 0, sizeof(float) * 3 * n);
+            sk->ring_pos[k] = rp;
+            sk->ring_nrm[k] = rn;
+            sk->ring_n = k + 1;
+        }
+        if (sk->ring_n == 2) {                       /* (two would be rewritten while a queued frame reads) */
+            gliStaticArrayRemove(sk->ring_pos[1], sk);
+            gliStaticArrayRemove(sk->ring_nrm[1], sk);
+            sk->ring_n = 1;
+        }
         return 1;
     }
     if (sk->pos) gliStaticArrayRemove(sk->pos, sk);
@@ -3906,6 +4023,30 @@ static void skin_item(Scene *s, const Instance *in, DrawItem *it, int rebuild_pa
     uint32_t nb = in->tree.n < 256 ? in->tree.n : 256;
     if (rebuild_palette)
         skin_palette(in, palette);
+    /* A cloth's vertex that a particle drives is written from the simulation below, whatever the bones made of it:
+     * the bones do not pose it first. The scratch the particles come back through is made sure of here, so that
+     * without it every vertex still gets its rigid pose, as it did; the trace measures against the rigid pose and so
+     * keeps it too. */
+    static int trace_cloth = -1;                     /* (asked once: getenv searched the environment for every
+                                                      * cloth of every frame) */
+    const int32_t *driven = NULL;
+    int np = 0, scratch_ok = 0;
+    if (sk->cloth && sk->particle) {
+        if (trace_cloth < 0)
+            trace_cloth = getenv("RAMPAGE_CLOTH") != NULL;
+        np = cloth_count(sk->cloth);
+        uint32_t count = (uint32_t)(np ? np : 1);
+        if (count > s->cloth_scratch_particles) {
+            float *grown = realloc(s->cloth_scratch, sizeof(float) * 6 * (size_t)count);
+            if (grown) {
+                s->cloth_scratch = grown;
+                s->cloth_scratch_particles = count;
+            }
+        }
+        scratch_ok = count <= s->cloth_scratch_particles;
+        if (scratch_ok && !trace_cloth)
+            driven = sk->particle;
+    }
     const Mesh *m = &s->meshes[it->mesh].mesh;
     uint32_t v = 0;
     for (uint32_t pi = 0; pi < m->nparts; pi++) {
@@ -3915,6 +4056,8 @@ static void skin_item(Scene *s, const Instance *in, DrawItem *it, int rebuild_pa
          * weighted matrices are added column by column, and the vertex and its normal go through the result once.
          * Posing the monsters was the largest single cost of a frame with four of them. */
         for (uint32_t i = 0; i < p->nverts; i++, v++) {
+            if (driven && v < sk->nverts && driven[v] >= 0 && driven[v] < np)
+                continue;                            /* its particle's, below */
             const float *x = p->pos + 3 * i, *n = p->nrm ? p->nrm + 3 * i : NULL;
             __m128 c0 = _mm_setzero_ps(), c1 = c0, c2 = c0, c3 = c0;
             for (int k = 0; k < 4; k++) {
@@ -3943,6 +4086,8 @@ static void skin_item(Scene *s, const Instance *in, DrawItem *it, int rebuild_pa
         }
 #else
         for (uint32_t i = 0; i < p->nverts; i++, v++) {
+            if (driven && v < sk->nverts && driven[v] >= 0 && driven[v] < np)
+                continue;                            /* its particle's, below */
             float o[3] = { 0, 0, 0 }, on[3] = { 0, 0, 0 };
             const float *x = p->pos + 3 * i, *n = p->nrm ? p->nrm + 3 * i : NULL;
             for (int k = 0; k < 4; k++) {
@@ -4000,21 +4145,10 @@ static void skin_item(Scene *s, const Instance *in, DrawItem *it, int rebuild_pa
                 cloth_collide_plane(sk->cloth, sk->plane, sk->plane[3], still);
             }
         }
-        int np = cloth_count(sk->cloth);
-        uint32_t count = (uint32_t)(np ? np : 1);
-        if (count > s->cloth_scratch_particles) {
-            float *grown = realloc(s->cloth_scratch, sizeof(float) * 6 * (size_t)count);
-            if (!grown)
-                return;                              /* keep the rigid pose and retry scratch growth next update */
-            s->cloth_scratch = grown;
-            s->cloth_scratch_particles = count;
-        }
+        if (!scratch_ok)
+            return;                                  /* keep the rigid pose and retry scratch growth next update */
         float *lp = s->cloth_scratch, *ln = lp + 3 * np;
         cloth_to_local(sk->cloth, lp, ln);
-        static int trace_cloth = -1;                 /* (asked once: getenv searched the environment for every
-                                                      * cloth of every frame) */
-        if (trace_cloth < 0)
-            trace_cloth = getenv("RAMPAGE_CLOTH") != NULL;
         float dev = 0;
         for (uint32_t k = 0; k < sk->nverts; k++) {
             int32_t q = sk->particle[k];
@@ -4138,6 +4272,7 @@ static void monster_tail(SceneMonster *s, Instance *in)
         int m = in->tree.nodes[j].mirror;
         in->node[m >= 0 && (uint32_t)m < in->tree.n ? m : j] = reflect_node(drawn[j], reflect_axis(in, j));
     }
+    in->pose_serial++;
 }
 
 int scene_monster_slot(const Scene *s, int inst)
@@ -4154,20 +4289,81 @@ static Instance *mon_inst(const Scene *s, int k)
     return k >= 0 && k < s->nmon && s->mon[k].inst >= 0 ? &s->instances[s->mon[k].inst] : NULL;
 }
 
+/* scene_monster_node's names, found once (the game resolves its bones to indices at the monster's setup): per monster
+ * slot the names asked for so far, each with the first node whose name ends with it (-1 none), that node's other side
+ * and the axis the other side is reflected about. The callers of every frame (the feet, the hands, the effects' and
+ * the attachments' bones) then scan no names of the skeleton. An entry is known by the pointer asked with and one
+ * compare of its text: some callers build the name in a buffer of their own, whose text changes under the same
+ * pointer. A skeleton's nodes never change once read; the entries go with the scene (city_build, scene_free), when
+ * the slot is given its monster, and whenever the slot's tree is not the one they were found in. */
+#define NODE_MEMO 48
+static struct NodeMemo {
+    const Scene *scene; const TreeNode *nodes; uint32_t n;   /* whose names these are: NULL scene = none */
+    int count, next;
+    struct { const char *name; char text[40]; int node, other, axis; } e[NODE_MEMO];
+} node_memo[SCENE_MONSTERS];
+
+static void node_memo_drop(const Scene *s, int k)   /* k < 0: all of the scene's */
+{
+    for (int i = 0; i < SCENE_MONSTERS; i++)
+        if (node_memo[i].scene == s && (k < 0 || i == k)) {
+            node_memo[i].scene = NULL;
+            node_memo[i].count = node_memo[i].next = 0;
+        }
+}
+
 int scene_monster_node(const Scene *s, int k, const char *name, Mat4 *world)
 {
     const Instance *in = mon_inst(s, k);
     if (!in)
         return -1;
-    for (uint32_t i = 0; i < in->tree.n; i++)
-        if (ends_with(in->tree.nodes[i].name, name)) {
-            int m = in->mirrored ? in->tree.nodes[i].mirror : (int)i;
-            if (m < 0 || (uint32_t)m >= in->tree.n)
-                m = (int)i;
-            *world = mat_mul(in->base, in->mirrored ? reflect_node(in->node[m], reflect_axis(in, m)) : in->node[m]);
-            return 0;
+    struct NodeMemo *mm = k < SCENE_MONSTERS ? &node_memo[k] : NULL;
+    int node = -1, other = -1, axis = 2, known = 0;
+    if (mm && (mm->scene != s || mm->nodes != in->tree.nodes || mm->n != in->tree.n)) {
+        mm->scene = s;
+        mm->nodes = in->tree.nodes;
+        mm->n = in->tree.n;
+        mm->count = mm->next = 0;
+    }
+    for (int i = 0; mm && i < mm->count && !known; i++)
+        if (mm->e[i].name == name && strcmp(mm->e[i].text, name) == 0) {
+            node = mm->e[i].node; other = mm->e[i].other; axis = mm->e[i].axis;
+            known = 1;
         }
-    return -1;
+    for (int i = 0; mm && i < mm->count && !known; i++)   /* the same name from another place */
+        if (strcmp(mm->e[i].text, name) == 0) {
+            mm->e[i].name = name;
+            node = mm->e[i].node; other = mm->e[i].other; axis = mm->e[i].axis;
+            known = 1;
+        }
+    if (!known) {
+        for (uint32_t i = 0; i < in->tree.n && node < 0; i++)
+            if (ends_with(in->tree.nodes[i].name, name))
+                node = (int)i;
+        if (node >= 0) {
+            other = in->tree.nodes[node].mirror;
+            if (other < 0 || (uint32_t)other >= in->tree.n)
+                other = node;
+            axis = reflect_axis(in, other);
+        }
+        size_t len = strlen(name);
+        if (mm && len < sizeof mm->e[0].text) {      /* (a longer name is scanned for each time, as before) */
+            int at = mm->count;                      /* full: over the oldest, in turn */
+            if (at < NODE_MEMO)
+                mm->count++;
+            else {
+                at = mm->next;
+                mm->next = (mm->next + 1) % NODE_MEMO;
+            }
+            mm->e[at].name = name;
+            memcpy(mm->e[at].text, name, len + 1);
+            mm->e[at].node = node; mm->e[at].other = other; mm->e[at].axis = axis;
+        }
+    }
+    if (node < 0)
+        return -1;
+    *world = mat_mul(in->base, in->mirrored ? reflect_node(in->node[other], axis) : in->node[node]);
+    return 0;
 }
 
 int scene_monster_hand(const Scene *s, int k, int hand, Mat4 *world)
@@ -4295,6 +4491,9 @@ static void update(Scene *s, double t, int all)
             /* The people, the army and the other small skins in sight are posed on alternate frames, half of them
              * each frame (their walk is drawn at half the frame rate); a monster every frame. */
             if (!all && it->skin->posed && !monster && ((skin_frame + i) & 1u)) {
+                /* a flag: this frame's time is kept for its next step, which else ran it at half its speed */
+                if (it->skin->cloth && it->skin->cloth_started)
+                    cloth_defer(it->skin->cloth, s->cloth_dt);
                 it->world = in->base;
                 continue;
             }
@@ -4302,7 +4501,14 @@ static void update(Scene *s, double t, int all)
                 it->world = in->base;
                 continue;
             }
-            if (it->skin->gpu && !gpu_waited) {      /* (posed into memory the GPU reads: once it is idle) */
+            if (it->skin->gpu && it->skin->ring_n == 3) {   /* posed into the next of its three pairs */
+                if (it->skin->ring_frame != skin_frame) {
+                    it->skin->ring_frame = skin_frame;
+                    it->skin->ring_at = (it->skin->ring_at + 1) % 3;
+                    it->skin->pos = it->skin->ring_pos[it->skin->ring_at];
+                    it->skin->nrm = it->skin->ring_nrm[it->skin->ring_at];
+                }
+            } else if (it->skin->gpu && !gpu_waited) {   /* (posed into memory the GPU reads: once it is idle) */
                 xbox_gpu_idle();
                 gpu_waited = 1;
             }
@@ -4331,6 +4537,7 @@ int city_build(City *c, const char *block_name, int night, Scene *s)
     memcpy(saved_runners, c->runners, sizeof saved_runners);
     int crowd_sound = 0;
     memset(s, 0, sizeof *s);
+    node_memo_drop(s, -1);                          /* (a scene made anew where one was: its bones are other trees') */
     s->owner = c;                                   /* before the first inheritable lookup */
     s->city = &c->bundle;
     if (scene_failed(s)) goto failed;
@@ -4664,21 +4871,16 @@ static Bundle *own_bundle(const Vol *vol, Scene *s, const char *file)
 {
     if (scene_failed(s)) return NULL;
     if (!vol_find(vol, file)) return NULL;          /* truly absent optional bundle */
-    uint32_t size;
-    uint8_t *data = vol_read(vol, file, &size);
-    if (!data || s->nown == (int)(sizeof s->own / sizeof *s->own)) {
-        free(data);
+    if (s->nown == (int)(sizeof s->own / sizeof *s->own)) {
         scene_fail(s);
         return NULL;
     }
     Bundle *b = calloc(1, sizeof *b);
     if (!b) {
-        free(data);
         scene_fail(s);
         return NULL;
     }
-    if (bdp_load(b, data, size) != 0) {
-        free(data);
+    if (bdp_open(b, vol, file) != 0) {
         free(b);
         scene_fail(s);
         return NULL;
@@ -4702,7 +4904,14 @@ static Skin *new_skin(const Mesh *m)
     sk->bones = calloc(n, sizeof *sk->bones);
     sk->weights = calloc(n, sizeof *sk->weights);
 #ifdef RAMPAGE_XBOX
+#ifdef RAMPAGE_XBOX
+    {
+        extern int g_xbox_gpu_skin;                  /* (render_gl.c: a test build's switch) */
+        sk->gpu_skin = g_xbox_gpu_skin ? 1 : -1;     /* (the GPU poses it: no posed arrays unless it cannot) */
+    }
+#else
     sk->gpu_skin = 1;                                /* (the GPU poses it: no posed arrays unless it cannot) */
+#endif
     if (!sk->bones || !sk->weights) goto failed;
 #else
     if (!sk->bones || !sk->weights || !skin_arrays(sk)) goto failed;
@@ -4822,7 +5031,8 @@ int city_monster(City *c, Scene *s, const char *monster, int clip_index, float x
                 for (uint32_t pi = 0; pi < m.nparts; base += m.parts[pi].nverts, pi++) {
                     const MeshPart *p = &m.parts[pi];
                     ClothMeshPart cp;
-                    int status = e->wii ? -1 : cloth_mesh_part(sk->cloth, (int)pi, e->data, e->size, e->data2, e->size2, &cp);
+                    int status = e->wii ? -1 : cloth_mesh_part(sk->cloth, (int)pi, e->data, e->size, bdp_payload(e),
+                                                               bdp_payload(e) ? e->size2 : 0, &cp);
                     if (status == -2) goto mesh_failed;
                     if (status == 0) {
                         if ((uint32_t)cp.nverts == p->nverts)
@@ -4857,7 +5067,8 @@ mesh_failed:
     }
     free(cloth);
     sm->inst = id;
-    sm->look_neck = sm->look_head = -1;              /* MD +0xA14: two bones, the neck yaws and the head pitches */
+    node_memo_drop(s, (int)(sm - s->mon));           /* the slot's bone names are found again in this skeleton */
+    sm->look_neck = sm->look_head = -1;             /* MD +0xA14: two bones, the neck yaws and the head pitches */
     for (uint32_t i = 0; i < in->tree.n; i++) {
         if (ends_with(in->tree.nodes[i].name, "Bip01 Neck")) sm->look_neck = (int)i;
         if (ends_with(in->tree.nodes[i].name, "Bip01 Head")) sm->look_head = (int)i;
@@ -5163,15 +5374,15 @@ void scene_buildings_update(Scene *s, float dt)
 {
     if (scene_failed(s)) return;
     s->water_acc += dt;                              /* the water, a world step at a time: 0x338180 -> 0x336DC0 in */
-    if (s->water_acc > 0.25f)                        /* the world's object update (0x284E40), dt gWorld +4 = 1/30 [R] */
-        s->water_acc = 0.25f;
+    if (s->water_acc > STEP_ACC_MAX)                        /* the world's object update (0x284E40), dt gWorld +4 = 1/30 [R] */
+        s->water_acc = STEP_ACC_MAX;
     for (; s->water_acc >= 1.0f / 30; s->water_acc -= 1.0f / 30)
         for (int k = 0; k < s->nwater; k++)
             water_step(s->water[k], 1.0f / 30);
     int flag_steps = 0;                              /* the buildings' flags' world steps (0x3473B0) */
     s->flag_acc += dt;
-    if (s->flag_acc > 0.25f)
-        s->flag_acc = 0.25f;
+    if (s->flag_acc > STEP_ACC_MAX)
+        s->flag_acc = STEP_ACC_MAX;
     for (; s->flag_acc >= 1.0f / 30; s->flag_acc -= 1.0f / 30)
         flag_steps++;
     s->light_frame++;                                /* 0x2B8F80: the queue's frame; no grant yet */
@@ -5613,6 +5824,7 @@ int city_camera(City *c, Group *two_tilts)
 
 void scene_free(Scene *s)
 {
+    node_memo_drop(s, -1);                           /* the trees its monsters' bone names were found in go below */
     for (int k = 0; k < s->nwater; k++)
         water_free(s->water[k]);
     for (uint32_t i = 0; i < s->nmeshes; i++)

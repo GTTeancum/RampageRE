@@ -98,7 +98,7 @@ static int find_rec(Group g, const char *key, Record *out)
     if (!g.at || !key)
         return 0;
     for (size_t i = 0; i < sizeof TYPED / sizeof *TYPED; i++) {
-        snprintf(k, sizeof k, "%s%s", TYPED[i], key);
+        prb_typed_key(k, sizeof k, TYPED[i], key);
         if (group_get(g, k, out))
             return 1;
     }
@@ -110,7 +110,7 @@ static const char *gstr(Group g, const char *key)
     if (!g.at || !key)
         return NULL;
     for (size_t i = 0; i < sizeof TYPED / sizeof *TYPED; i++) {
-        snprintf(k, sizeof k, "%s%s", TYPED[i], key);
+        prb_typed_key(k, sizeof k, TYPED[i], key);
         const char *s = group_str(g, k);
         if (s && *s)
             return s;

@@ -37,6 +37,8 @@ typedef struct {                                     /* a skinned mesh's vertice
     uint32_t nverts;
     int posed;                                        /* posed at least once (scene_update) */
     int gpu;                                          /* Xbox: pos / nrm are in the GPU's static store, not the heap */
+    float *ring_pos[3], *ring_nrm[3];                 /* Xbox: the pairs it is posed into in turn (city.c skin_arrays) */
+    int ring_n, ring_at; uint32_t ring_frame;
     /* Xbox: 1 = the GPU poses it with a vertex program (render_gl.c: pos / nrm stay NULL and scene_update leaves it
      * alone), 0 = the CPU does (a cloth), -1 = the renderer could not (the CPU from the next update on) */
     int gpu_skin;
@@ -55,6 +57,8 @@ typedef struct {
     Clip clip; int has_clip; float offset;            /* a looping clip, started offset seconds in */
     int vehicle;                                      /* -1, or the vehicle it rides on */
     Mat4 *node;                                       /* per node, relative to base */
+    uint32_t pose_serial;                             /* counted up whenever node[] is posed again (city.c): what was
+                                                       * worked out from the pose can be kept until it changes */
     /* root motion the monster takes over (0x301080): the root's axes in still_root (bit 0 x, 1 y, 2 z) are held
      * at root_hold, and its turn about Z is taken out by root_turn degrees */
     int still_root; float root_hold[3], root_turn;

@@ -249,7 +249,23 @@ static int wii_mesh_read(const BdpEntry *e, Mesh *m)
     return 0;
 }
 
+static int mesh_read_in(const BdpEntry *e, Mesh *m);
+
 int mesh_read(const BdpEntry *e, Mesh *m)
+{
+    if (e && !e->data2 && e->at2) {                      /* a lean bundle's (bdp_open): its streams from the disc */
+        BdpEntry with = *e;
+        with.data2 = bdp_payload(e);
+        if (!with.data2) {
+            memset(m, 0, sizeof *m);
+            return -1;
+        }
+        return mesh_read_in(&with, m);
+    }
+    return mesh_read_in(e, m);
+}
+
+static int mesh_read_in(const BdpEntry *e, Mesh *m)
 {
     memset(m, 0, sizeof *m);
     if (e->wii)

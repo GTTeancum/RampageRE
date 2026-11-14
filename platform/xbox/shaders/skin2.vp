@@ -1,0 +1,56 @@
+!!VP1.1
+# RampageRE skinning, two bones a vertex (after the Xbox prototype's 0x266e8c / 0x26740c).
+# v[0] position, v[2] normal, v[3] colour, v[8] texture coordinates,
+# v[9] the bones' constant offsets (3 x index), v[10] their weights.
+# c[0..3] model to screen, c[4..6] model to eye (rows), c[7] ambient rgb + lit flag,
+# c[8..11] light directions (eye), c[12..15] light colours, c[16] uv scale x y, 0, 1,
+# c[17..94] 26 bones of 3 rows, c[95].x fog sign.
+ARL A0.x, v[9].x;
+MUL R0, v[10].x, c[A0.x + 17];
+MUL R1, v[10].x, c[A0.x + 18];
+MUL R2, v[10].x, c[A0.x + 19];
+ARL A0.x, v[9].y;
+MAD R0, v[10].y, c[A0.x + 17], R0;
+MAD R1, v[10].y, c[A0.x + 18], R1;
+MAD R2, v[10].y, c[A0.x + 19], R2;
+DPH R3.x, v[0], R0;
+DPH R3.y, v[0], R1;
+DPH R3.z, v[0], R2;
+MOV R3.w, c[16].w;
+DP3 R4.x, v[2], R0;
+DP3 R4.y, v[2], R1;
+DP3 R4.z, v[2], R2;
+DP4 R5.x, R3, c[0];
+DP4 R5.y, R3, c[1];
+DP4 R5.z, R3, c[2];
+DP4 R5.w, R3, c[3];
+DP3 R6.x, R4, c[4];
+DP3 R6.y, R4, c[5];
+DP3 R6.z, R4, c[6];
+DP4 R9.x, R3, c[6];
+DP3 R6.w, R6, R6;
+RSQ R6.w, R6.w;
+MUL R6.xyz, R6, R6.w;
+DP3 R7.x, R6, c[8];
+DP3 R7.y, R6, c[9];
+DP3 R7.z, R6, c[10];
+DP3 R7.w, R6, c[11];
+MAX R7, R7, c[16].z;
+MOV R8.xyz, c[7];
+MAD R8.xyz, R7.x, c[12], R8;
+MAD R8.xyz, R7.y, c[13], R8;
+MAD R8.xyz, R7.z, c[14], R8;
+MAD R8.xyz, R7.w, c[15], R8;
+MUL R8.xyz, v[3], R8;
+MIN R8.xyz, R8, c[16].w;
+ADD R8.xyz, R8, -v[3];
+MAD o[COL0].xyz, R8, c[7].w, v[3];
+MOV o[COL0].w, v[3];
+MOV o[COL1], c[16].z;
+RCP R1.w, R5.w;
+MUL o[HPOS].xyz, R5, R1.w;
+MOV o[HPOS].w, R5;
+MUL o[FOGC].x, R9.x, c[95].x;
+MUL o[TEX0].xy, v[8], c[16];
+MOV o[TEX0].zw, c[16];
+END

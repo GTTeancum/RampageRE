@@ -33,6 +33,11 @@ static int host_shape_sphere(const RailHost *h, const char *shape, float centre[
 
 #define SPI 3.1415927f                               /* the scripts' own pi */
 #define TIMESTEP (1.0f / 30.0f)                      /* gWorld.getTimeStep(): its step, 1/30 [R 0x2B7800] */
+#ifdef RAMPAGE_XBOX
+#define STEP_ACC_MAX (TIMESTEP * 2.999f)             /* two steps a frame, under one carried over */
+#else
+#define STEP_ACC_MAX 0.25f
+#endif
 #define MAX_OBJS 128
 #define MAX_EVENTS 512
 #define MAX_SPAWN 8
@@ -165,7 +170,7 @@ static int find_rec(Group g, const char *key, Record *out)
     if (!g.at || !key)
         return 0;
     for (size_t i = 0; i < sizeof TYPED / sizeof *TYPED; i++) {
-        snprintf(k, sizeof k, "%s%s", TYPED[i], key);
+        prb_typed_key(k, sizeof k, TYPED[i], key);
         if (group_get(g, k, out))
             return 1;
     }
@@ -177,7 +182,7 @@ static const char *gstr(Group g, const char *key)    /* "" and "StringNotFound" 
     if (!g.at || !key)
         return NULL;
     for (size_t i = 0; i < sizeof TYPED / sizeof *TYPED; i++) {
-        snprintf(k, sizeof k, "%s%s", TYPED[i], key);
+        prb_typed_key(k, sizeof k, TYPED[i], key);
         const char *s = group_str(g, k);
         if (s)
             return *s && strcmp(s, "StringNotFound") ? s : NULL;
@@ -2198,8 +2203,11 @@ void rail_update(Rail *r, float dt, const ArmyMonster *m, int nm, const RailBox 
     r->b = b;
     r->nb = b ? nb : 0;
     r->acc += dt;
-    if (r->acc > 0.25f)
-        r->acc = 0.25f;
+    /* The console runs at most two steps in a frame and carries less than one over (the Xbox prototype's rule,
+     * docs/xbox_proto/GAME_SIDE.md: 0xa5480): after a slow frame the next is not made slow as well by seven steps
+     * of catching up. Below 15 frames a second the world slows down instead. */
+    if (r->acc > STEP_ACC_MAX)
+        r->acc = STEP_ACC_MAX;
     while (r->acc >= TIMESTEP) {                     /* the scripts count in frames: run them at the game's step */
         r->acc -= TIMESTEP;
         r->time += TIMESTEP;

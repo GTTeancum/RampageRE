@@ -344,7 +344,9 @@ typedef struct Viewer {
     int replay_frame; float replay_rows[2][3];       /* replay_log: the camera axes the game's monster read the stick
                                                         in (+0xA18, +0xA24), for player 1 in place of the port's */
     int ap_type, ap_players, ap_bots, ap_city, ap_demos;
-    int bot_guard_falls;                             /* buildings the bots' 60 s guard felled (for the watchdog) */
+    int ap_live;                                     /* Xbox test builds: autoplay on screen, drawn every frame on the
+                                                      * real clock (a load test), not offscreen in simulated time */
+    int bot_guard_falls;                            /* buildings the bots' 60 s guard felled (for the watchdog) */
     int play_values[8];                              /* gWorld.getPlayValue / setPlayValue (0x4D201C): the run's, never
                                                       * cleared (the airstrike's height in 0, the NY generators' ends) */
     int ny_generators;                               /* Boss_NY_Generator.bsf's numGenerators: from 0 as the city's
@@ -631,6 +633,8 @@ static Group mon_props(Mon *mo, const char *group)
     return b && b->wii ? city_book_group_wii(v->city, book, group) : city_book_group(v->city, book, group);
 }
 
+static void answer_ids_drop(void);
+
 static int start_moves(Mon *mo)
 {
     if (scene_construction_stop(mo->v)) return -1;
@@ -643,6 +647,7 @@ static int start_moves(Mon *mo)
         moves_free(&mo->graph);
         mo->have_graph = 0;
     }
+    answer_ids_drop();                           /* the calls' numbers go by their names' pointers: other names now */
     if (!mon_in(mo) || !v->scene.mon[mo->slot].bundle || moves_read(v->scene.mon[mo->slot].bundle, &mo->graph) != 0)
         return 0;                                /* absent graph keeps the existing no-graph behavior */
     if (moves_start(&mo->run, &mo->graph, moves_find(&mo->graph, "Ground_Idle")) != 0) {
@@ -1779,8 +1784,10 @@ static void build(Viewer *v)
         dircam_init(&v->cd, &v->cam);
         v->view = v->cd.out;
     }
-    if (v->have_scene)
+    if (v->have_scene) {
         rnd_scene(v->rnd, &v->scene);
+        rnd_preload(v->rnd);
+    }
     printf("%s %s%s: %u models drawn, %d people, %d rockets, %d not found\n", CITIES[v->city_index],
            v->blocks[v->block], v->night ? " (night)" : "", v->scene.nitems, v->scene.people, v->scene.nrockets,
            v->scene.missing);
@@ -1979,6 +1986,70 @@ static int along(Mon *mo, float p0)
     return (mo->mirror && p0 == 0) || (!mo->mirror && p0 > 0) ? -1 : 1;
 }
 
+/* answer's calls by number. A call's name goes through the compares once (answer_find, in the order answer always
+ * asked them in: the first that matches is the call) and its number is kept by the name's pointer, so a condition
+ * asked every frame by every monster compares no strings (the game binds a script call to its function when the
+ * script is compiled). The names are the graphs' own (MoveTrans.call, text of the monster's bundle), so the pointer
+ * says which name it is while the graphs live: the numbers are dropped whenever a graph is read (start_moves), a new
+ * bundle being free to stand where an old one's names did. */
+enum {
+    AN_UNKNOWN = 0,                                  /* not asked yet */
+    AN_HAS_DOUBLE_JUMP, AN_CAN_SPIN, AN_EYEGORE_CAN_SPIN,
+    AN_CAN_MOUNT, AN_MOUNT_IS_OCCUPIED, AN_CAN_HOP, AN_CAN_SWING, AN_CAN_MANTLE, AN_CAN_RESPAWN, AN_CAN_GRAB_PERSON,
+    AN_CAN_DO_PUNCH, AN_EDIBLE, AN_PICKUP_SUCCESS, AN_IS_HOLDING_EDIBLE, AN_IS_SHAKER, AN_CAN_TRANSFER,
+    AN_CAN_SPIDER_TRANSFER, AN_STOP_CLIMB_UP, AN_STOP_SPIDER_CLIMB_UP, AN_STOP_CLIMB_DOWN, AN_SHOULD_UNMOUNT_DOWN,
+    AN_HIT_ELECTRIC_SIGN,
+    AN_NONE                                          /* none of answer's own */
+};
+/* id: the call; power: edible_power_answer knows the name (hasRoarEnergy, hasChargePunch, ...: asked before the calls
+ * from AN_CAN_MOUNT on, as ever) */
+typedef struct { const char *call; uint8_t id, power; } AnswerId;
+static AnswerId answer_ids[1024];                    /* (by the pointer's hash; two names in one place take turns) */
+
+static void answer_ids_drop(void)
+{
+    memset(answer_ids, 0, sizeof answer_ids);
+}
+
+static int answer_find(const char *call)
+{
+    if (!strcmp(call, "Monsters::hasDoubleJump")) return AN_HAS_DOUBLE_JUMP;
+    if (!strcmp(call, "Monsters::canSpin")) return AN_CAN_SPIN;
+    if (!strcmp(call, "Eyegore::canSpin")) return AN_EYEGORE_CAN_SPIN;
+    if (!strcmp(call, "Monsters::canMount")) return AN_CAN_MOUNT;
+    if (!strcmp(call, "Monsters::mountIsOccupied")) return AN_MOUNT_IS_OCCUPIED;
+    if (!strcmp(call, "Monsters::canHop")) return AN_CAN_HOP;
+    if (!strcmp(call, "Monsters::canSwing")) return AN_CAN_SWING;
+    if (!strcmp(call, "Monsters::canMantle")) return AN_CAN_MANTLE;
+    if (!strcmp(call, "Monsters::canRespawn")) return AN_CAN_RESPAWN;
+    if (!strcmp(call, "Monsters::canGrabPerson")) return AN_CAN_GRAB_PERSON;
+    if (!strcmp(call, "Monsters::canDoPunch")) return AN_CAN_DO_PUNCH;
+    if (strstr(call, "::canGrabPowerup") || strstr(call, "::checkForHazard")) return AN_EDIBLE;
+    if (!strcmp(call, "Monsters::pickupSuccess")) return AN_PICKUP_SUCCESS;
+    if (!strcmp(call, "Monsters::isHoldlingEdible")) return AN_IS_HOLDING_EDIBLE;
+    if (!strcmp(call, "Monsters::isShaker")) return AN_IS_SHAKER;
+    if (!strcmp(call, "Monsters::canTransfer")) return AN_CAN_TRANSFER;
+    if (!strcmp(call, "Monsters::canSpiderTransfer")) return AN_CAN_SPIDER_TRANSFER;
+    if (!strcmp(call, "Monsters::stopClimbUp")) return AN_STOP_CLIMB_UP;
+    if (!strcmp(call, "Monsters::stopSpiderClimbUp")) return AN_STOP_SPIDER_CLIMB_UP;
+    if (!strcmp(call, "Monsters::stopClimbDown")) return AN_STOP_CLIMB_DOWN;
+    if (!strcmp(call, "Monsters::shouldUnmountDown")) return AN_SHOULD_UNMOUNT_DOWN;
+    if (!strcmp(call, "Monsters::hitElectricSign")) return AN_HIT_ELECTRIC_SIGN;
+    return AN_NONE;
+}
+
+static AnswerId answer_id(const char *call)
+{
+    AnswerId *k = &answer_ids[(uint32_t)((uintptr_t)call * 2654435761u) >> 22];
+    if (k->call != call || k->id == AN_UNKNOWN) {
+        static const EdiblePower nothing;            /* edible_power_answer says -1 only for a name it does not know */
+        k->call = call;
+        k->id = (uint8_t)answer_find(call);
+        k->power = edible_power_answer(&nothing, call) >= 0;
+    }
+    return *k;
+}
+
 static int answer(void *ctx, const char *call, const float *a)
 {
     if (scene_construction_stop(((Mon *)ctx)->v)) return 0;
@@ -1986,9 +2057,11 @@ static int answer(void *ctx, const char *call, const float *a)
     Viewer *v = mo ? mo->v : NULL;
     if (!mo)
         return 0;
-    if (!strcmp(call, "Monsters::hasDoubleJump"))    /* Monsters.bsf: hasDoubleJumped() == 0 (+0xAB7) [R] */
+    const AnswerId k = answer_id(call);              /* (a copy: a call below may come back here for another name) */
+    switch (k.id) {
+    case AN_HAS_DOUBLE_JUMP:                        /* Monsters.bsf: hasDoubleJumped() == 0 (+0xAB7) [R] */
         return !mo->double_jumped;
-    if (!strcmp(call, "Monsters::canSpin")) {        /* Monsters.bsf: a jump's first spin, two more with MULTI-SPIN
+    case AN_CAN_SPIN:                                /* Monsters.bsf: a jump's first spin, two more with MULTI-SPIN
                                                       * (upgrade flag 2), cheat 8 or the rage; each counted
                                                       * (incJumpSpinCount) [R] */
         if (mo->spins == 0 || (mo->spins <= 2 && ((mo->power.abilities & 2) || (mo->power.cheats & 8) || mo->power.rage))) {
@@ -1996,65 +2069,90 @@ static int answer(void *ctx, const char *call, const float *a)
             return 1;
         }
         return 0;
-    }
-    if (!strcmp(call, "Eyegore::canSpin")) {         /* Eyegore.bsf's own: the first counted, then with MULTI-SPIN, */
+    case AN_EYEGORE_CAN_SPIN:                        /* Eyegore.bsf's own: the first counted, then with MULTI-SPIN, */
         if (mo->spins == 0) {                        /* cheat 8 or the rage any number, uncounted [R] */
             mo->spins++;
             return 1;
         }
         return (mo->power.abilities & 2) || (mo->power.cheats & 8) || mo->power.rage;
+    default:
+        break;
     }
-    int r = v ? edible_power_answer(&mo->power, call) : -1;   /* hasRoarEnergy, hasChargePunch, ... (edible.c) */
+    int r = v && k.power ? edible_power_answer(&mo->power, call) : -1;   /* hasRoarEnergy, hasChargePunch, ... (edible.c) */
     if (r >= 0)
         return r;
     if (!v)
         return 0;
-    Climber c = climber(mo);
     const Scene *sc = &v->scene;
-    if (!strcmp(call, "Monsters::canMount")) {       /* (side, z offset, style): styles 2 / 3 swap the sides */
+    Climber c;                                       /* (made for the calls that climb only: it gathers the other
+                                                      * monsters' shapes, and most calls of a frame do not look) */
+    switch (k.id) {
+    case AN_CAN_MOUNT: {                             /* (side, z offset, style): styles 2 / 3 swap the sides */
         int side = (int)a[0];
         if ((a[2] == 2 && mo->mirror) || (a[2] == 3 && !mo->mirror))
             side = side == 0 ? 1 : side == 1 ? 0 : side;
+        c = climber(mo);
         return climb_can_mount(&mo->mount, sc, &c, side, a[1]) == 1;
     }
-    if (!strcmp(call, "Monsters::mountIsOccupied")) {
+    case AN_MOUNT_IS_OCCUPIED: {
+        c = climber(mo);
         int r = climb_can_mount(&mo->mount, sc, &c, (int)a[0], 0);
         return r == -1 || r == -2 || r == -3 || r == -5 || r == -6;
     }
-    if (!strcmp(call, "Monsters::canHop")) return climb_can_climb(&mo->mount, sc, &c, 0, along(mo, a[0]), 0) == 3;
-    if (!strcmp(call, "Monsters::canSwing")) return climb_can_climb(&mo->mount, sc, &c, 0, along(mo, a[0]), 0) == 4;
-    if (!strcmp(call, "Monsters::canMantle")) return climb_can_climb(&mo->mount, sc, &c, 1, 0, 0) == 5;
-    if (!strcmp(call, "Monsters::canRespawn"))       /* 0x2D3D80: lives left, become human, its streaker not held */
+    case AN_CAN_HOP:
+        c = climber(mo);
+        return climb_can_climb(&mo->mount, sc, &c, 0, along(mo, a[0]), 0) == 3;
+    case AN_CAN_SWING:
+        c = climber(mo);
+        return climb_can_climb(&mo->mount, sc, &c, 0, along(mo, a[0]), 0) == 4;
+    case AN_CAN_MANTLE:
+        c = climber(mo);
+        return climb_can_climb(&mo->mount, sc, &c, 1, 0, 0) == 5;
+    case AN_CAN_RESPAWN:                             /* 0x2D3D80: lives left, become human, its streaker not held */
         return v->game ? game_can_respawn(v->game, mo->slot, mo->streaker >= 0 && v->scene.folk &&
                                           people_get(v->scene.folk, mo->streaker)->phase == PP_HELD) : mo->defeated;
-    if (!strcmp(call, "Monsters::canGrabPerson")) return window_person(mo, a + 1) >= 0 || window_soldier(mo, a + 1) >= 0;
-    if (!strcmp(call, "Monsters::canDoPunch")) {     /* not at a person's or a power-up's window */
+    case AN_CAN_GRAB_PERSON:
+        return window_person(mo, a + 1) >= 0 || window_soldier(mo, a + 1) >= 0;
+    case AN_CAN_DO_PUNCH: {                          /* not at a person's or a power-up's window */
         int e = edible_call(mo, call, a + 1);
     if (scene_construction_stop(((Mon *)ctx)->v)) return 0;
         return e >= 0 ? e : window_person(mo, a + 1) < 0 && window_soldier(mo, a + 1) < 0;
     }
-    if (strstr(call, "::canGrabPowerup") || strstr(call, "::checkForHazard"))
+    case AN_EDIBLE:                                  /* ::canGrabPowerup, ::checkForHazard */
         return edible_call(mo, call, a + 1) > 0;
-    if (!strcmp(call, "Monsters::pickupSuccess") || !strcmp(call, "Monsters::isHoldlingEdible"))
-        return call[10] == 'p' ? held_anything(mo) : held_edible(mo);                      /* hasGrabbedObject 2 (0x2E5590): the held object's flag 0x80000 */
-    if (!strcmp(call, "Monsters::isShaker"))         /* Ground_Grab_Down -> Ground_Hold_Shake */
+    case AN_PICKUP_SUCCESS:
+        return held_anything(mo);
+    case AN_IS_HOLDING_EDIBLE:                       /* hasGrabbedObject 2 (0x2E5590): the held object's flag 0x80000 */
+        return held_edible(mo);
+    case AN_IS_SHAKER:                               /* Ground_Grab_Down -> Ground_Hold_Shake */
         return held_shaker(mo) != 0;
-    if (!strcmp(call, "Monsters::canTransfer"))      /* (right): mirrored the other way */
+    case AN_CAN_TRANSFER:                            /* (right): mirrored the other way */
+        c = climber(mo);
         return climb_can_transfer(&mo->mount, sc, &c, mo->mirror ? a[0] == 0 : a[0] == 1) == 1;
-    if (!strcmp(call, "Monsters::canSpiderTransfer"))   /* (right): mirrored always right */
+    case AN_CAN_SPIDER_TRANSFER:                     /* (right): mirrored always right */
+        c = climber(mo);
         return climb_can_transfer(&mo->mount, sc, &c, mo->mirror || a[0] != 0) == 1;
-    if (!strcmp(call, "Monsters::stopClimbUp") || !strcmp(call, "Monsters::stopSpiderClimbUp")) {
-        int r = climb_can_climb(&mo->mount, sc, &c, 1, 0, !strcmp(call, "Monsters::stopSpiderClimbUp"));
+    case AN_STOP_CLIMB_UP:
+    case AN_STOP_SPIDER_CLIMB_UP: {
+        c = climber(mo);
+        int r = climb_can_climb(&mo->mount, sc, &c, 1, 0, k.id == AN_STOP_SPIDER_CLIMB_UP);
         if (getenv("RAMPAGE_TRACE"))
             printf("  canClimb up %d (mount z %.1f, top %.1f)\n", r, mo->mount.at.pt[2],
                    mo->mount.at.building >= 0 ? sc->buildings[mo->mount.at.building].b.max[2] : 0);
         return r != 2;
     }
-    if (!strcmp(call, "Monsters::stopClimbDown")) return climb_can_climb(&mo->mount, sc, &c, -1, 0, 0) != 2;
-    if (!strcmp(call, "Monsters::shouldUnmountDown")) return climb_can_climb(&mo->mount, sc, &c, -1, 0, 0) == -1;
-    if (!strcmp(call, "Monsters::hitElectricSign"))
+    case AN_STOP_CLIMB_DOWN:
+        c = climber(mo);
+        return climb_can_climb(&mo->mount, sc, &c, -1, 0, 0) != 2;
+    case AN_SHOULD_UNMOUNT_DOWN:
+        c = climber(mo);
+        return climb_can_climb(&mo->mount, sc, &c, -1, 0, 0) == -1;
+    case AN_HIT_ELECTRIC_SIGN:
+        c = climber(mo);
         return climb_can_climb(&mo->mount, sc, &c, a[0] == 0 ? 1 : -1, 0, 0) == -2;
-    return 0;                                        /* canGrabPerson, ...: not here */
+    default:
+        return 0;                                    /* canGrabPerson, ...: not here */
+    }
 }
 
 /* the clip events the viewer acts on: the movement mode, and Monsters.bsf's velocity functions (jumpNorm and its kin
@@ -3161,6 +3259,7 @@ static void world_monster_moved(Mon *mo, const float (*sp)[4], int ns)
         memcpy(o->m + 9, sp[k], 3 * sizeof(float));
         o->shape.radius = o->shape.half[0] = o->shape.half[1] = o->shape.half[2] = r;
         o->shape.raw[3] = r * r;
+        collide_moved(&v->cw, mo->msph0 + k);        /* (the world keeps each object's sphere for its queries) */
     }
 }
 
@@ -3410,11 +3509,44 @@ static void mon_cyl(const Mon *mo, float c[3], float *r, float *h)
 
 static void mon_shape(const Mon *mo, float c[3], float *r)
 {
+#ifdef RAMPAGE_XBOX
+    /* Asked a dozen times a frame for every monster (each climbing probe of each of the others, the attacks): its
+     * bones' spheres through two matrices and a merge with three roots a sphere, 3 % of the busiest frames. It only
+     * changes when the monster is posed or placed again, so the answer is kept while the pose (Instance.pose_serial),
+     * the placement, the mirroring and the scale are the ones it was worked out for. */
+    static struct {
+        const Instance *in; uint32_t serial; float base[16], scale, c[3], r; int mirror, have;
+    } memo[MONSTERS];
+    const Instance *in_now = mon_in(mo);
+    long slot = mo->v ? (long)(mo - mo->v->mon) : -1;
+    if (in_now && slot >= 0 && slot < MONSTERS) {
+        if (memo[slot].have && memo[slot].in == in_now && memo[slot].serial == in_now->pose_serial &&
+            memo[slot].mirror == mo->mirror && memo[slot].scale == mo->scale &&
+            memcmp(memo[slot].base, in_now->base.m, sizeof memo[slot].base) == 0) {
+            memcpy(c, memo[slot].c, sizeof memo[slot].c);
+            *r = memo[slot].r;
+            return;
+        }
+    } else
+        slot = -1;
+#endif
     float sp[64][4], s = mo->scale > 0 ? mo->scale : 1;
     int n = mon_spheres(mo, sp, 64);
     for (int i = 0; i < n; i++)
         sp[i][3] *= s;
     army_monster_shape((const float (*)[4])sp, n, c, r);
+#ifdef RAMPAGE_XBOX
+    if (slot >= 0) {
+        memo[slot].in = in_now;
+        memo[slot].serial = in_now->pose_serial;
+        memo[slot].mirror = mo->mirror;
+        memo[slot].scale = mo->scale;
+        memcpy(memo[slot].base, in_now->base.m, sizeof memo[slot].base);
+        memcpy(memo[slot].c, c, sizeof memo[slot].c);     /* (c is left as it was when there is no shape: r < 0) */
+        memo[slot].r = *r;
+        memo[slot].have = 1;
+    }
+#endif
 }
 
 /* the armed part whose attack the collision shape i's bone holds (the newest arming of a part with that bone), or
@@ -6698,6 +6830,8 @@ static void mon_step(Mon *mo, float dt)
                 seen_root(mo->mirror, bake_p, &r, bake_r);
             }
             const MoveState *to = &mo->graph.states[mo->run.state];
+#ifndef RAMPAGE_XBOX                                 /* (the console: no log line per state change, a format and a
+                                                      * write several times a second for every monster) */
             if (mo->run.from != mo->run.state && mo->slot)   /* (the other monsters' marked with their slot) */
                 printf(getenv("RAMPAGE_TRACE") ? "[%d] %s -> %s (%s) by %d\n" : "[%d] %s -> %s (%s)\n", mo->slot + 1,
                        st->name ? st->name : "?", to->name ? to->name : "?", to->clip ? to->clip : "-",
@@ -6707,6 +6841,7 @@ static void mon_step(Mon *mo, float dt)
                        to->name ? to->name : "?", to->clip ? to->clip : "-", ev == 0 ? -2 : mo->run.via);
             if (getenv("RAMPAGE_TRACE"))
                 printf("  stick %.2f %.2f size %.2f\n", lx, ly, in->v[MV_L_SIZE]);
+#endif
             /* the transition says whether the new clip blends in (over the new state's blend time) or cuts; a start
              * the game forces (a slot: 0x2C0DC0 .. 0x2C0E78, +0x110) takes no transition and blends in when the new
              * state's blend time is over 0.001, else cuts [R], which is what blending over its time does; it starts
@@ -9226,6 +9361,22 @@ static void gui_log_bound(void)                      /* a bound for whatever sti
 #define DEBUG_TITLE 1                                /* city, block, clip, triangles, fps and effects in the title */
 #endif
 
+
+/* a frame's quad lists. The Xbox's 64 MB: the HUD's and the front end's lists are one (a frame draws one of them),
+ * 4,096 quads as the front end's always was, and the effects' half the desktop's (the lists were 2.4 MB of the
+ * program's image) */
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+volatile uint32_t g_xbox_heavy_frame;      /* test builds: 1 while frames miss 60 a second (read by a profiler) */
+#endif
+#ifdef RAMPAGE_XBOX
+#define HUD_QUADS_MAX 4096
+#define FX_QUADS_MAX 4096
+static HudQuad xbox_hud_quads[HUD_QUADS_MAX];
+#else
+#define HUD_QUADS_MAX 8192
+#define FX_QUADS_MAX 8192
+#endif
+
 static int viewer_main(int argc, char **argv)
 {
     static Viewer v;
@@ -9321,6 +9472,40 @@ static int viewer_main(int argc, char **argv)
             have_view = 1;
         }
         else if (strcmp(argv[i], "--autoplay") == 0) autoplay = 1;   /* the playthrough test (docs/NATIVE.md) */
+#ifdef RAMPAGE_XBOX
+        else if (strcmp(argv[i], "--xoff") == 0 && i + 1 < argc) {   /* a test build's switch (render_gl.c g_xbox_*):
+                                                      * quads, own, region, skin, skip; several: --xoff a --xoff b */
+            extern int g_xbox_direct_quads, g_xbox_own_parts, g_xbox_region_bake, g_xbox_gpu_skin, g_xbox_item_skip;
+            extern int g_xbox_preload, g_xbox_rigid;
+            const char *n = argv[++i];
+            if (!strcmp(n, "quads")) g_xbox_direct_quads = 0;
+            else if (!strcmp(n, "own")) g_xbox_own_parts = 0;
+            else if (!strcmp(n, "region")) g_xbox_region_bake = 0;
+            else if (!strcmp(n, "skin")) g_xbox_gpu_skin = 0;
+            else if (!strcmp(n, "skip")) g_xbox_item_skip = 0;
+            else if (!strcmp(n, "preload")) g_xbox_preload = 0;
+            else if (!strcmp(n, "rigid")) g_xbox_rigid = 0;
+            else if (!strcmp(n, "twobuf")) { extern int g_xbox_two_buffers; g_xbox_two_buffers = 0; }
+            else if (!strcmp(n, "p8")) { extern int g_xbox_direct_p8; g_xbox_direct_p8 = 0; }
+            else if (!strcmp(n, "batpace")) { extern int g_xbox_batch_pace; g_xbox_batch_pace = 0; }
+            else if (!strcmp(n, "meshdrop")) { extern int g_xbox_mesh_drop; g_xbox_mesh_drop = 0; }
+            else if (!strcmp(n, "longpb")) { extern int g_xbox_long_pushbuffer; g_xbox_long_pushbuffer = 0; }
+            else if (!strcmp(n, "texdrop")) { extern int g_xbox_tex_drop; g_xbox_tex_drop = 0; }
+            else if (!strcmp(n, "glyphs")) { extern int g_xbox_glyphs; g_xbox_glyphs = 0; }
+            printf("xbox test switch off: %s\n", n);
+        }
+        else if (strcmp(argv[i], "--xvideo") == 0 && i + 1 < argc) { /* the picture, whatever the dashboard says: 480
+                                                      * (4:3), 481 (480 lines drawn for a 16:9 screen), 720 */
+            extern int g_xbox_video;
+            g_xbox_video = atoi(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--xon") == 0 && i + 1 < argc) {    /* and the ones that are off by default */
+            extern int g_xbox_sound_preload;
+            const char *n = argv[++i];
+            if (!strcmp(n, "sndpre")) g_xbox_sound_preload = 1;
+            printf("xbox test switch on: %s\n", n);
+        }
+#endif
         else if (strcmp(argv[i], "--ap-log") == 0 && i + 1 < argc) ap_log = argv[++i];
         else if (strcmp(argv[i], "--movelog") == 0 && i + 1 < argc) {   /* tools/movelog.py */
             v.movelog = fopen(argv[++i], "w");
@@ -9386,6 +9571,9 @@ static int viewer_main(int argc, char **argv)
     if (!data_check(pos[0], &v.vol, msg, sizeof msg))   /* another release: say so, carry on */
         plat_message(msg, 1);
     v.region = data_region(pos[0], &v.vol);
+#ifdef RAMPAGE_XBOX
+    xtp_open(pos[0]);                                /* the Xbox button pictures: XBOXTEX.RXT beside the VOL, if there */
+#endif
 #ifdef __ANDROID__
     if (wii_pick)                                    /* the Wii's data through the file picker, copied into wii */
         android_wii_setup();
@@ -9477,16 +9665,21 @@ static int viewer_main(int argc, char **argv)
      * never for a --shot run, nor with --mute */
     if (sound_init(&v.vol) > 0 && !shot && !mute && sound_start() != 0)
         printf("no sound output\n");
+#ifdef RAMPAGE_XBOX
+    {
+        /* The prototype keeps its whole sample bank in memory (docs/xbox_proto/SOUND_LOADING_FRAME.md): nothing is
+         * read at a sound's first play. Here that is 8.6 MB of the console's 64, which the GPU's static store wants
+         * as well, so it is asked for (--xon sndpre) until a test run has shown what memory is left. */
+        extern int g_xbox_sound_preload;
+        if (g_xbox_sound_preload)
+            sound_preload_all();
+    }
+#endif
     {                                                /* the effects: fx.bdp, its words from RAMPAGE.ELF beside the VOL */
-        uint32_t size = 0;
-        uint8_t *data = vol_read(&v.vol, "fx.bdp", &size);
-        uint32_t gsize = 0, csize = 0;                /* the HUD's: WorldGui.bdp and CommonGUI.bdp */
-        uint8_t *gui = vol_read(&v.vol, "WorldGui.bdp", &gsize), *common = vol_read(&v.vol, "CommonGUI.bdp", &csize);
-        int have_world = gui && bdp_load(&v.gui_world, gui, gsize) == 0;
-        int have_common = common && bdp_load(&v.gui_common, common, csize) == 0;
+        /* the HUD's: WorldGui.bdp and CommonGUI.bdp */
+        int have_world = bdp_open(&v.gui_world, &v.vol, "WorldGui.bdp") == 0;
+        int have_common = bdp_open(&v.gui_common, &v.vol, "CommonGUI.bdp") == 0;
         v.have_gui = have_world && have_common;
-        if (!have_world) free(gui);
-        if (!have_common) free(common);
         if (!v.have_gui) {
             bdp_free(&v.gui_world);
             bdp_free(&v.gui_common);
@@ -9503,7 +9696,7 @@ static int viewer_main(int argc, char **argv)
                 free(wd);
             wii_b[k]->scope = k ? "GUI" : "fx";
         }
-        if (data && bdp_load(&v.fx_bundle, data, size) == 0) {
+        if (bdp_open(&v.fx_bundle, &v.vol, "fx.bdp") == 0) {
             v.fx_bundle.scope = "fx";
             const Bundle *bl[2] = { &v.fx_bundle, &v.wii_fx };   /* the PS2's first: its names win */
             snprintf(v.data_path, sizeof v.data_path, "%s", pos[0]);
@@ -9523,8 +9716,7 @@ static int viewer_main(int argc, char **argv)
                         v.fx_shapes[i][v.fx_nshapes[i]++].b = fx_shape_bundle(v.fxlib, i);
             }
 
-        } else
-            free(data);
+        }
     }
     v.night = night;
     prof_init(&v);                                   /* the profile: rampage_profile.bin (a --shot run: a new one,
@@ -9585,11 +9777,16 @@ static int viewer_main(int argc, char **argv)
     v.clip = clip;
     if (autoplay) {                                  /* --autoplay: offscreen alone, in simulated time */
         char lp[1024], what[1024] = "";
-        if (!shot) {
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+        v.ap_live = !shot;                           /* a load test: on screen, real time */
+        if (v.ap_live)
+            v.unattended = 1;                        /* (the results screens answer themselves, as with --shot) */
+#endif
+        if (!shot && !v.ap_live) {
             plat_message("--autoplay runs with --shot (no window).", 1);
             return 1;
         }
-        snprintf(lp, sizeof lp, "%s.log", shot);
+        snprintf(lp, sizeof lp, "%s.log", shot ? shot : "autoplay");
         for (int i = 1; i < argc; i++)
             snprintf(what + strlen(what), sizeof what - strlen(what), "%s%s", i > 1 ? " " : "", argv[i]);
         ap_lim.stop_at_menu = !ap_lim.demos;         /* back at the main menu after a game: over */
@@ -9732,11 +9929,12 @@ static int viewer_main(int argc, char **argv)
         float dt = (float)(now - last);
         last = now;
         int apf = 0;                                 /* --autoplay: the watchdog's asks this frame */
-        if (v.ap) {                                  /* simulated time, 60 frames a second */
+        if (v.ap && !v.ap_live) {                    /* simulated time, 60 frames a second */
             dt = 1.0f / 60;
             v.ap_t += dt;
             now = start + v.ap_t;
-        }
+        } else if (v.ap)                             /* (the live load test: the autopilot's clock is the real one) */
+            v.ap_t += dt > 0.1f ? 0.1f : dt;
         int cap_draw = 0;                            /* RAMPAGE_CAPTURE: this step's picture is a frame */
         if (cap_v) {
             if (cap_step == cap_to) {
@@ -9794,7 +9992,11 @@ static int viewer_main(int argc, char **argv)
                 }
             } else if (!shot)
                 shell_frame(&v, &w, dt > 0.1f ? 0.1f : dt);
+#ifdef RAMPAGE_XBOX
+            HudQuad *sq = xbox_hud_quads;                /* (shared with the game's HUD: one or the other is drawn) */
+#else
             static HudQuad sq[4096];
+#endif
             v.shell_scene->hud = sq;
             v.gui_side = w.height ? fmaxf(0, (480.0f * (float)w.width / (float)w.height - 640) / 2) : 0;
             shell_set_wide(v.shell, v.gui_side);
@@ -10046,12 +10248,14 @@ leave_world:
                 v.scene.nspheres = 0;
         }
         if (scene_construction_stop(&v)) continue;
-        if (v.ap && !v.shell && !((apf = autoplay_watch(&v)) & (AP_SHOT | AP_STOP)) && !cap_draw)
+        if (v.ap && !v.shell && !((apf = autoplay_watch(&v)) & (AP_SHOT | AP_STOP)) && !cap_draw && !v.ap_live)
             continue;                                /* --autoplay: nothing to draw */
+        if (v.ap_live && (apf & AP_STOP))            /* the live load test: over when the watchdog says so */
+            break;
         {                                            /* this frame's particles */
-            static FxQuad quads[8192];
+            static FxQuad quads[FX_QUADS_MAX];
             v.scene.fx = quads;
-            v.scene.nfx = v.fxw ? fx_quads(v.fxw, quads, 8192) : 0;
+            v.scene.nfx = v.fxw ? fx_quads(v.fxw, quads, FX_QUADS_MAX) : 0;
             shadow_frame(&v, cap_v ? 2.0f / 60 : shot ? 1.0f : (dt > 0.1f ? 0.1f : dt));
             if (scene_construction_stop(&v)) continue;
             if (shot && getenv("RAMPAGE_TRACE")) {
@@ -10072,7 +10276,11 @@ leave_world:
                        v.scene.nfx ? quads[0].pos[2] : 0, v.scene.nfx ? quads[0].size[0] : 0, v.scene.nfx ? quads[0].col[3] : 0);
         }
         {                                            /* the HUD, through this frame's camera */
-            static HudQuad hq[8192];
+#ifdef RAMPAGE_XBOX
+            HudQuad *hq = xbox_hud_quads;
+#else
+            static HudQuad hq[HUD_QUADS_MAX];
+#endif
             if (have_view) {
                 Camera fixed = { { view[0], view[1], view[2] }, view[3] / 57.2957795f, view[4] / 57.2957795f, 60 };
                 v.hud_cam = fixed;
@@ -10084,10 +10292,10 @@ leave_world:
             int nq = 0;                              /* the other players' HUDs, then player 1's (the screens) */
             for (int k = 1; k < v.nmon; k++)
                 if (v.mon[k].hud && v.mon[k].hud != v.hud)
-                    nq += hud_quads(v.mon[k].hud, hq + nq, 8192 - nq);
-            nq += v.hud ? hud_quads(v.hud, hq + nq, 8192 - nq) : 0;
+                    nq += hud_quads(v.mon[k].hud, hq + nq, HUD_QUADS_MAX - nq);
+            nq += v.hud ? hud_quads(v.hud, hq + nq, HUD_QUADS_MAX - nq) : 0;
             if (shell_popup_shown(v.popup))          /* the SaveGame popup over the screens */
-                nq += shell_quads(v.popup, hq + nq, 8192 - nq);
+                nq += shell_quads(v.popup, hq + nq, HUD_QUADS_MAX - nq);
             v.scene.nhud = nq;
             gui3d_layers(&v, shell_popup_shown(v.popup) ? v.popup : NULL, &v.scene);
         }
@@ -10135,6 +10343,53 @@ leave_world:
         sound_pump();
 #endif
         frames++;
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+        {                                            /* test builds: the frame rate and slowest frame, every 5 s */
+            static double fps_at, frame_last, frame_worst;
+            static unsigned fps_frames;
+            if (frame_last > 0 && now - frame_last > frame_worst)
+                frame_worst = now - frame_last;
+            {                                        /* for a profiler outside (it reads this word with each sample):
+                                                      * the frame just ended missed the display's 60 a second */
+                extern volatile uint32_t g_xbox_heavy_frame;
+                g_xbox_heavy_frame = frame_last > 0 && now - frame_last > 0.0185;
+            }
+            frame_last = now;
+            fps_frames++;
+            if (fps_at == 0)
+                fps_at = now;
+            else if (now - fps_at >= 5.0) {
+                /* (the GPU's static store, nxdk-gles11 gli_static_stats: live bytes and arrays, arrays served, arrays
+                 * staged under the hint, chunks, adds refused for want of room) */
+                extern volatile uint32_t gli_static_stats[6];
+                static uint32_t staged_before, refused_before;
+                printf("xbox frames fps=%.1f worst_ms=%.0f triangles=%u city=%s block=%s store_kb=%lu arrays=%lu "
+                       "chunks=%lu staged=%lu refused=%lu\n", fps_frames / (now - fps_at),
+                       frame_worst * 1000.0, rnd_triangles(v.rnd), CITIES[v.city_index],
+                       v.nblocks ? v.blocks[v.block] : "-", (unsigned long)(gli_static_stats[0] / 1024),
+                       (unsigned long)gli_static_stats[1], (unsigned long)gli_static_stats[4],
+                       (unsigned long)(gli_static_stats[3] - staged_before),
+                       (unsigned long)(gli_static_stats[5] - refused_before));
+                staged_before = gli_static_stats[3];
+                refused_before = gli_static_stats[5];
+                {                                    /* and its textures: count, bytes asked for, bytes held */
+                    extern void gliTextureMemoryStats(uint32_t out[8]);
+                    uint32_t tm[8];
+                    gliTextureMemoryStats(tm);
+                    printf("xbox textures images=%lu asked_kb=%lu held_kb=%lu\n", (unsigned long)tm[1],
+                           (unsigned long)(tm[2] / 1024), (unsigned long)(tm[3] / 1024));
+                }
+                {                                    /* the most one frame staged (of the 2 MiB arena's two frames) */
+                    extern volatile uint32_t gli_staging_peak;
+                    printf("xbox staging frame_peak_kb=%lu\n", (unsigned long)(gli_staging_peak / 1024));
+                    gli_staging_peak = 0;
+                }
+                fps_at = now;
+                fps_frames = 0;
+                frame_worst = 0;
+            }
+        }
+#endif
 #if defined RAMPAGE_GUI && defined _WIN32 && !defined RAMPAGE_XBOX
         if (now - title_at > 0.5)
             gui_log_bound();
@@ -10185,6 +10440,46 @@ int main(int argc, char **argv)                      /* (Android: SDL_main, andr
         MessageBoxA(NULL, g_gui_log ? "RampageRE could not start. rampage.log (beside rampage.cfg) says why." :
                     "RampageRE could not start.", "RampageRE", MB_ICONERROR);
     return r;
+#elif defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+    /* Test builds only (CMake RAMPAGE_XBOX_TEST_ARGS): an XBE gets no command line, so a fixed one is built in,
+     * e.g. "Chicago 1 --players 4 --autoplay --ap-seed 1". Space separated, no quoting. */
+    static char test_line[] = RAMPAGE_XBOX_TEST_ARGS;
+    static char *test_argv[32];
+    int test_argc = 0;
+    test_argv[test_argc++] = argc > 0 ? argv[0] : "default.xbe";
+    for (char *p = strtok(test_line, " "); p && test_argc < 31; p = strtok(NULL, " "))
+        test_argv[test_argc++] = p;
+    test_argv[test_argc] = NULL;
+    printf("xbox test command line: %s\n", RAMPAGE_XBOX_TEST_ARGS);
+    return viewer_main(test_argc, test_argv);
+#elif defined RAMPAGE_XBOX
+    /* The console gives an XBE no command line. A text file in the game's save folder stands in for one, so a path
+     * can be switched on the console itself without another build: E:\UDATA\RampageRE\xbox_args.txt, words
+     * separated by spaces or line ends, e.g. "--xvideo 480" (640 x 480 whatever the dashboard says), "--xoff
+     * twobuf" (three screen buffers at 1280 x 720), "--xoff longpb", "--xoff texdrop", "--xoff p8", "--xoff glyphs"
+     * (docs/XBOX_PERF_PLAN.md lists them). No file: nothing changes. */
+    static char args_text[512];
+    static char *args_argv[48];
+    int args_argc = 0;
+    args_argv[args_argc++] = argc > 0 ? argv[0] : "default.xbe";
+    for (int i = 1; i < argc && args_argc < 16; i++)
+        args_argv[args_argc++] = argv[i];
+    plat_xbox_home();
+    FILE *args_file = fopen("E:\\UDATA\\RampageRE\\xbox_args.txt", "rb");
+    if (args_file) {
+        size_t got = fread(args_text, 1, sizeof args_text - 1, args_file);
+        fclose(args_file);
+        args_text[got] = 0;
+        int first = args_argc;
+        args_argv[args_argc++] = "--shell";          /* (with no words at all the game starts its front end; with
+                                                      * these switches it still does) */
+        for (char *p = strtok(args_text, " \t\r\n"); p && args_argc < 47; p = strtok(NULL, " \t\r\n"))
+            args_argv[args_argc++] = p;
+        if (args_argc == first + 1)                  /* an empty file: as no file */
+            args_argc = first;
+    }
+    args_argv[args_argc] = NULL;
+    return viewer_main(args_argc, args_argv);
 #else
     return viewer_main(argc, argv);
 #endif

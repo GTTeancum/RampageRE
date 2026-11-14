@@ -79,12 +79,23 @@ typedef struct {
 #define COLLIDE_MAX_OBJ 768
 #define COLLIDE_MAX_BUILDINGS 32
 #define COLLIDE_ROW_MAX 16
+#define COLLIDE_CELLS 16                             /* the cells the objects are kept by, along x and along y */
+#define COLLIDE_WORDS ((COLLIDE_MAX_OBJ + 31) / 32)  /* a bit an object */
 
 typedef struct {
     CollideObj o[COLLIDE_MAX_OBJ]; int no;
     CollideBuilding b[COLLIDE_MAX_BUILDINGS]; int nb;
     int row[2][COLLIDE_ROW_MAX], nrow[2];            /* +0x10 / +0x18: each row by its x (0x2A51B0) */
     float back_row;                                  /* BackRowOffset (0x4D502C): the back row's fronts' y */
+    /* collide.c's own, so that a query does not walk every object working out where each one is: an object's
+     * bounding sphere in the world (its shape's centre through its matrix, its radius), made when it is added and
+     * again whenever its matrix or shape is written (collide_moved); the cells along x and along y that it reaches
+     * (cell: first and last of each), and per cell the objects there, a bit each (walked in index order, so a query
+     * gives what the walk over all of them gave, in the same order); stamp counts the changes */
+    float bound[COLLIDE_MAX_OBJ][4];
+    uint8_t cell[COLLIDE_MAX_OBJ][4];
+    uint32_t in_x[COLLIDE_CELLS][COLLIDE_WORDS], in_y[COLLIDE_CELLS][COLLIDE_WORDS];
+    uint32_t stamp;
 } CollideWorld;
 
 /* each frame: empty it; back_row is the block's BackRowOffset (10 when the block does not say; < 0: taken from the
@@ -95,6 +106,9 @@ void collide_begin(CollideWorld *w, float back_row);
 int collide_add_building(CollideWorld *w, const float min[3], const float max[3], int row, int state, int falling, int tag);
 /* an object with a shape (in the world list gp - 0x6CFC +0x58); returns its index, -1 full */
 int collide_add(CollideWorld *w, const CollideShape *s, const float m[12], uint32_t flags, int tag, int kind);
+/* object obj's matrix or shape was written in place (w->o[obj].m, .shape): what the world keeps of it for its queries
+ * is made again. Its flags need none of this */
+void collide_moved(CollideWorld *w, int obj);
 void collide_finish(CollideWorld *w);                /* the rows sorted, the roofs' neighbours (0x2A4C70) */
 
 /* helpers for the matrices: a heading (degrees about z, main.c's: x axis (cos, sin, 0)) and a place */

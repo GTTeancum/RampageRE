@@ -104,6 +104,7 @@ struct Army {
     Chain chain[MAX_BUILDINGS];
     /* this frame */
     const ArmyMonster *m; int nm;
+    float m_centre[ARMY_MONSTERS][3]; int m_centre_ok[ARMY_MONSTERS];   /* monster_centre of m[], once a frame */
     const ArmyBox *b; int nb;
     float dt;
     float view[2];                                   /* about the camera's x (army_set_view) */
@@ -230,7 +231,7 @@ static int find_rec(Group g, const char *key, Record *out)
     if (!g.at || !key)
         return 0;
     for (size_t i = 0; i < sizeof TYPED / sizeof *TYPED; i++) {
-        snprintf(k, sizeof k, "%s%s", TYPED[i], key);
+        prb_typed_key(k, sizeof k, TYPED[i], key);
         if (group_get(g, k, out))
             return 1;
     }
@@ -242,7 +243,7 @@ static const char *gstr(Group g, const char *key)
     if (!g.at || !key)
         return NULL;
     for (size_t i = 0; i < sizeof TYPED / sizeof *TYPED; i++) {
-        snprintf(k, sizeof k, "%s%s", TYPED[i], key);
+        prb_typed_key(k, sizeof k, TYPED[i], key);
         const char *s = group_str(g, k);
         if (s)
             return s;
@@ -979,7 +980,11 @@ static void shot_update(Army *a, ArmyShot *s, float dt)
     }
     if (s->target >= 0 && s->target < a->nm) {
         float t[3], to[3];
-        monster_centre(&a->m[s->target], t);
+        if (!a->m_centre_ok[s->target]) {            /* (every homing shot asks: merged once a frame) */
+            monster_centre(&a->m[s->target], a->m_centre[s->target]);
+            a->m_centre_ok[s->target] = 1;
+        }
+        memcpy(t, a->m_centre[s->target], sizeof t);
         for (int k = 0; k < 3; k++)
             to[k] = t[k] - s->pos[k];
         norm3(to);
@@ -4170,6 +4175,7 @@ static void frame_inputs(Army *a, const ArmyMonster *m, int nm, const ArmyBox *b
 {
     a->m = m;
     a->nm = m ? (nm < ARMY_MONSTERS ? nm : ARMY_MONSTERS) : 0;
+    memset(a->m_centre_ok, 0, sizeof a->m_centre_ok);
     a->b = b;
     a->nb = b ? nb : 0;
 }
@@ -4630,18 +4636,16 @@ int army_hit_behind(const float monster_pos[3], float monster_heading, const flo
 
 void army_monster_shape(const float (*spheres)[4], int n, float centre[3], float *radius)
 {
-    ArmyMonster m;
-    memset(&m, 0, sizeof m);
-    m.spheres = spheres;
-    m.nspheres = n;
     *radius = -1;
     if (n <= 0)
         return;
-    monster_centre(&m, centre);
-    float r2 = spheres[0][3] * spheres[0][3];        /* the same merge for its radius */
+    /* monster_centre's merge, which gives the radius with the centre (one pass: this runs several times a frame for
+     * every monster) */
+    float r2 = spheres[0][3] * spheres[0][3];
     float c[3] = { spheres[0][0], spheres[0][1], spheres[0][2] };
     for (int i = 1; i < n; i++)
         sphere_merge(c, &r2, spheres[i], spheres[i][3] * spheres[i][3]);
+    memcpy(centre, c, sizeof c);
     *radius = sqrtf(r2);
 }
 

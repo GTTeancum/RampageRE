@@ -35,6 +35,11 @@ static Group host_find(const StreetHost *h, const char *name)
 
 #define PI 3.14159265f
 #define TIMESTEP (1.0f / 30.0f)                      /* gWorld.getTimeStep(): its step, 1/30 [R 0x2B7800] */
+#ifdef RAMPAGE_XBOX
+#define STEP_ACC_MAX (TIMESTEP * 2.999f)             /* two steps a frame, under one carried over */
+#else
+#define STEP_ACC_MAX 0.25f
+#endif
 #define MAX_OBJS 256
 #define MAX_EVENTS 256
 #define MAX_BUILDINGS 64
@@ -219,7 +224,7 @@ static int find_rec(Group g, const char *key, Record *out, Group *where)
     if (!g.at || !key)
         return 0;
     for (size_t i = 0; i < sizeof TYPED / sizeof *TYPED; i++) {
-        snprintf(k, sizeof k, "%s%s", TYPED[i], key);
+        prb_typed_key(k, sizeof k, TYPED[i], key);
         if (group_get(g, k, out)) {
             if (where)
                 *where = g;
@@ -2389,8 +2394,11 @@ void streetobj_update(StreetObjs *s, float dt, const StreetMonster *m, int nm, c
         memcpy(s->b, b, sizeof *s->b * (size_t)s->nb);
     }
     s->acc += dt;
-    if (s->acc > 0.25f)
-        s->acc = 0.25f;
+    /* The console runs at most two steps in a frame and carries less than one over (the Xbox prototype's rule,
+     * docs/xbox_proto/GAME_SIDE.md: 0xa5480): after a slow frame the next is not made slow as well by seven steps
+     * of catching up. Below 15 frames a second the world slows down instead. */
+    if (s->acc > STEP_ACC_MAX)
+        s->acc = STEP_ACC_MAX;
     while (s->acc >= TIMESTEP) {                     /* the scripts count in frames: run them at the game's step */
         s->acc -= TIMESTEP;
         /* one TakeDamage an object a frame, the game's frame: its world step [R 0x2E22B0 runs in the monster's update,

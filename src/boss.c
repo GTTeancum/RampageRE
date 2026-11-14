@@ -316,7 +316,7 @@ static int find_rec(Group g, const char *key, Record *out, Group *where)
     if (!g.at)
         return 0;
     for (size_t i = 0; i < sizeof TYPED / sizeof *TYPED; i++) {
-        snprintf(k, sizeof k, "%s%s", TYPED[i], key);
+        prb_typed_key(k, sizeof k, TYPED[i], key);
         if (group_get(g, k, out)) {
             if (where)
                 *where = g;

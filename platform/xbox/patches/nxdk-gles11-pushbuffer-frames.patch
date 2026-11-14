@@ -1,0 +1,75 @@
+diff --git a/nv2a_helper.c b/nv2a_helper.c
+index dbe2524..17c3d0f 100644
+--- a/nv2a_helper.c
++++ b/nv2a_helper.c
+@@ -12,10 +12,27 @@ extern void pb_reset_drain_guard(unsigned phase);
+ /* pbkit's default, PBKIT_PUSHBUFFER_SIZE. An application that calls pb_size before glContextInit must build this
+  * with the same size: a push buffer several frames long is then restarted (and the GPU drained) only every few
+  * frames. Not the default: on a 64 MiB console the memory is worth more to the static arrays. */
+-#define GLI_PUSHBUFFER_SIZE (512u * 1024u)
++#define GLI_PUSHBUFFER_SIZE gli_pushbuffer_size
+ #define GLI_PUSHBUFFER_MARGIN (64u * 1024u) /* state and setup methods between two checks */
++static uint32_t gli_pushbuffer_size = 512u * 1024u; /* pbkit's default, or gliPushbufferSize's */
+ static uint8_t *gli_pushbuffer_start; /* pbkit's head once the first reset has run */
+-static GLboolean gli_pushbuffer_restart_due; /* a frame ended: restart before the next draw */
++static GLboolean gli_pushbuffer_restart_due; /* a frame ended with no room for another: restart before the next draw */
++static size_t gli_pushbuffer_frame_from; /* where in the buffer the current frame began (0 after a restart) */
++static size_t gli_pushbuffer_frame_max; /* the largest frame of late, in bytes */
++static DWORD gli_frames_sent; /* frames ended with pb_finished (pbkit counts the ones the GPU has finished) */
++
++/* A push buffer several frames long (the game's own Xbox build has 2 MiB): call before glContextInit, with a power
++ * of two above 64 KiB (pb_size's rule). The restart, which waits for the GPU to finish everything it was sent, is
++ * then made only at the end of a frame that leaves no room for another one, every few frames; in between the GPU
++ * goes on drawing a frame while the next is being sent. With pbkit's 512 KiB a frame of a few hundred KiB restarts
++ * every frame, as before. */
++void gliPushbufferSize(uint32_t bytes)
++{
++    if (bytes < 128u * 1024u || (bytes & (bytes - 1)))
++        return;
++    pb_size(bytes);
++    gli_pushbuffer_size = bytes;
++}
+ 
+ static void gli_pushbuffer_restart(void)
+ {
+@@ -26,6 +43,7 @@ static void gli_pushbuffer_restart(void)
+     uint32_t *head = pb_begin();
+     pb_end(head);
+     gli_pushbuffer_start = (uint8_t *)head;
++    gli_pushbuffer_frame_from = 0;
+ }
+ 
+ /* pbkit's last defence (pb_room_hook): a block begun with the buffer nearly full, where no draw's
+@@ -141,7 +159,31 @@ void glFlipNV2A()
+      * (gliPushbufferReserve), after the application's own work for that frame, which the GPU's
+      * remaining work then overlaps. The little that is sent in between (a clear, state) fits the
+      * margin gliPushbufferReserve keeps. */
+-    gli_pushbuffer_restart_due = GL_TRUE;
++    {
++        /* Restart before the next frame only when one like the largest of late, and half as much again, would not
++         * fit behind this one. */
++        uint32_t *put = pb_begin();
++        pb_end(put);
++        size_t used = gli_pushbuffer_start ? (size_t)((uint8_t *)put - gli_pushbuffer_start) : 0;
++        size_t frame = used > gli_pushbuffer_frame_from ? used - gli_pushbuffer_frame_from : 0;
++        if (frame > gli_pushbuffer_frame_max)
++            gli_pushbuffer_frame_max = frame;
++        else
++            gli_pushbuffer_frame_max -= (gli_pushbuffer_frame_max - frame) / 64; /* (settles after a heavy spell) */
++        gli_pushbuffer_frame_from = used;
++        if (used + gli_pushbuffer_frame_max + gli_pushbuffer_frame_max / 2 + GLI_PUSHBUFFER_MARGIN > GLI_PUSHBUFFER_SIZE)
++            gli_pushbuffer_restart_due = GL_TRUE;
++        /* With no restart the GPU is no longer known to be idle here. It may still be drawing the frame just sent,
++         * and no more: the frame before that must be done before the next one is begun, because memory the GPU
++         * reads is reused two frames on (the staging arena's two-frame ring, the application's posed meshes). */
++        extern DWORD pb_frames_done(void);
++        gli_frames_sent++;
++        while ((DWORD)(gli_frames_sent - pb_frames_done()) > 1u && (DWORD)(gli_frames_sent - pb_frames_done()) < 0x80000000u) {
++            NtYieldExecution();
++        }
++        extern void gliStaticArraysFrames(uint32_t sent, uint32_t done);
++        gliStaticArraysFrames(gli_frames_sent, pb_frames_done()); /* released static copies the GPU is done with */
++    }
+ 
+     if (gl_swap_interval > 0) {
+         /* pbkit shows the finished frame at a vertical blank by itself (pb_finished). Waiting here only

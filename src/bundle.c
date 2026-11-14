@@ -288,7 +288,28 @@ static int swap_entry(const Bundle *b, BdpEntry *e)
     return 0;
 }
 
-int bdp_load(Bundle *b, uint8_t *file, uint32_t size)
+/* a lean bundle's payload area (bdp_open): what of it is in memory. The runs are the kept stretches of the file's
+ * payload area in file order, each at its own place in the image; the textures' pixels are in none of them */
+typedef struct { uint32_t from, to, at; } LeanRun;       /* [from, to) from the payload area's start; at: from file */
+typedef struct { const LeanRun *run; uint32_t n; } Lean;
+
+static const uint8_t *lean_at(const Lean *lm, const uint8_t *file, uint32_t off, uint32_t size)
+{
+    uint32_t lo = 0, hi = lm->n;
+    while (lo < hi) {
+        uint32_t mid = (lo + hi) / 2;
+        if (off >= lm->run[mid].to) lo = mid + 1; else hi = mid;
+    }
+    if (lo == lm->n || off < lm->run[lo].from || size > lm->run[lo].to - off)
+        return NULL;
+    return file + lm->run[lo].at + (off - lm->run[lo].from);
+}
+
+#ifdef RAMPAGE_XBOX
+static void name_table(Bundle *b);
+#endif
+
+static int load(Bundle *b, uint8_t *file, uint32_t size, const Lean *lm)
 {
     memset(b, 0, sizeof *b);
     b->file = file;
@@ -329,6 +350,16 @@ int bdp_load(Bundle *b, uint8_t *file, uint32_t size)
         e->size2 = r32(rec + 14);
         e->data = e->size ? file + d_off + r32(rec + 2) : NULL;
         e->data2 = e->size2 ? file + d2_off + r32(rec + 10) : NULL;
+        if (lm && e->size2) {                            /* a lean image: the payload is where the map says, or on
+                                                          * the disc alone (a texture's pixels: tex_decode) */
+            e->data2 = lean_at(lm, file, r32(rec + 10), e->size2);
+            if (!e->data2) {
+                if (e->type != ET_TEXTURE && e->type != ET_MESH && e->type != ET_SKINNED)
+                    goto failed;
+                e->at2 = d2_off + r32(rec + 10);
+            }
+        }
+        e->owner = b;
         if (e->name < b->nnames) {
             b->by_name[e->name] = (int32_t)i;
             if (e->type == ET_MATERIAL) b->mat_by_name[e->name] = (int32_t)i;
@@ -336,6 +367,9 @@ int bdp_load(Bundle *b, uint8_t *file, uint32_t size)
         }
     }
     b->nentries = count;
+#ifdef RAMPAGE_XBOX
+    name_table(b);
+#endif
     if (b->wii)
         for (uint32_t i = 0; i < count; i++)
             if (swap_entry(b, &b->entries[i]) != 0)
@@ -349,14 +383,178 @@ failed:
     return -1;
 }
 
+int bdp_load(Bundle *b, uint8_t *file, uint32_t size) { return load(b, file, size, NULL); }
+
+#ifdef RAMPAGE_XBOX
+int g_xbox_tex_drop = 1;                 /* bundles are read without their textures' pixels (--xoff texdrop: whole) */
+int g_xbox_mesh_drop = 1;                /* and without their meshes' vertex streams (--xoff meshdrop: those kept) */
+
+static int lean_cmp(const void *a, const void *b)
+{
+    const LeanRun *x = a, *y = b;
+    return x->from < y->from ? -1 : x->from > y->from;
+}
+
+/* The Xbox's 64 MB: a bundle's image without its textures' pixels, which the PS2 kept in the file for its GS and
+ * which here are only ever read to make a GPU texture (tex_decode), a second copy the console has no room for
+ * (2.8 of Las Vegas's 5.2 MB, 34 of the bundles' 121 MB). Every one of the game's 117 bundles is laid out with all
+ * its tables, names and entry data below the payload area and the payloads last (checked over the whole VOL), so
+ * the image is that lower part followed by the payloads that are kept (meshes, palettes, cloth), packed in file
+ * order; a texture's pixels are read from the disc when it is decoded (BdpEntry.at2). Anything unexpected returns
+ * -1 and the caller reads the whole file as before. */
+static int lean_open(Bundle *b, const Vol *v, const VolFile *f)
+{
+    uint8_t head[0x60], sh[0x18];
+    if (f->size < sizeof head || vol_read_range(v, f, 0, head, sizeof head) != 0 ||
+        memcmp(head, MAGIC, sizeof MAGIC - 1) != 0 || head[sizeof MAGIC - 1] != '3' || rd32(head + 0x30) != 1300u)
+        return -1;
+    uint32_t seg = rd32(head + 0x38);
+    if (seg > f->size - sizeof sh || vol_read_range(v, f, seg, sh, sizeof sh) != 0)
+        return -1;
+    uint32_t count = rd16(sh + 2), table = rd32(sh + 4), d_off = rd32(sh + 8), d2_off = rd32(sh + 16);
+    if (d2_off < sizeof head || d2_off > f->size || seg > d2_off || 0x18 + 0x12 * (uint64_t)count > d2_off - seg ||
+        table > d2_off || 16 * (uint64_t)count > d2_off - table || d_off > d2_off || rd32(head + 0x34) >= d2_off)
+        return -1;
+    uint32_t area = f->size - d2_off;                    /* the payload area's size */
+    uint8_t *low = malloc(d2_off);
+    LeanRun *run = malloc((count ? count : 1) * sizeof *run);
+    int result = -1;
+    if (!low || !run || vol_read_range(v, f, 0, low, d2_off) != 0)
+        goto done;
+    /* the name table and every entry's data must be in the lower part: the entry loop reads them from it */
+    uint32_t names_at = rd32(low + 0x34);
+    if (d2_off - names_at < 4 || rd32(low + names_at) > (d2_off - names_at - 4) / 4)
+        goto done;
+    for (uint32_t i = 0, nn = rd32(low + names_at); i < nn; i++) {
+        uint32_t at = rd32(low + names_at + 4 + 4 * i);
+        if (at >= d2_off - names_at || !memchr(low + names_at + at, 0, d2_off - names_at - at))
+            goto done;
+    }
+    uint32_t n = 0, textures = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t *rec = low + seg + 0x18 + 0x12 * i, *ent = low + table + 16 * i;
+        uint32_t o1 = rd32(rec + 2), s1 = rd32(rec + 6), o2 = rd32(rec + 10), s2 = rd32(rec + 14);
+        if (s1 && (o1 > d2_off - d_off || s1 > d2_off - d_off - o1))
+            goto done;
+        if (!s2)
+            continue;
+        if (o2 > area || s2 > area - o2)
+            goto done;
+        /* Left on the disc: the textures' pixels, and the meshes' vertex streams, which are parsed into arrays of
+         * their own when a level is built (mesh_read) and not looked at again until the next one is */
+        if (ent[2] == ET_TEXTURE || (g_xbox_mesh_drop && (ent[2] == ET_MESH || ent[2] == ET_SKINNED))) {
+            textures += s2;
+            continue;
+        }
+        run[n].from = o2; run[n].to = o2 + s2; run[n].at = 0;
+        n++;
+    }
+    if (textures < 64u * 1024u)                          /* nothing worth the second read */
+        goto done;
+    qsort(run, n, sizeof *run, lean_cmp);
+    uint32_t m = 0, kept = 0;                            /* neighbours (and the few bytes of padding between them) as
+                                                          * one run; a run starts at its file offset modulo 16, as
+                                                          * the whole image would have it (the meshes' streams) */
+    for (uint32_t i = 0; i < n; i++) {
+        if (m && run[i].from <= run[m - 1].to + 16) {
+            if (run[i].to > run[m - 1].to) run[m - 1].to = run[i].to;
+        } else
+            run[m++] = run[i];
+    }
+    for (uint32_t i = 0; i < m; i++) {
+        uint32_t at = d2_off + kept;
+        at += ((d2_off + run[i].from) - at) & 15u;
+        run[i].at = at;
+        kept = at + (run[i].to - run[i].from) - d2_off;
+    }
+    uint8_t *image = realloc(low, d2_off + (kept ? kept : 1));
+    if (!image)
+        goto done;
+    low = image;
+    for (uint32_t i = 0; i < m; i++)
+        if (vol_read_range(v, f, d2_off + run[i].from, low + run[i].at, run[i].to - run[i].from) != 0)
+            goto done;
+    Lean lm = { run, m };
+    if (load(b, low, d2_off + kept, &lm) != 0)
+        goto done;
+    b->src = v;
+    b->src_file = *f;
+    low = NULL;                                          /* the bundle's now */
+    result = 0;
+done:
+    free(low);
+    free(run);
+    return result;
+}
+#endif
+
+static struct { const BdpEntry *e; uint8_t *mem; } payload_slot;
+
+const uint8_t *bdp_payload(const BdpEntry *e)
+{
+    if (!e || e->data2 || !e->at2 || !e->size2)
+        return e ? e->data2 : NULL;
+    if (payload_slot.e == e && payload_slot.mem)
+        return payload_slot.mem;
+    const Bundle *b = e->owner;
+    free(payload_slot.mem);
+    payload_slot.mem = NULL;
+    payload_slot.e = NULL;
+    if (!b || !b->src || e < b->entries || e >= b->entries + b->nentries)
+        return NULL;
+    uint8_t *mem = malloc(e->size2);
+    if (!mem)
+        return NULL;
+    if (vol_read_range(b->src, &b->src_file, e->at2, mem, e->size2) != 0) {
+        free(mem);
+        return NULL;
+    }
+    payload_slot.mem = mem;
+    payload_slot.e = e;
+    return mem;
+}
+
+void bdp_payload_release(void)
+{
+    free(payload_slot.mem);
+    payload_slot.mem = NULL;
+    payload_slot.e = NULL;
+}
+
+int bdp_open(Bundle *b, const Vol *v, const char *name)
+{
+    memset(b, 0, sizeof *b);
+#ifdef RAMPAGE_XBOX
+    const VolFile *f = g_xbox_tex_drop && v ? vol_find(v, name) : NULL;
+    if (f && !f->path && lean_open(b, v, f) == 0)
+        return 0;
+    memset(b, 0, sizeof *b);
+#endif
+    uint32_t size = 0;
+    uint8_t *data = vol_read(v, name, &size);
+    if (!data)
+        return -1;
+    if (bdp_load(b, data, size) != 0) {
+        free(data);
+        return -1;
+    }
+    return 0;
+}
+
 void bdp_free(Bundle *b)
 {
+    if (payload_slot.e && b->entries && payload_slot.e >= b->entries && payload_slot.e < b->entries + b->nentries)
+        bdp_payload_release();                           /* (the buffer is one of this bundle's entries') */
+#ifdef RAMPAGE_XBOX
+    prb_forget();                        /* remembered property lookups may point into this bundle's books */
+#endif
     free(b->file);
     free((void *)b->names);
     free(b->entries);
     free(b->by_name);
     free(b->mat_by_name);
     free(b->tex_by_name);
+    free(b->name_slot);
     memset(b, 0, sizeof *b);
 }
 
@@ -389,8 +587,51 @@ const BdpEntry *bdp_entry_of(const Bundle *b, uint32_t name_index, int type)
     return NULL;
 }
 
+#ifdef RAMPAGE_XBOX
+/* bdp_find_name compared the name with every name of the bundle (Las Vegas has thousands), and the shadows, effects
+ * and HUD ask by name every frame. The same answer from a table made at the load: the first name that matches,
+ * letter case ignored. */
+static uint32_t name_hash(const char *s)
+{
+    uint32_t h = 2166136261u;
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        h = (h ^ c) * 16777619u;
+    }
+    return h;
+}
+
+static void name_table(Bundle *b)
+{
+    uint32_t size = 16;
+    while (size < 2 * b->nnames)
+        size *= 2;
+    b->name_slot = b->nnames ? calloc(size, sizeof *b->name_slot) : NULL;
+    if (!b->name_slot)
+        return;
+    b->name_mask = size - 1;
+    for (uint32_t i = 0; i < b->nnames; i++) {
+        const char *nm = bdp_name(b, i);
+        uint32_t at = name_hash(nm) & b->name_mask;
+        while (b->name_slot[at] && _stricmp(bdp_name(b, b->name_slot[at] - 1), nm) != 0)
+            at = (at + 1) & b->name_mask;
+        if (!b->name_slot[at])                           /* (a name there twice: the first one answers, as before) */
+            b->name_slot[at] = i + 1;
+    }
+}
+#endif
+
 int bdp_find_name(const Bundle *b, const char *name)
 {
+#ifdef RAMPAGE_XBOX
+    if (b->name_slot) {
+        for (uint32_t at = name_hash(name) & b->name_mask; b->name_slot[at]; at = (at + 1) & b->name_mask)
+            if (_stricmp(bdp_name(b, b->name_slot[at] - 1), name) == 0)
+                return (int)(b->name_slot[at] - 1);
+        return -1;
+    }
+#endif
     for (uint32_t i = 0; i < b->nnames; i++)
         if (_stricmp(bdp_name(b, i), name) == 0)
             return (int)i;

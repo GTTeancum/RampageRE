@@ -247,10 +247,19 @@ typedef struct {
     size_t at_nrm, at_uv, at_col;
 #ifdef RAMPAGE_XBOX
     uint16_t *idx16;                     /* the triangles as 16-bit indices (xbox_part), NULL: more than 65536 vertices */
-    uint8_t churn;                       /* times its registered arrays changed: past 3 it is left to the staging */
-    uint8_t wait;                        /* draws on its own before its arrays are registered (vbo 3: waiting) */
-    uint8_t skinned;                     /* drawn posed: never registered */
-    const float *gpos, *gnrm, *guv, *gcol;       /* its registered arrays in GPU memory (gliStaticArrayAddress) */
+    uint8_t churn;                       /* (a posed part) times its registered arrays changed: past 3 staged */
+    uint8_t wait;                        /* (a posed part) draws before its arrays are registered (vbo 3: waiting) */
+    uint8_t skinned;                     /* drawn posed: its positions and normals are never registered */
+    uint8_t own;                         /* vbo 1 and its arrays in GPU memory are its own copies (xbox_own_build),
+                                          * not registered by the part's addresses */
+    uint8_t stale;                       /* the part changed since its copies were made: they are made again when
+                                          * the frame's budget allows, the old ones are drawn until then */
+    uint32_t nidx16;                     /* the indices in idx16 (those of the copies: the part may have changed) */
+    uint32_t stale_since;                /* the frame it changed in while its copies were current */
+    uint8_t baked;                       /* its copies' texture coordinates hold the material's region scale (rs):
+                                          * drawn without the texture matrix, which only gl4es could apply */
+    float rs[2];
+    const float *gpos, *gnrm, *guv, *gcol;       /* its arrays in GPU memory */
     struct SkinGpu *sg;                  /* a skinned part as the GPU poses it (xbox_skin_gpu) */
 #endif
 } PartBuf;
@@ -307,6 +316,9 @@ struct Renderer {
     const int16_t *bat_keys;                         /* the item draw_mesh is drawing: its batched parts */
     const Instance *cur_inst;                        /* its instance (the bones of a skinned one) */
     const Instance *pal_inst; uint32_t pal_frame, xframe, npal; Mat4 *pal;   /* that instance's palette, this frame's */
+    struct RigMesh *rig; int nrig;                   /* the moving models' merged meshes (rig_mesh) */
+    uint32_t own_budget, own_starved, own_made;      /* xbox_part: bytes of changed parts' copies still to be made
+                                                      * this frame (and for the ones kept waiting), and how many were */
     float bat_amb[3], bat_amb_now[3]; int bat_own;   /* the scene's ambient; the one set while the batches draw */
     uint16_t *bat_idx; uint32_t cbat_idx;            /* a batch's indices of the items in sight this frame */
 #endif
@@ -511,9 +523,13 @@ void gliStaticArraysHint(unsigned char on);
 const void *gliStaticArrayAddress(const void *src);
 void gliDirectDraw(const float *pos, const float *nrm, const float *uv, const float *col, const uint16_t *idx, int count);
 int gliSkinMaxBones(void);
-void gliSkinDraw(const float *pos, const float *nrm, const float *uv, const float *col, const float *bone,
-                 const float *weight, const uint16_t *idx, int count, const float (*palette)[12], int nbones);
+void gliSkinNewFrame(void);
+void gliSkinDraw(const float *pos, const float *nrm, const float *uv, const float *col, const int16_t *bone,
+                 const float *weight, const uint16_t *idx, int count, const float (*palette)[12], int nbones,
+                 int four);
 int gl4es_xbox_predraw(void);
+extern int g_xbox_direct_quads, g_xbox_own_parts, g_xbox_region_bake, g_xbox_gpu_skin, g_xbox_item_skip;
+extern int g_xbox_preload, g_xbox_rigid;
 
 /* A skinned part for the GPU: its triangles in groups that each use at most the vertex program's bones, a group's
  * vertices (the bind pose, with each one's bones as indices into the group's list, and their weights) in the static
@@ -521,10 +537,13 @@ int gl4es_xbox_predraw(void);
 #define SKIN_GROUP_BONES 26
 #define SKIN_GROUP_VERTS 16000u                  /* (16 bytes a vertex in the largest array, a 256 KB chunk) */
 typedef struct {
-    float *pos, *nrm, *uv, *col, *bone, *weight;
+    float *pos, *nrm, *uv, *col, *weight;
+    int16_t *bone;                               /* per vertex 4 shorts: 3 x the bone's place in b (the program's
+                                                  * constant offset, as the prototype stores it) */
     uint16_t *idx;
     uint32_t nverts, nidx;
     uint8_t nb, b[SKIN_GROUP_BONES];             /* its bones: indices into the instance's palette */
+    uint8_t four;                                /* a vertex with more than two bones: the four-bone program */
 } SkinGroup;
 typedef struct SkinGpu { SkinGroup *g; int ng, failed; } SkinGpu;
 
@@ -550,27 +569,97 @@ static void xbox_static_unregister(PartBuf *pb)
 {
     skin_gpu_free(pb->sg);
     pb->sg = NULL;
-    pb->gpos = pb->gnrm = pb->guv = pb->gcol = NULL;
-    if (pb->vbo == 1) {
+    if (pb->vbo == 1 && pb->own) {                   /* (released copies are freed once the GPU is idle) */
+        if (pb->gpos) gliStaticArrayRemove(pb->gpos, pb);
+        if (pb->gnrm) gliStaticArrayRemove(pb->gnrm, pb);
+        if (pb->guv) gliStaticArrayRemove(pb->guv, pb);
+        if (pb->gcol) gliStaticArrayRemove(pb->gcol, pb);
+    } else if (pb->vbo == 1) {
         gliStaticArrayRemove(pb->pos, pb);
         if (pb->nrm) gliStaticArrayRemove(pb->nrm, pb);
         if (pb->uv) gliStaticArrayRemove(pb->uv, pb);
         if (pb->col) gliStaticArrayRemove(pb->col, pb);
     }
+    pb->gpos = pb->gnrm = pb->guv = pb->gcol = NULL;
     pb->vbo = 0;
+    pb->own = pb->stale = pb->baked = 0;
     free(pb->idx16);
     pb->idx16 = NULL;
+    pb->nidx16 = 0;
+}
+
+/* An unposed part's own copies in GPU memory, as the Xbox prototype keeps a building's walls (docs/xbox_proto/
+ * WORLD_DRAWING.md: buffers of its own, damage only marks them, they are rewritten on a budget and the old ones are
+ * drawn meanwhile). The part's arrays are copied into the static store under the store's own addresses, so a facade
+ * that city.c frees and builds again at another (or a reused) address cannot answer for another part; the copies made
+ * before are released (freed when the GPU is idle: a frame still queued may be reading them) and their 16-bit
+ * indices go with them. 0: no room (what was there stays). */
+#define OWN_STARVED_BYTES (96u * 1024u)             /* a frame's budget for the changed parts kept waiting */
+static int xbox_own_build(PartBuf *pb, const MeshPart *p, const float *rs)
+{
+    size_t n = p->nverts, ni = 3 * (size_t)p->ntris;
+    if (!n || !ni || n > 65536 || !p->pos || !p->tris)
+        return 0;
+    uint16_t *idx = malloc(sizeof *idx * ni);
+    float *pos = gliStaticArrayAlloc(sizeof(float) * 3 * n, pb);
+    float *nrm = p->nrm ? gliStaticArrayAlloc(sizeof(float) * 3 * n, pb) : NULL;
+    float *uv = p->uv ? gliStaticArrayAlloc(sizeof(float) * 2 * n, pb) : NULL;
+    float *col = p->col ? gliStaticArrayAlloc(sizeof(float) * 4 * n, pb) : NULL;
+    if (!idx || !pos || (p->nrm && !nrm) || (p->uv && !uv) || (p->col && !col)) {
+        if (pos) gliStaticArrayRemove(pos, pb);
+        if (nrm) gliStaticArrayRemove(nrm, pb);
+        if (uv) gliStaticArrayRemove(uv, pb);
+        if (col) gliStaticArrayRemove(col, pb);
+        free(idx);
+        return 0;
+    }
+    memcpy(pos, p->pos, sizeof(float) * 3 * n);      /* (each written once, in order: the store is write-combined) */
+    if (nrm) memcpy(nrm, p->nrm, sizeof(float) * 3 * n);
+    if (uv && rs) {                                  /* a region's tile: its scale in the coordinates (rnd: the
+                                                      * texture matrix did this, on the CPU in gl4es, every draw) */
+        for (size_t k = 0; k < n; k++) {
+            uv[2 * k] = p->uv[2 * k] * rs[0];
+            uv[2 * k + 1] = p->uv[2 * k + 1] * rs[1];
+        }
+    } else if (uv)
+        memcpy(uv, p->uv, sizeof(float) * 2 * n);
+    if (col) memcpy(col, p->col, sizeof(float) * 4 * n);
+    for (size_t k = 0; k < ni; k++)
+        idx[k] = (uint16_t)p->tris[k];
+    uint32_t rev = pb->rev, nverts = pb->nverts, ntris = pb->ntris;
+    const float *ppos = pb->pos, *pnrm = pb->nrm, *puv = pb->uv, *pcol = pb->col;
+    const uint32_t *ptris = pb->tris;
+    uint8_t churn = pb->churn;
+    struct SkinGpu *sg = pb->sg;
+    pb->sg = NULL;
+    xbox_static_unregister(pb);                      /* the copies and indices made before */
+    pb->sg = sg;
+    pb->rev = rev; pb->nverts = nverts; pb->ntris = ntris;
+    pb->pos = ppos; pb->nrm = pnrm; pb->uv = puv; pb->col = pcol; pb->tris = ptris;
+    pb->churn = churn;
+    pb->gpos = pos; pb->gnrm = nrm; pb->guv = uv; pb->gcol = col;
+    pb->idx16 = idx;
+    pb->nidx16 = (uint32_t)ni;
+    pb->vbo = 1;
+    pb->own = 1;
+    pb->stale = 0;
+    pb->baked = uv && rs;
+    pb->rs[0] = rs ? rs[0] : 1;
+    pb->rs[1] = rs ? rs[1] : 1;
+    return 1;
 }
 #endif
 
 #ifdef RAMPAGE_XBOX
 static void bat_drop(Renderer *r);
+static void rig_drop(Renderer *r);
 #endif
 
 static void drop_buffers(Renderer *r)
 {
 #ifdef RAMPAGE_XBOX
     bat_drop(r);
+    rig_drop(r);
 #endif
     for (uint32_t m = 0; m < r->nmbuf; m++) {
         MeshBuf *mb = &r->mbuf[m];
@@ -669,7 +758,7 @@ static const PartBuf *part_buffers(Renderer *r, const SceneMesh *sm, uint32_t i)
 #ifdef RAMPAGE_XBOX
 /* part i of scene mesh sm: its 16-bit indices and, unskinned, its arrays registered as static, made at its first
  * draw and again when the part changed (as part_buffers); NULL: not a scene mesh, the draw is as before */
-static const PartBuf *xbox_part(Renderer *r, const SceneMesh *sm, uint32_t i, int skinned)
+static const PartBuf *xbox_part(Renderer *r, const SceneMesh *sm, uint32_t i, int skinned, const float *rs)
 {
     const Scene *s = r->scene;
     if (!s || !s->meshes || (uintptr_t)sm < (uintptr_t)s->meshes ||
@@ -698,25 +787,81 @@ static const PartBuf *xbox_part(Renderer *r, const SceneMesh *sm, uint32_t i, in
     }
     const MeshPart *p = &m->parts[i];
     PartBuf *pb = &mb->pb[i];
-    if (!pb->vbo || pb->rev != p->rev || pb->nverts != p->nverts || pb->ntris != p->ntris || pb->pos != p->pos ||
-        pb->nrm != p->nrm || pb->uv != p->uv || pb->col != p->col || pb->tris != p->tris ||
-        pb->skinned != (uint8_t)(skinned != 0)) {
+    int changed = !pb->vbo || pb->rev != p->rev || pb->nverts != p->nverts || pb->ntris != p->ntris ||
+                  pb->pos != p->pos || pb->nrm != p->nrm || pb->uv != p->uv || pb->col != p->col ||
+                  pb->tris != p->tris || pb->skinned != (uint8_t)(skinned != 0);
+    if (changed && !skinned) {
+        /* An unposed part keeps copies of its own in GPU memory (xbox_own_build). When it changes (a facade's cell
+         * is damaged) the copies it has go on being drawn, with their own indices, until this frame's budget lets
+         * them be made again: no draw of a changed part goes back to the staging arena and gl4es, which was the
+         * slowest path and the one a city under attack was drawn through. */
+        int had = pb->vbo == 1 && pb->own;
+        if (!had)
+            xbox_static_unregister(pb);              /* (posed before, or staged: nothing to keep) */
+        pb->rev = p->rev; pb->nverts = p->nverts; pb->ntris = p->ntris;
+        pb->pos = p->pos; pb->nrm = p->nrm; pb->uv = p->uv; pb->col = p->col; pb->tris = p->tris;
+        pb->skinned = 0;
+        if (!pb->stale)
+            pb->stale_since = r->xframe;
+        pb->stale = 1;
+        if (!had)
+            pb->vbo = 2;                             /* staged until its copies are made (below, at once) */
+    } else if (changed) {
         if (pb->vbo == 1 && pb->churn < 255)
-            pb->churn++;                             /* (a facade being damaged: registering it again and again
-                                                      * costs more than staging it) */
+            pb->churn++;                             /* (a posed part's own arrays changing: registering them
+                                                      * again and again costs more than staging them) */
         xbox_static_unregister(pb);
         size_t n = p->nverts;
         pb->rev = p->rev; pb->nverts = p->nverts; pb->ntris = p->ntris;
         pb->pos = p->pos; pb->nrm = p->nrm; pb->uv = p->uv; pb->col = p->col; pb->tris = p->tris;
-        if (n <= 65536 && p->ntris && p->tris && (pb->idx16 = malloc(sizeof *pb->idx16 * 3 * (size_t)p->ntris)))
+        if (n <= 65536 && p->ntris && p->tris && (pb->idx16 = malloc(sizeof *pb->idx16 * 3 * (size_t)p->ntris))) {
             for (size_t k = 0; k < 3 * (size_t)p->ntris; k++)
                 pb->idx16[k] = (uint16_t)p->tris[k];
+            pb->nidx16 = 3 * p->ntris;
+        }
         pb->vbo = pb->churn <= 3 && n && p->pos && (!skinned || p->uv || p->col) ? 3 : 2;
         pb->wait = 0;
         pb->skinned = (uint8_t)(skinned != 0);
     }
-    /* Registered only once it has been drawn on its own for a second and a half: a part on its way into a batch (its
-     * item settling) would leave a second copy of itself in the store, and the store is small. */
+    if (pb->vbo == 1 && pb->own && !pb->stale && pb->baked != (uint8_t)(rs != NULL && p->uv != NULL))
+        pb->stale = 1;                               /* (its material's region came or went) */
+    if (pb->stale) {
+        /* The prototype rewrites one building a frame and lets a wall that was never built exceed that. Here: a part
+         * with no copies yet is copied at once (it cannot be drawn from old ones); a changed one when the frame has
+         * budget left, and one a frame whatever its size. */
+        size_t n = p->nverts;
+        size_t bytes = n * (12 + (p->nrm ? 12 : 0) + (p->uv ? 8 : 0) + (p->col ? 16 : 0));
+        int had = pb->vbo == 1 && pb->own;
+        /* (a part that changes every frame, a falling building's, would take the frame's budget each time and
+         * leave the ones drawn after it old for good: one that has waited five frames, the prototype's limit for
+         * its rationed building jobs, draws on a budget of its own) */
+        int starved = had && r->own_budget < bytes && r->xframe - pb->stale_since >= 5 &&
+                      (r->own_starved >= bytes || r->own_starved == OWN_STARVED_BYTES);   /* (the first of them
+                                                      * whatever its size: a large one is not left old for good) */
+        if (!had || !r->own_made || r->own_budget >= bytes || starved) {
+            if (g_xbox_own_parts && xbox_own_build(pb, p, rs)) {
+                if (had) {
+                    r->own_made++;
+                    if (starved)
+                        r->own_starved = r->own_starved > bytes ? r->own_starved - (uint32_t)bytes : 0;
+                    else
+                        r->own_budget = r->own_budget > bytes ? r->own_budget - (uint32_t)bytes : 0;
+                }
+            } else {                                 /* no room in the store: staged from the part's arrays, with
+                                                      * 16-bit indices as before (not tried again until it changes) */
+                xbox_static_unregister(pb);
+                pb->vbo = 2;
+                if (n <= 65536 && p->ntris && p->tris &&
+                    (pb->idx16 = malloc(sizeof *pb->idx16 * 3 * (size_t)p->ntris))) {
+                    for (size_t k = 0; k < 3 * (size_t)p->ntris; k++)
+                        pb->idx16[k] = (uint16_t)p->tris[k];
+                    pb->nidx16 = 3 * p->ntris;
+                }
+            }
+        }
+    }
+    /* (A posed part.) Registered only once it has been drawn on its own for a second and a half: a part on its way
+     * into a batch (its item settling) would leave a second copy of itself in the store, and the store is small. */
     if (pb->vbo == 3 && !(pb->sg && !pb->sg->failed) && ++pb->wait >= 90) {   /* (not one the GPU poses: its
                                                                                  * groups have their own copies) */
         size_t n = p->nverts;
@@ -938,6 +1083,54 @@ static void try_exact_palette(Renderer *r)
 #define try_exact_palette(r) ((void)0)
 #endif
 
+#ifdef RAMPAGE_XBOX
+int g_xbox_direct_p8 = 1;                /* --xoff p8: every texture expanded to full colour first, as before */
+#endif
+#if defined(RAMPAGE_XBOX) && defined(RAMPAGE_XBOX_EXACT_PALETTE)
+extern GLboolean gliTexturePalette8(GLsizei width, GLsizei height, const GLubyte *indices, const GLubyte *palette_rgba);
+
+/* The PS2's world textures are 8-bit with a palette, and that is what the Xbox's GPU stores them as. They used to
+ * go there the long way round: expanded to full colour, uploaded, then (try_exact_palette) the GPU waited for, the
+ * upload read back out of its memory and its 256 colours found again. Here the indices and the palette are handed
+ * over as they are (the studio's Xbox build keeps its textures in the GPU's own formats on the disc for the same
+ * reason). The same texture results: the same colours at the same texels.
+ * Only what try_exact_palette took: the world's textures of power-of-two sizes from 8 texels, without mipmaps.
+ * Returns the GL texture, 0 for a texture that has to go the ordinary way. */
+static GLuint xbox_texture_p8(Renderer *r, const Bundle *b, uint32_t name)
+{
+    if (!g_xbox_direct_p8 || r->in_hud || r->in_hud_quad || g_mips)
+        return 0;
+    uint8_t *index = NULL, pal[256][4];
+    int w = 0, h = 0;
+    if (tex_indexed(b, bdp_entry_of(b, name, ET_TEXTURE), &index, pal, &w, &h) != TEX_DECODE_OK)
+        return 0;
+    GLuint id = 0;
+    if (w >= 8 && h >= 8 && w <= 1024 && h <= 1024 && !(w & (w - 1)) && !(h & (h - 1)))
+        glGenTextures(1, &id);
+    if (!id) {
+        free(index);
+        return 0;
+    }
+    glBindTexture(GL_TEXTURE_2D, id);
+    XS_TEXTURE_BOUND();
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    /* the image's size and format for gl4es and the driver, no pixels; then the storage itself */
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    GLboolean ok = gliTexturePalette8(w, h, index, &pal[0][0]);
+    free(index);
+    if (!ok) {                                       /* (no memory, or not the storage expected: the ordinary way) */
+        glDeleteTextures(1, &id);
+        return 0;
+    }
+    tex_aniso();
+    pump_output(r);
+    return id;
+}
+#endif
+
 static GLuint texture_at(Renderer *r, const Bundle *b, uint32_t name, int zero_ok)
 {
     pump_output(r);
@@ -961,6 +1154,15 @@ static GLuint texture_at(Renderer *r, const Bundle *b, uint32_t name, int zero_o
         uint8_t *rgba;
         int w, h;
         slots[name] = ~0u;
+#if defined(RAMPAGE_XBOX) && defined(RAMPAGE_XBOX_EXACT_PALETTE)
+        {
+            GLuint direct = xbox_texture_p8(r, b, name);
+            if (direct) {
+                slots[name] = direct;
+                return direct;
+            }
+        }
+#endif
         int decoded = tex_decode(b, bdp_entry_of(b, name, ET_TEXTURE), &rgba, &w, &h);
         if (decoded == TEX_DECODE_NOMEM) {
             slots[name] = 0;             /* missing/invalid images stay negative-cached; OOM can retry */
@@ -1407,6 +1609,16 @@ static void draw_mesh(Renderer *r, const SceneMesh *sm, const Skin *skin, double
  * batches built again and again). An item drawn with its own ambient (an adornment) is batched with the others of
  * that ambient, the ambient set for the batch. */
 /* which of Scene.items this frame's culling kept (rnd_frame); scene_update reads the last frame's */
+/* Switches for the console's test builds (main.c --xoff NAME): each takes one of the Xbox drawing paths back to
+ * what it replaced, to tell which one a fault on screen belongs to. All on in a normal build. */
+int g_xbox_direct_quads = 1;                         /* quads: the effects' and the HUD's straight from GPU memory */
+int g_xbox_own_parts = 1;                            /* own: changed and loose parts keep copies in GPU memory */
+int g_xbox_region_bake = 1;                          /* region: a region's scale in the texture coordinates */
+int g_xbox_gpu_skin = 1;                             /* skin: the GPU poses the skins (city.c) */
+int g_xbox_item_skip = 1;                            /* skip: no matrix for an item whose parts are all batched */
+int g_xbox_preload = 1;                              /* preload: a level's textures made as it loads */
+int g_xbox_rigid = 1;                                /* rigid: a moving model's pieces merged into a few draws */
+int g_xbox_sound_preload = 0;                        /* sndpre (--xon): the sample banks whole in memory (main.c) */
 uint8_t *g_xbox_item_seen;
 uint32_t g_xbox_item_seen_n;
 
@@ -1415,6 +1627,7 @@ uint32_t g_xbox_item_seen_n;
                                                       * better but were three times as many draws) */
 #define BAT_MAX_INDICES 30000u
 #define BAT_SETTLE_FRAMES 60u
+int g_xbox_batch_pace = 1;               /* --xoff batpace: a changed part rejoins its batch the frame it is due */
 
 static uint32_t bat_hash(uint32_t h, uint32_t v)
 {
@@ -1472,11 +1685,13 @@ static int bat_part_key(Renderer *r, const SceneMesh *sm, const MeshPart *p, con
     if (!p->ntris || !p->nverts || !p->pos || !p->tris || p->nverts > BAT_MAX_VERTS || 3u * p->ntris > BAT_MAX_INDICES)
         return 0;
     uint32_t name = material_texture(sm->b, p->material), tex = shown_texture(r, sm->b, name, t);
-    float reg[4];
+    float reg[4], rs[2];
     if (tex != name)                                 /* an .ifl: its frame changes */
         return 0;
-    if (p->uv && material_region(sm->b, p->material, reg))
+    /* a region's tile is batched as a texture of its own, its scale in the batch's coordinates (bat_build) */
+    if (!g_xbox_region_bake && p->uv && material_region(sm->b, p->material, reg))
         return 0;
+    GLuint rid = p->uv && material_region(sm->b, p->material, reg) ? region_texture(r, sm->b, tex, reg, rs) : 0;
     if (cube_material(s, sm, p->material))
         return 0;
     if (s->cloud_material && sm->b == s->city && p->material == s->cloud_material)
@@ -1492,10 +1707,10 @@ static int bat_part_key(Renderer *r, const SceneMesh *sm, const MeshPart *p, con
         return 0;
     if (p->nrm && material_env(sm->b, p->material))
         return 0;
-    k->tex = texture(r, sm->b, tex);
+    k->tex = rid ? rid : texture(r, sm->b, tex);
     k->fmt = (uint8_t)((p->nrm ? 1 : 0) | (p->uv ? 2 : 0) | (p->col ? 4 : 0));
     k->two_sided = (material_flags(sm->b, p->material) & MAT_TWO_SIDED) != 0;
-    k->clamp = k->tex && material_clamped(sm->b, p->material);
+    k->clamp = k->tex && !rid && material_clamped(sm->b, p->material);   /* (a region's tile repeats: draw_part) */
     k->uncut = material_uncut(sm->b, p->material) != 0;
     if (p->col && k->blend != 3)                     /* the colour is the array's */
         k->col[0] = k->col[1] = k->col[2] = k->col[3] = 1;
@@ -1584,8 +1799,19 @@ static void bat_build(Renderer *r, const BatKey *key, BatSub *b)
                 no[3 * k + 2] = c[2] * x + c[5] * y + c[8] * z;
             }
         }
-        if (key->fmt & 2)
-            memcpy(b->uv + 2 * v0, p->uv, sizeof(float) * 2 * p->nverts);
+        if (key->fmt & 2) {
+            const SceneMesh *sm = &s->meshes[it->mesh];
+            float reg[4], rs[2] = { 1, 1 };
+            if (material_region(sm->b, p->material, reg) &&
+                region_texture(r, sm->b, material_texture(sm->b, p->material), reg, rs)) {
+                float *uo = b->uv + 2 * v0;          /* a region's tile: its scale (bat_part_key) */
+                for (uint32_t k = 0; k < p->nverts; k++) {
+                    uo[2 * k] = p->uv[2 * k] * rs[0];
+                    uo[2 * k + 1] = p->uv[2 * k + 1] * rs[1];
+                }
+            } else
+                memcpy(b->uv + 2 * v0, p->uv, sizeof(float) * 2 * p->nverts);
+        }
         if (key->fmt & 4)
             memcpy(b->col + 4 * v0, p->col, sizeof(float) * 4 * p->nverts);
         uint16_t *io = b->idx + i0;
@@ -1683,7 +1909,9 @@ static void bat_draw(Renderer *r, const BatKey *key, const BatSub *b)
 }
 
 /* a part into a batch of its group that has room; the batch is built again at its next draw */
-static void bat_join(Renderer *r, uint32_t i, uint32_t k, const MeshPart *p)
+/* returns the vertices this makes bat_frame build again: the whole batch's when it was clean, none when it was
+ * already to be built */
+static uint32_t bat_join(Renderer *r, uint32_t i, uint32_t k, const MeshPart *p)
 {
     BatItem *bi = &r->bitem[i];
     BatGroup *bg = &r->bgroup[bi->key[k]];
@@ -1694,10 +1922,10 @@ static void bat_join(Renderer *r, uint32_t i, uint32_t k, const MeshPart *p)
             at = q;
     if (at < 0) {
         if (bg->nsub >= 32767)
-            return;
+            return 0;
         BatSub *n = realloc(bg->sub, sizeof *n * (size_t)(bg->nsub + 1));
         if (!n)
-            return;
+            return 0;
         bg->sub = n;
         memset(&n[bg->nsub], 0, sizeof *n);
         at = bg->nsub++;
@@ -1707,10 +1935,11 @@ static void bat_join(Renderer *r, uint32_t i, uint32_t k, const MeshPart *p)
         uint32_t c = b->cmem ? 2 * b->cmem : 16;
         BatMember *mm = realloc(b->mem, sizeof *mm * c);
         if (!mm)
-            return;
+            return 0;
         b->mem = mm;
         b->cmem = c;
     }
+    uint32_t cost = b->dirty ? 0 : b->fverts + nv;
     BatMember *mm = &b->mem[b->nmem++];
     mm->item = i;
     mm->part = (uint16_t)k;
@@ -1722,6 +1951,7 @@ static void bat_join(Renderer *r, uint32_t i, uint32_t k, const MeshPart *p)
     b->fidx += ni;
     b->dirty = 1;
     bi->sub[k] = (int16_t)at;
+    return cost;
 }
 
 /* a part out of its batch (it changed, or its item did) */
@@ -1769,6 +1999,7 @@ static void bat_frame(Renderer *r, double t)
     const Scene *s = r->scene;
     static uint32_t frame;
     frame++;
+    int32_t rejoin_left = g_xbox_batch_pace ? (int32_t)BAT_MAX_VERTS : 0x7FFFFFFF;   /* (vertices: see the rejoin) */
     if (r->nbitem != s->nitems) {                    /* another set of items: start again */
         bat_drop(r);
         r->bitem = calloc(s->nitems ? s->nitems : 1, sizeof *r->bitem);
@@ -1849,10 +2080,20 @@ static void bat_frame(Renderer *r, double t)
                     if (!bi->out[k]) bi->out[k] = 1;
                     if (bi->chg[k] < 255) bi->chg[k]++;
                 } else if (bi->out[k] && (int32_t)(frame - bi->out[k]) >= 0) {
+                    /* Back into its batch, which is then built again whole (every member's vertices through its
+                     * matrix: up to 10,000). With buildings under attack parts came back every frame, each into
+                     * another batch, and those rebuilds were the largest single cost of the busiest frames. They
+                     * come back together instead: in four frames of every sixteen, and no more than one batch's
+                     * worth of vertices a frame; parts for a batch already to be built ride along free. A part
+                     * that waits is drawn on its own meanwhile, as it has been since it changed. */
+                    if (rejoin_left <= 0 || (frame & 15u) > 3u) {
+                        bi->out[k] = frame + 1 ? frame + 1 : 1;
+                        continue;
+                    }
                     bi->out[k] = 0;
                     bi->key[k] = bat_sort_part(r, it, in, m, k, t);
                     if (bi->key[k] >= 0)
-                        bat_join(r, i, k, &m->parts[k]);
+                        rejoin_left -= (int32_t)bat_join(r, i, k, &m->parts[k]);
                 }
             }
         }
@@ -1904,6 +2145,316 @@ static void bat_draw_blended(Renderer *r)
         r->bat_own = 0;
     }
 }
+
+/* ---- a moving model of many rigid pieces in a few draws ---------------------------------------------------------
+ * A person, a soldier, a car is a node tree with a mesh hung on each node: an item, a matrix and a draw for every
+ * piece, and in a street half of all the items are people's limbs. They move every frame, so the batches of the
+ * standing city never take them. Here the pieces of one model are merged into one mesh whose vertices each name
+ * their piece as their single bone, and drawn with the skinning program (gliSkinDraw: the two-bone one, the second
+ * weight 0), the pieces' matrices as the palette: a draw for each texture the model uses in place of one for each
+ * piece. The prototype draws its rigid shapes piece by piece and has no crowd; this is the port's own, on the
+ * prototype's skinning. The merged mesh is made once for a model (its meshes' list) and shared by every instance
+ * of it. A part the batches would not take (a second layer, an animated texture, a blended one) is left to the
+ * ordinary draw of its item. */
+#define RIG_MAX 96                                   /* models with merged meshes (all dropped with the scene) */
+#define RIG_SUBS 6                                   /* textures a model's pieces are drawn with */
+typedef struct {
+    BatKey key;
+    float *pos, *nrm, *uv, *col, *weight;
+    int16_t *bone;
+    uint16_t *idx;
+    uint32_t nverts, nidx;
+} RigSub;
+typedef struct RigMesh {
+    uint32_t sig, n;                                 /* its items' signature and count (at most SKIN_GROUP_BONES) */
+    uint32_t *mesh;                                  /* their meshes */
+    const MeshPart **parts;                          /* and each one's parts and their count, to tell a change */
+    uint32_t *nparts, *rev;
+    int16_t **keys;                                  /* per item, per part: 0 merged (draw_mesh leaves it), -1 not */
+    uint8_t *left;                                   /* per item: it has parts that are not merged */
+    RigSub sub[RIG_SUBS];
+    int nsub, failed;
+} RigMesh;
+
+/* its merged meshes out of the store (a failed one keeps its place in the list, so it is not tried again, and
+ * holds no GPU memory) */
+static void rig_release(RigMesh *rm)
+{
+    for (int q = 0; q < rm->nsub; q++) {
+        RigSub *b = &rm->sub[q];
+        if (b->pos) gliStaticArrayRemove(b->pos, rm);
+        if (b->nrm) gliStaticArrayRemove(b->nrm, rm);
+        if (b->uv) gliStaticArrayRemove(b->uv, rm);
+        if (b->col) gliStaticArrayRemove(b->col, rm);
+        if (b->weight) gliStaticArrayRemove(b->weight, rm);
+        if (b->bone) gliStaticArrayRemove(b->bone, rm);
+        free(b->idx);
+        memset(b, 0, sizeof *b);
+    }
+    rm->nsub = 0;
+}
+
+static void rig_free(RigMesh *rm)
+{
+    rig_release(rm);
+    for (uint32_t j = 0; rm->keys && j < rm->n; j++)
+        free(rm->keys[j]);
+    free(rm->keys); free(rm->left); free(rm->mesh); free(rm->parts); free(rm->nparts); free(rm->rev);
+    memset(rm, 0, sizeof *rm);
+}
+
+static void rig_drop(Renderer *r)
+{
+    for (int k = 0; k < r->nrig; k++)
+        rig_free(&r->rig[k]);
+    free(r->rig);
+    r->rig = NULL;
+    r->nrig = 0;
+}
+
+static uint32_t rig_sig(const Scene *s, uint32_t i0, uint32_t n)
+{
+    uint32_t h = 2166136261u;
+    for (uint32_t j = 0; j < n; j++) {
+        const Mesh *m = &s->meshes[s->items[i0 + j].mesh].mesh;
+        h = (h ^ s->items[i0 + j].mesh) * 16777619u;
+        h = (h ^ (uint32_t)(uintptr_t)m->parts) * 16777619u;
+        h = (h ^ m->nparts) * 16777619u;
+        for (uint32_t k = 0; k < m->nparts; k++)
+            h = (h ^ m->parts[k].rev) * 16777619u;
+    }
+    return h;
+}
+
+/* the model the entry was made for: the same meshes in the same order (what they hold is the signature's) */
+static int rig_same(const Scene *s, const RigMesh *rm, uint32_t i0, uint32_t n)
+{
+    if (rm->n != n || !rm->mesh)
+        return 0;
+    for (uint32_t j = 0; j < n; j++)
+        if (rm->mesh[j] != s->items[i0 + j].mesh)
+            return 0;
+    return 1;
+}
+
+/* the merged mesh of the items i0 .. i0 + n (one instance's, unskinned, at most SKIN_GROUP_BONES), made at its
+ * first draw; NULL: not this model (no memory, no room in the store, nothing of it could be merged) */
+static RigMesh *rig_mesh(Renderer *r, uint32_t i0, uint32_t n, double t)
+{
+    const Scene *s = r->scene;
+    uint32_t sig = rig_sig(s, i0, n);
+    for (int k = 0; k < r->nrig; k++) {
+        RigMesh *e = &r->rig[k];
+        if (!rig_same(s, e, i0, n))
+            continue;
+        if (e->sig != sig && !e->failed) {           /* its meshes changed since (a part's rev, its parts): a model
+                                                      * that changes as it moves is not merged, and holds nothing */
+            rig_release(e);
+            e->failed = 1;
+        }
+        return e->failed ? NULL : e;
+    }
+    if (r->nrig == RIG_MAX)                          /* (every model of a long level: start again) */
+        rig_drop(r);
+    if (!r->rig && !(r->rig = calloc(RIG_MAX, sizeof *r->rig)))
+        return NULL;
+    RigMesh *rm = &r->rig[r->nrig++];
+    memset(rm, 0, sizeof *rm);
+    rm->sig = sig;
+    rm->n = n;
+    rm->failed = 1;                                  /* until it is whole */
+    rm->mesh = calloc(n, sizeof *rm->mesh);
+    rm->parts = calloc(n, sizeof *rm->parts);
+    rm->nparts = calloc(n, sizeof *rm->nparts);
+    rm->keys = calloc(n, sizeof *rm->keys);
+    rm->left = calloc(n, 1);
+    if (!rm->mesh || !rm->parts || !rm->nparts || !rm->keys || !rm->left) {
+        rig_free(rm);                                /* (no entry at all: its lists would be read by the lookup) */
+        r->nrig--;
+        return NULL;
+    }
+    uint32_t nv[RIG_SUBS] = { 0 }, ni[RIG_SUBS] = { 0 };
+    int overlay = 0;
+    for (uint32_t j = 0; j < n; j++) {               /* (the whole list first: the lookup compares it) */
+        const Mesh *m = &s->meshes[s->items[i0 + j].mesh].mesh;
+        rm->mesh[j] = s->items[i0 + j].mesh;
+        rm->parts[j] = m->parts;
+        rm->nparts[j] = m->nparts;
+    }
+    for (uint32_t j = 0; j < n; j++) {               /* which parts go into which merged mesh */
+        const DrawItem *it = &s->items[i0 + j];
+        const SceneMesh *sm = &s->meshes[it->mesh];
+        const Mesh *m = &sm->mesh;
+        if (!(rm->keys[j] = malloc(sizeof **rm->keys * (m->nparts ? m->nparts : 1))))
+            return NULL;                             /* (it stays failed, with nothing in the store) */
+        for (uint32_t k = 0; k < m->nparts; k++) {
+            const MeshPart *p = &m->parts[k];
+            BatKey bk;
+            rm->keys[j][k] = -1;
+            if (!p->ntris)
+                continue;
+            int q = -1, plain = bat_part_key(r, sm, p, &s->instances[it->instance], t, &bk);
+            if (plain && bk.blend == 1)
+                overlay = 1;
+            if (plain && !bk.blend && p->nverts <= 65535u) {
+                bk.own = 0;                          /* (the instance's ambient is set when it is drawn) */
+                bk.amb[0] = bk.amb[1] = bk.amb[2] = 0;
+                for (q = 0; q < rm->nsub; q++)
+                    if (!memcmp(&rm->sub[q].key, &bk, sizeof bk))
+                        break;
+                if (q == rm->nsub && rm->nsub < RIG_SUBS)
+                    rm->sub[rm->nsub++].key = bk;
+                else if (q == rm->nsub)
+                    q = -1;
+                if (q >= 0 && (nv[q] + p->nverts > 65535u || nv[q] + p->nverts > SKIN_GROUP_VERTS))
+                    q = -1;
+            }
+            if (q < 0) {
+                rm->left[j] = 1;
+                continue;
+            }
+            rm->keys[j][k] = (int16_t)(q + 1);       /* (its merged mesh for now; 0 once they are made) */
+            nv[q] += p->nverts;
+            ni[q] += 3 * p->ntris;
+        }
+    }
+    /* A model with a crack layer (drawn at the depth of the wall under it, LEQUAL) is left as it is: the merged wall
+     * would come from the vertex program and the cracks from the fixed pipeline, and their depths need not agree
+     * to the last bit. */
+    if (overlay) {
+        rm->nsub = 0;
+        return NULL;
+    }
+    int any = 0;
+    for (int q = 0; q < rm->nsub; q++) {
+        RigSub *b = &rm->sub[q];
+        if (!nv[q])
+            continue;
+        int nrm = b->key.fmt & 1, uv = b->key.fmt & 2, col = b->key.fmt & 4;
+        b->pos = gliStaticArrayAlloc(sizeof(float) * 3 * nv[q], rm);
+        b->nrm = nrm ? gliStaticArrayAlloc(sizeof(float) * 3 * nv[q], rm) : NULL;
+        b->uv = uv ? gliStaticArrayAlloc(sizeof(float) * 2 * nv[q], rm) : NULL;
+        b->col = col ? gliStaticArrayAlloc(sizeof(float) * 4 * nv[q], rm) : NULL;
+        b->bone = gliStaticArrayAlloc(sizeof(int16_t) * 4 * nv[q], rm);
+        b->weight = gliStaticArrayAlloc(sizeof(float) * 4 * nv[q], rm);
+        b->idx = malloc(sizeof *b->idx * ni[q]);
+        if (!b->pos || (nrm && !b->nrm) || (uv && !b->uv) || (col && !b->col) || !b->bone || !b->weight || !b->idx) {
+            rig_release(rm);                         /* no room: it stays failed, and holds nothing */
+            return NULL;
+        }
+        /* each array written once and in order: the store is write-combined */
+#define RIG_EACH(body) \
+        for (uint32_t j = 0; j < n; j++) { \
+            const SceneMesh *sm = &s->meshes[s->items[i0 + j].mesh]; \
+            for (uint32_t k = 0; k < sm->mesh.nparts; k++) { \
+                const MeshPart *p = &sm->mesh.parts[k]; \
+                if (rm->keys[j][k] != q + 1) continue; \
+                body \
+            } \
+        }
+        float *o = b->pos;
+        RIG_EACH(memcpy(o, p->pos, sizeof(float) * 3 * p->nverts); o += 3 * p->nverts;)
+        if (nrm) {
+            o = b->nrm;
+            RIG_EACH(memcpy(o, p->nrm, sizeof(float) * 3 * p->nverts); o += 3 * p->nverts;)
+        }
+        if (uv) {
+            o = b->uv;
+            RIG_EACH(
+                float reg[4]; float rs[2]; rs[0] = rs[1] = 1;
+                if (material_region(sm->b, p->material, reg) &&
+                    region_texture(r, sm->b, material_texture(sm->b, p->material), reg, rs)) {
+                    for (uint32_t v = 0; v < p->nverts; v++) {
+                        o[2 * v] = p->uv[2 * v] * rs[0];
+                        o[2 * v + 1] = p->uv[2 * v + 1] * rs[1];
+                    }
+                } else
+                    memcpy(o, p->uv, sizeof(float) * 2 * p->nverts);
+                o += 2 * p->nverts;)
+        }
+        if (col) {
+            o = b->col;
+            RIG_EACH(memcpy(o, p->col, sizeof(float) * 4 * p->nverts); o += 4 * p->nverts;)
+        }
+        int16_t *bo = b->bone;
+        RIG_EACH(
+            for (uint32_t v = 0; v < p->nverts; v++) {
+                bo[4 * v] = (int16_t)(3 * j); bo[4 * v + 1] = 0; bo[4 * v + 2] = 0; bo[4 * v + 3] = 0;
+            }
+            bo += 4 * p->nverts;)
+        o = b->weight;
+        RIG_EACH(
+            for (uint32_t v = 0; v < p->nverts; v++) {
+                o[4 * v] = 1; o[4 * v + 1] = 0; o[4 * v + 2] = 0; o[4 * v + 3] = 0;
+            }
+            o += 4 * p->nverts;)
+        uint16_t *io = b->idx;
+        uint32_t v0 = 0;
+        RIG_EACH(
+            for (uint32_t x = 0; x < 3 * p->ntris; x++)
+                io[x] = (uint16_t)(v0 + p->tris[x]);
+            io += 3 * p->ntris;
+            v0 += p->nverts;)
+#undef RIG_EACH
+        b->nverts = nv[q];
+        b->nidx = ni[q];
+        any = 1;
+    }
+    for (uint32_t j = 0; j < n; j++)                 /* draw_mesh's convention: 0 and up is "not drawn here" */
+        for (uint32_t k = 0; k < rm->nparts[j]; k++)
+            if (rm->keys[j][k] > 0)
+                rm->keys[j][k] = 0;
+    rm->failed = !any;
+    return any ? rm : NULL;
+}
+
+/* the merged meshes of the items i0 .. i0 + n with their matrices as the palette (the view matrix is loaded).
+ * 0: gl4es has work for one of the textures; nothing more is drawn this way for this model. */
+static int rig_draw(Renderer *r, RigMesh *rm, uint32_t i0)
+{
+    const Scene *s = r->scene;
+    static float pal[SKIN_GROUP_BONES][12];
+    for (uint32_t j = 0; j < rm->n; j++) {
+        const float *m = s->items[i0 + j].world.m;
+        for (int row = 0; row < 3; row++) {          /* its rows (the matrices are column-major) */
+            pal[j][4 * row] = m[row];
+            pal[j][4 * row + 1] = m[4 + row];
+            pal[j][4 * row + 2] = m[8 + row];
+            pal[j][4 * row + 3] = m[12 + row];
+        }
+    }
+    for (int q = 0; q < rm->nsub; q++) {
+        const RigSub *b = &rm->sub[q];
+        const BatKey *key = &b->key;
+        if (!b->nidx)
+            continue;
+        xs_enable(&xs.cull, GL_CULL_FACE, !key->two_sided);
+        if (key->tex) {
+            xs_bind(key->tex);
+            xs_wrap(key->tex, key->clamp ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+        } else
+            xs_enable(&xs.tex2d, GL_TEXTURE_2D, 0);
+        if (!b->nrm) glNormal3f(0, 0, 1);
+        if (!b->col) glColor4fv(key->col);
+        xs_light(!b->nrm ? 0 : xs_light_base());     /* no normals: its light is in its colours (draw_part) */
+        GLboolean test_was = key->uncut ? glIsEnabled(GL_ALPHA_TEST) : GL_FALSE;
+        if (test_was)
+            glDisable(GL_ALPHA_TEST);
+        int ok = gl4es_xbox_predraw();
+        if (ok)
+            gliSkinDraw(b->pos, b->nrm, b->uv, b->col, b->bone, b->weight, b->idx, (int)b->nidx,
+                        (const float (*)[12])pal, (int)rm->n, 0);
+        if (test_was)
+            glEnable(GL_ALPHA_TEST);
+        if (!ok) {                                   /* (a texture gl4es must work on, every frame: not this model) */
+            rm->failed = 1;
+            rig_release(rm);                         /* (freed once the GPU is idle: the draws made are queued) */
+            return 0;
+        }
+        r->drawn += b->nidx / 3;
+    }
+    return 1;
+}
 #endif
 
 #ifdef RAMPAGE_XBOX
@@ -1912,20 +2463,51 @@ static void bat_draw_blended(Renderer *r)
  * added in their order and drawn when the state they need changes (the caller's qb_flush), so what is blended over
  * what is as before. */
 #define QB_MAX 1024
+/* A run of quads (from one flush to the next) goes one of two ways. When gl4es has nothing to do for the bound
+ * texture (gl4es_xbox_predraw, asked at the run's first vertex: the state is set by then), its vertices are written
+ * straight into GPU memory, 24 bytes each as the prototype's effects and HUD (position, colour bytes, texture
+ * coordinates: gliDirectQuads), and drawn from there with no indices. Else, as before, into arrays here that are
+ * drawn through glDrawElements and the staging arena.
+ * The GPU memory is a chunk of the static store filled from its start and never rewritten: a frame still queued may
+ * be reading what was drawn. A full chunk is released (freed once the GPU is idle) and another taken. */
+#define QB_VERTEX 24u
+#define QB_CHUNK (96u * 1024u)                       /* 1,024 quads */
+#define QB_RING 8                                    /* chunks at most: three frames of 2,700 quads */
+void gliDirectQuads(const void *verts, int nverts);
 static struct {
     float pos[QB_MAX * 4 * 3], uv[QB_MAX * 4 * 2], col[QB_MAX * 4 * 4];
     uint16_t idx[QB_MAX * 6];
     int n, ready;
+    int direct;                                      /* this run's vertices go into the chunk */
+    uint8_t *chunk;                                  /* the chunk being filled, NULL: none */
+    uint32_t chunk_at, run_at;                       /* its first free byte; where this run starts */
+    /* The chunks are the batcher's own and go round: a full one is not given back to the store and another taken
+     * (that was a release and an allocation of 96 KB for every thousand quads, some of them every frame, which
+     * left holes among the store's long-lived arrays and kept it a megabyte or two larger than what it held). A
+     * chunk is filled again once two frames have ended since it was last drawn from: the GPU is never more than
+     * one frame behind what has been sent (nxdk-gles11's frame fence; with the short push buffer it is idle at
+     * every frame's start). */
+    struct { uint8_t *mem; uint32_t frame; } ring[QB_RING];
+    int ring_n, ring_at;                             /* chunks owned; the one being filled */
+    uint32_t frame;                                  /* frames begun (qb_frame) */
 } qb;
+
+/* a frame begins (rnd_frame) */
+static void qb_frame(void) { qb.frame++; }
 
 static void qb_flush(void)
 {
     if (!qb.n)
         return;
-    glVertexPointer(3, GL_FLOAT, 0, qb.pos);
-    glTexCoordPointer(2, GL_FLOAT, 0, qb.uv);
-    glColorPointer(4, GL_FLOAT, 0, qb.col);
-    glDrawElements(GL_TRIANGLES, qb.n * 6, GL_UNSIGNED_SHORT, qb.idx);
+    if (qb.direct) {
+        gliDirectQuads(qb.chunk + qb.run_at, qb.n * 4);
+        qb.chunk_at = qb.run_at + (uint32_t)qb.n * 4u * QB_VERTEX;
+    } else {
+        glVertexPointer(3, GL_FLOAT, 0, qb.pos);
+        glTexCoordPointer(2, GL_FLOAT, 0, qb.uv);
+        glColorPointer(4, GL_FLOAT, 0, qb.col);
+        glDrawElements(GL_TRIANGLES, qb.n * 6, GL_UNSIGNED_SHORT, qb.idx);
+    }
     qb.n = 0;
 }
 static void qb_begin(void)
@@ -1951,9 +2533,57 @@ static void qb_end(void)
     glDisableClientState(GL_TEXTURE_COORD_ARRAY);
     glDisableClientState(GL_COLOR_ARRAY);
 }
-/* the next quad's corner k: its place, texture coordinates and colour */
-static void qb_vertex(int k, float x, float y, float z, float u, float v, const float rgb[3], float a)
+/* a run's first vertex: where the run goes */
+static void qb_run(void)
 {
+    qb.direct = 0;
+    if (!g_xbox_direct_quads || !gl4es_xbox_predraw())
+        return;
+    if (qb.chunk)
+        qb.ring[qb.ring_at].frame = qb.frame;        /* drawn from in this frame */
+    if (qb.chunk && qb.chunk_at + 4u * QB_VERTEX > QB_CHUNK)
+        qb.chunk = NULL;                             /* full: it rests until the GPU is past it */
+    if (!qb.chunk) {
+        int pick = -1;
+        for (int i = 0; i < qb.ring_n && pick < 0; i++)
+            if ((uint32_t)(qb.frame - qb.ring[i].frame) >= 2u)
+                pick = i;
+        if (pick < 0 && qb.ring_n < QB_RING) {
+            uint8_t *mem = gliStaticArrayAlloc(QB_CHUNK, &qb);
+            if (mem) {
+                pick = qb.ring_n++;
+                qb.ring[pick].mem = mem;
+            }
+        }
+        if (pick < 0)
+            return;                                  /* none free yet, no room for one more: the arrays here */
+        qb.ring_at = pick;
+        qb.ring[pick].frame = qb.frame;
+        qb.chunk = qb.ring[pick].mem;
+        qb.chunk_at = 0;
+    }
+    qb.run_at = qb.chunk_at;
+    qb.direct = 1;
+}
+static inline uint8_t qb_byte(float v)
+{
+    return v <= 0 ? 0 : v >= 1 ? 255 : (uint8_t)(v * 255.0f + 0.5f);
+}
+/* the next quad's corner k (0 .. 3, in order): its place, texture coordinates and colour */
+/* (in line at each of its calls: four of them a quad, a thousand quads and more a frame) */
+static inline __attribute__((always_inline)) void qb_vertex(int k, float x, float y, float z, float u, float v,
+                                                          const float rgb[3], float a)
+{
+    if (!qb.n && !k)
+        qb_run();
+    if (qb.direct) {                                 /* (write-combined memory: each field once, in order) */
+        uint8_t *o = qb.chunk + qb.run_at + (uint32_t)(qb.n * 4 + k) * QB_VERTEX;
+        float *f = (float *)(void *)o;
+        f[0] = x; f[1] = y; f[2] = z;
+        o[12] = qb_byte(rgb[0]); o[13] = qb_byte(rgb[1]); o[14] = qb_byte(rgb[2]); o[15] = qb_byte(a);
+        f[4] = u; f[5] = v;
+        return;
+    }
     int at = qb.n * 4 + k;
     float *p = &qb.pos[3 * at], *t = &qb.uv[2 * at], *c = &qb.col[4 * at];
     p[0] = x; p[1] = y; p[2] = z;
@@ -1962,10 +2592,70 @@ static void qb_vertex(int k, float x, float y, float z, float u, float v, const 
 }
 static void qb_next(void)
 {
-    if (++qb.n == QB_MAX)
+    qb.n++;
+    if (qb.direct ? qb.run_at + (uint32_t)(qb.n + 1) * 4u * QB_VERTEX > QB_CHUNK : qb.n == QB_MAX)
         qb_flush();
 }
 #endif
+
+#ifdef RAMPAGE_XBOX
+/* view x world in one load (the prototype's one matrix an object), not a push, a multiply and a pop through gl4es */
+static void xbox_item_matrix(const float *a, const float *b)
+{
+    float mv[16];
+    for (int c = 0; c < 4; c++)
+        for (int q = 0; q < 4; q++)
+            mv[4 * c + q] = a[q] * b[4 * c] + a[4 + q] * b[4 * c + 1] + a[8 + q] * b[4 * c + 2] + a[12 + q] * b[4 * c + 3];
+    glLoadMatrixf(mv);
+}
+#endif
+
+/* Every texture the scene's meshes are drawn with, made now (a level's loading) and not at its first sight in
+ * play: decoding a PS2 texture, building its palette and waiting twice for the GPU in the middle of a fight was
+ * a hitch each time. The prototype has all of a level's textures in memory when the level starts
+ * (docs/xbox_proto/SOUND_LOADING_FRAME.md). Nothing here is drawn. */
+void rnd_preload(Renderer *r)
+{
+#ifdef RAMPAGE_XBOX
+    const Scene *s = r ? r->scene : NULL;
+    if (!s || !s->meshes || !g_xbox_preload)
+        return;
+    unsigned made = 0;
+    for (uint32_t m = 0; m < s->nmeshes; m++) {
+        const SceneMesh *sm = &s->meshes[m];
+        if (!sm->b)
+            continue;                                /* (a generated facade: its sheets are the bundles' parts') */
+        for (uint32_t k = 0; k < sm->mesh.nparts; k++) {
+            const MeshPart *p = &sm->mesh.parts[k];
+            if (!p->ntris)
+                continue;
+            uint32_t name = material_texture(sm->b, p->material), tex = shown_texture(r, sm->b, name, 0);
+            float reg[4], rs[2];
+            if (p->uv && material_region(sm->b, p->material, reg))
+                made += region_texture(r, sm->b, tex, reg, rs) != 0;
+            else
+                made += texture(r, sm->b, tex) != 0;
+            for (int f = 0; f < r->nifl; f++)        /* an animated one: all its frames */
+                if (r->ifl[f].b == sm->b && r->ifl[f].name == name)
+                    for (int q = 0; q < r->ifl[f].n; q++)
+                        made += texture(r, sm->b, r->ifl[f].frame[q]) != 0;
+            uint32_t layer = p->col && p->uv ? material_damage_layer(sm->b, p->material) : 0;
+            if (layer)
+                made += texture(r, sm->b, layer) != 0;
+            layer = p->nrm ? material_env(sm->b, p->material) : 0;
+            if (layer)
+                made += texture(r, sm->b, layer) != 0;
+        }
+    }
+    if (s->city && s->env_map)
+        made += texture(r, s->city, s->env_map) != 0;
+    XS_TEXTURE_BOUND();
+    printf("xbox preload: %u textures for %u meshes\n", made, (unsigned)s->nmeshes);
+    bdp_payload_release();                           /* (the last mesh read from the disc for the level's building) */
+#else
+    (void)r;
+#endif
+}
 
 static void draw_held(Renderer *r, double t)
 {
@@ -1989,6 +2679,11 @@ typedef struct {
     int ok, arrays_set;
     const float *pos, *nrm, *uv, *col;               /* in GPU memory */
     const uint16_t *idx16;
+    uint32_t nidx16;                                 /* the indices of the copies in GPU memory (a changed part's
+                                                      * old copies have their own count) */
+    int baked;                                       /* the copies' texture coordinates hold the region's scale rs:
+                                                      * a draw from the client arrays sets the texture matrix */
+    float rs[2];
     const float *cpos, *cnrm, *cuv, *ccol;           /* the client arrays */
 } XboxDirect;
 
@@ -2028,7 +2723,44 @@ static void xbox_skin_draw(Renderer *r, const SkinGpu *sg)
             }
         }
         gliSkinDraw(g->pos, g->nrm, g->uv, g->col, g->bone, g->weight, g->idx, (int)g->nidx,
-                    (const float (*)[12])gp, g->nb);
+                    (const float (*)[12])gp, g->nb, g->four);
+    }
+}
+
+/* A skin goes to the GPU whole or not at all (the prototype has no CPU skinning beside it): every part must be
+ * one the program can draw. One part with a second layer or a texture matrix used to send the skin back to the
+ * CPU in the middle of a frame, with the copies made for the parts before it left in the store. */
+static int xbox_skin_ok(Renderer *r, const SceneMesh *sm, const Skin *skin)
+{
+    const Scene *s = r->scene;
+    float reg[4];
+    if (!skin->bones || !skin->weights || gliSkinMaxBones() < 12)
+        return 0;
+    for (uint32_t k = 0; k < sm->mesh.nparts; k++) {
+        const MeshPart *p = &sm->mesh.parts[k];
+        if (!p->ntris)
+            continue;
+        if (!p->nrm || !p->pos || !p->tris || !p->nverts || (p->uv && material_region(sm->b, p->material, reg)) ||
+            cube_material(s, sm, p->material) || material_env(sm->b, p->material) ||
+            (p->col && p->uv && material_damage_layer(sm->b, p->material)) ||
+            (s->cloud_material && sm->b == s->city && p->material == s->cloud_material))
+            return 0;
+    }
+    return 1;
+}
+
+static void xbox_skin_demote(Renderer *r, const SceneMesh *sm, const Skin *skin)
+{
+    const Scene *s = r->scene;
+    ((Skin *)skin)->gpu_skin = -1;
+    if (!s || !s->meshes || (uintptr_t)sm < (uintptr_t)s->meshes || (uintptr_t)sm >= (uintptr_t)(s->meshes + s->nmeshes))
+        return;
+    uint32_t mi = (uint32_t)(sm - s->meshes);
+    if (mi >= r->nmbuf || !r->mbuf[mi].pb)
+        return;
+    for (uint32_t k = 0; k < r->mbuf[mi].nparts; k++) {
+        skin_gpu_free(r->mbuf[mi].pb[k].sg);
+        r->mbuf[mi].pb[k].sg = NULL;
     }
 }
 
@@ -2042,12 +2774,24 @@ static void xbox_part_draw(Renderer *r, XboxDirect *d, GLsizei count, GLenum idx
         return;
     }
     if (d->ok && gl4es_xbox_predraw()) {
-        gliDirectDraw(d->pos, d->nrm, d->uv, d->col, d->idx16, count);
+        gliDirectDraw(d->pos, d->nrm, d->uv, d->col, d->idx16, d->nidx16 ? (int)d->nidx16 : count);
         return;
     }
     if (!d->arrays_set)
         xbox_client_arrays(d);
+    if (d->baked) {                                  /* (gl4es has work for this texture: the part's own arrays,
+                                                      * their coordinates unscaled) */
+        glMatrixMode(GL_TEXTURE);
+        glLoadIdentity();
+        glScalef(d->rs[0], d->rs[1], 1);
+        glMatrixMode(GL_MODELVIEW);
+    }
     glDrawElements(GL_TRIANGLES, count, idx_type, idx);
+    if (d->baked) {
+        glMatrixMode(GL_TEXTURE);
+        glLoadIdentity();
+        glMatrixMode(GL_MODELVIEW);
+    }
 }
 
 /* part pi of a skinned scene mesh as the GPU poses it, made at its first draw; NULL: not this part (no normals,
@@ -2136,7 +2880,7 @@ static const SkinGpu *xbox_skin_gpu(Renderer *r, const SceneMesh *sm, const Skin
         g->nrm = gliStaticArrayAlloc(sizeof(float) * 3 * ngv, sg);
         g->uv = p->uv ? gliStaticArrayAlloc(sizeof(float) * 2 * ngv, sg) : NULL;
         g->col = p->col ? gliStaticArrayAlloc(sizeof(float) * 4 * ngv, sg) : NULL;
-        g->bone = gliStaticArrayAlloc(sizeof(float) * 4 * ngv, sg);
+        g->bone = gliStaticArrayAlloc(sizeof(int16_t) * 4 * ngv, sg);
         g->weight = gliStaticArrayAlloc(sizeof(float) * 4 * ngv, sg);
         g->idx = malloc(sizeof *g->idx * ngi);
         if (!g->pos || !g->nrm || (p->uv && !g->uv) || (p->col && !g->col) || !g->bone || !g->weight || !g->idx)
@@ -2158,20 +2902,30 @@ static const SkinGpu *xbox_skin_gpu(Renderer *r, const SceneMesh *sm, const Skin
             for (int c = 0; c < 4; c++)
                 g->col[4 * q + c] = p->col[4 * v + c];
         }
+        /* A vertex's bones in the order of their weights' places, the ones it has first: the two-bone program
+         * reads the first two only, so a vertex whose two bones sit in places 2 and 3 would be lost to it. */
+        int four = 0;
         for (uint32_t q = 0; q < ngv; q++) {
             uint32_t v = gv[q];
-            for (int k = 0; k < 4; k++) {
-                float w = skin->weights[first + v][k];
-                g->bone[4 * q + k] = w > 0 ? (float)local[skin->bones[first + v][k]] : 0.0f;
-            }
+            int16_t out[4] = { 0, 0, 0, 0 };
+            int n = 0;
+            for (int k = 0; k < 4; k++)
+                if (skin->weights[first + v][k] > 0)
+                    out[n++] = (int16_t)(3 * local[skin->bones[first + v][k]]);
+            if (n > 2)
+                four = 1;
+            g->bone[4 * q] = out[0]; g->bone[4 * q + 1] = out[1]; g->bone[4 * q + 2] = out[2]; g->bone[4 * q + 3] = out[3];
         }
         for (uint32_t q = 0; q < ngv; q++) {
             uint32_t v = gv[q];
-            for (int k = 0; k < 4; k++) {
-                float w = skin->weights[first + v][k];
-                g->weight[4 * q + k] = w > 0 ? w : 0.0f;
-            }
+            float out[4] = { 0, 0, 0, 0 };
+            int n = 0;
+            for (int k = 0; k < 4; k++)
+                if (skin->weights[first + v][k] > 0)
+                    out[n++] = skin->weights[first + v][k];
+            g->weight[4 * q] = out[0]; g->weight[4 * q + 1] = out[1]; g->weight[4 * q + 2] = out[2]; g->weight[4 * q + 3] = out[3];
         }
+        g->four = (uint8_t)four;
         memcpy(g->idx, gi, sizeof *g->idx * ngi);
         g->nverts = ngv;
         g->nidx = ngi;
@@ -2203,25 +2957,43 @@ fail:
 static void draw_part(Renderer *r, const SceneMesh *sm, const Skin *skin, uint32_t i, uint32_t first, double t)
 {
     pump_output(r);
-#ifdef RAMPAGE_XBOX
-    const PartBuf *xp = xbox_part(r, sm, i, skin != NULL);
-    XboxDirect xd;
-    memset(&xd, 0, sizeof xd);
-    xd.skin = skin;
-    if (skin && skin->gpu_skin > 0 && !skin->cloth) {   /* posed by the GPU */
-        xd.sg = r->cur_inst && xp ? xbox_skin_gpu(r, sm, skin, i, first, (PartBuf *)xp) : NULL;
-        if (!xd.sg) {
-            ((Skin *)skin)->gpu_skin = -1;           /* not this one: the CPU poses it from the next frame on */
-            return;
-        }
-    } else if (skin && !skin->pos)
-        return;                                      /* (the CPU has not posed it yet) */
-#endif
     const Scene *s = r->scene;
     const MeshPart *p = &sm->mesh.parts[i];
     uint32_t tex = shown_texture(r, sm->b, material_texture(sm->b, p->material), t);
     float reg[4], rs[2] = { 1, 1 };                      /* a texture region: its tile (region_texture) */
     GLuint rid = p->uv && material_region(sm->b, p->material, reg) ? region_texture(r, sm->b, tex, reg, rs) : 0;
+#ifdef RAMPAGE_XBOX
+    /* A region's scale goes into the part's own copies when nothing else uses its coordinates unscaled (a damage or
+     * reflection layer is drawn with them as they are) and its texture is one picture (not an .ifl): the taxis, the
+     * trucks, the backdrops' bricks and windows are then drawn straight from GPU memory. */
+    int bake = g_xbox_region_bake && rid && !skin && tex == material_texture(sm->b, p->material) &&
+               !cube_material(s, sm, p->material) &&
+               !(p->col && material_damage_layer(sm->b, p->material)) && !(p->nrm && material_env(sm->b, p->material)) &&
+               !(s->cloud_material && sm->b == s->city && p->material == s->cloud_material);
+    const PartBuf *xp = xbox_part(r, sm, i, skin != NULL, bake ? rs : NULL);
+    XboxDirect xd;
+    memset(&xd, 0, sizeof xd);
+    xd.skin = skin;
+    if (skin && skin->gpu_skin == 1 && !skin->cloth)
+        ((Skin *)skin)->gpu_skin = xbox_skin_ok(r, sm, skin) ? 2 : -1;   /* (asked once, of all its parts) */
+    if (skin && skin->gpu_skin > 0 && !skin->cloth) {   /* posed by the GPU */
+        xd.sg = r->cur_inst && xp ? xbox_skin_gpu(r, sm, skin, i, first, (PartBuf *)xp) : NULL;
+        if (!xd.sg) {                                /* no room in the store: the CPU poses it from the next frame on,
+                                                      * and what was made for its other parts goes */
+            xbox_skin_demote(r, sm, skin);
+            return;
+        }
+    } else if (skin && !skin->pos)
+        return;                                      /* (the CPU has not posed it yet) */
+    int baked = bake && xp && xp->vbo == 1 && xp->own && xp->baked;   /* (drawn without the texture matrix) */
+    if (baked) {
+        xd.baked = 1;
+        xd.rs[0] = rs[0];
+        xd.rs[1] = rs[1];
+    }
+#else
+    const int baked = 0;
+#endif
     GLuint id = rid ? rid : texture(r, sm->b, tex);
     int cube = cube_material(s, sm, p->material);
     GLuint cube_env = cube ? texture(r, s->city, s->env_map) : 0;
@@ -2263,7 +3035,7 @@ static void draw_part(Renderer *r, const SceneMesh *sm, const Skin *skin, uint32
         drift[0] = (float)fmod(s->cloud_rate[0] * t, 1.0);
         drift[1] = (float)fmod(s->cloud_rate[1] * t, 1.0);
     }
-    if (scroll || rid) {                                 /* the drifting cloud band (AnimatingSkyData); the tile's
+    if (scroll || (rid && !baked)) {                     /* the drifting cloud band (AnimatingSkyData); the tile's
                                                           * scale, after the drift as the GS wraps the UVs it is sent */
         glMatrixMode(GL_TEXTURE);
         glLoadIdentity();
@@ -2278,14 +3050,19 @@ static void draw_part(Renderer *r, const SceneMesh *sm, const Skin *skin, uint32
     const PartBuf *pb = skin ? NULL : part_buffers(r, sm, i);
     const void *pos = p->pos, *nrm = p->nrm, *uv = p->uv, *col = p->col, *idx = p->tris;
 #ifdef RAMPAGE_XBOX
-    int xbox_static = (xp && xp->vbo == 1) || (skin && skin->gpu);   /* (a posed mesh in the GPU's store) */
+    int xbox_static = (xp && xp->vbo == 1 && !xp->own) || (skin && skin->gpu);   /* (a posed mesh in the GPU's store;
+                                                      * an unposed part's own copies are not found by its addresses) */
     if (xbox_static)
         gliStaticArraysHint(1);                      /* this part's draws, to the end of the function */
     GLenum idx_type = GL_UNSIGNED_INT;
     if (xp && xp->idx16) {
-        idx = xp->idx16;
-        idx_type = GL_UNSIGNED_SHORT;
         xd.idx16 = xp->idx16;
+        xd.nidx16 = xp->own ? xp->nidx16 : 0;
+        if (!xp->stale) {                            /* (a changed part's old copies: their indices are not the
+                                                      * part's; a draw from the client arrays takes the part's own) */
+            idx = xp->idx16;
+            idx_type = GL_UNSIGNED_SHORT;
+        }
     }
     (void)pos; (void)nrm; (void)uv; (void)col;
     xd.cpos = skin ? (xd.sg ? NULL : skin->pos + 3 * first) : p->pos;
@@ -2416,7 +3193,7 @@ static void draw_part(Renderer *r, const SceneMesh *sm, const Skin *skin, uint32
     }
     if (test_was)
         glEnable(GL_ALPHA_TEST);
-    if (rid) {                                           /* the region is texture slot 0's alone (0x265840) */
+    if (rid && !baked) {                                 /* the region is texture slot 0's alone (0x265840) */
         glMatrixMode(GL_TEXTURE);
         glLoadIdentity();
         if (scroll)
@@ -2907,11 +3684,27 @@ static void draw_fx(Renderer *r, const FxQuad *fx, int nfx, const Camera *cam, f
 #ifdef RAMPAGE_XBOX
     GLuint qb_id = ~0u;
     int qb_depth = -1, qb_add = -1, qb_flat = -1;
+    const Bundle *last_b = NULL;                           /* (an emitter's quads follow each other: its texture is
+                                                            * looked up once, not for each of a thousand quads) */
+    uint32_t last_tex = 0;
+    GLuint last_id = 0;
     qb_begin();
 #endif
     for (int i = 0; i < nfx; i++) {
         const FxQuad *q = &fx[i];
+#ifdef RAMPAGE_XBOX
+        GLuint id = 0;
+        if (q->b) {
+            if (q->b != last_b || q->tex != last_tex) {
+                last_id = texture_at(r, q->b, q->tex, 1);
+                last_b = q->b;
+                last_tex = q->tex;
+            }
+            id = last_id;
+        }
+#else
         GLuint id = q->b ? texture_at(r, q->b, q->tex, 1) : 0;
+#endif
 #ifdef RAMPAGE_XBOX
         {                                                  /* the state as below, set only when it changes */
             int depth = q->ztest || world, add = q->additive != 0, flat = q->kind == FXQ_FLAT;
@@ -2952,7 +3745,14 @@ static void draw_fx(Renderer *r, const FxQuad *fx, int nfx, const Camera *cam, f
 #endif
         float c[4][3];                                     /* top-left, top-right, bottom-right, bottom-left */
         if (q->kind == FXQ_BILLBOARD) {
+#ifdef RAMPAGE_XBOX
+            float cs = 1, sn = 0, rr[3], uu[3];          /* (the library's cosf and sinf are slow here, and most
+                                                          * billboards are not turned: fx.c's table) */
+            if (q->rot != 0)
+                fx_sincos(q->rot, &sn, &cs);
+#else
             float cs = cosf(q->rot), sn = sinf(q->rot), rr[3], uu[3];
+#endif
             for (int k = 0; k < 3; k++) {
                 rr[k] = (cs * right[k] + sn * up[k]) * q->size[0] / 2;
                 uu[k] = (-sn * right[k] + cs * up[k]) * q->size[1] / 2;
@@ -3020,11 +3820,11 @@ static void draw_fx(Renderer *r, const FxQuad *fx, int nfx, const Camera *cam, f
         }
         if (world && !q->ztest) {                          /* (above: tested in front of what it starts in) */
             float pull = 0;
-            for (int k = 0; k < 4; k++) {
+            for (int k = 0; k < 4; k++) {                  /* (the farthest corner: one root, of the largest square) */
                 float e[3] = { c[k][0] - q->pos[0], c[k][1] - q->pos[1], c[k][2] - q->pos[2] };
-                pull = fmaxf(pull, sqrtf(e[0] * e[0] + e[1] * e[1] + e[2] * e[2]));
+                pull = fmaxf(pull, e[0] * e[0] + e[1] * e[1] + e[2] * e[2]);
             }
-            pull += 1;
+            pull = sqrtf(pull) + 1;
             for (int k = 0; k < 4; k++) {
                 float e[3] = { c[k][0] - cam->pos[0], c[k][1] - cam->pos[1], c[k][2] - cam->pos[2] };
                 float d = sqrtf(e[0] * e[0] + e[1] * e[1] + e[2] * e[2]), f = d > 0 ? fmaxf(d - pull, 0.5f) / d : 1;
@@ -3065,6 +3865,11 @@ void rnd_frame(Renderer *r, const Window *w, const Camera *cam, double t, int fo
     XS_END();
 #ifdef RAMPAGE_XBOX
     r->xframe++;
+    gliSkinNewFrame();                               /* (the skinning programs: loaded again at their first use) */
+    qb_frame();
+    r->own_budget = 64u * 1024u;                     /* (about 1,300 vertices: half a millisecond of copying) */
+    r->own_starved = OWN_STARVED_BYTES;
+    r->own_made = 0;
 #endif
     pump_output(r);
     const Scene *s = r->scene;
@@ -3168,6 +3973,10 @@ void rnd_frame(Renderer *r, const Window *w, const Camera *cam, double t, int fo
     }
     float view_mv[16], ty = tanf(cam->fov_deg * 3.14159265f / 360.0f), tx = ty * aspect;
     glGetFloatv(GL_MODELVIEW_MATRIX, view_mv);
+#ifdef RAMPAGE_XBOX
+    int xbox_mv_loaded = 0;
+    uint32_t rig_skip = 0;
+#endif
     for (int pass = 0; pass < 2; pass++) {               /* the street, its building shadows, then the rest */
         r->hold = pass && gtao_active();                 /* port extra: the blended parts after the occlusion (the
                                                           * street's lie on it, darkened as it is) */
@@ -3204,21 +4013,91 @@ void rnd_frame(Renderer *r, const Window *w, const Camera *cam, double t, int fo
                 g_xbox_item_seen[i] = (uint8_t)seen;     /* (scene_update: a skin out of sight is not posed) */
             r->bat_keys = pass && i < r->nbitem && r->bitem[i].active ? r->bitem[i].key : NULL;
             r->cur_inst = in;
+            /* A model that keeps moving (a person, a soldier, a car: not in the batches, and moved more than once),
+             * the run of its unskinned items: their merged meshes in a few draws (rig_mesh), then whatever parts
+             * of them were not merged, item by item. */
+            if (pass && g_xbox_rigid && i >= rig_skip && !it->skin && i < r->nbitem && !r->bitem[i].active &&
+                r->bitem[i].moves >= 3) {
+                uint32_t n = 1;
+                while (i + n < s->nitems && n < SKIN_GROUP_BONES && s->items[i + n].instance == it->instance &&
+                       !s->items[i + n].skin && i + n < r->nbitem && !r->bitem[i + n].active)
+                    n++;
+                if (n >= 2) {
+                    int vis = 0;
+                    for (uint32_t j = 0; j < n; j++)
+                        vis |= i + j < g_xbox_item_seen_n ? g_xbox_item_seen[i + j] : 1;
+                    RigMesh *rm = vis ? rig_mesh(r, i, n, t) : NULL;
+                    if (!vis) {
+                        i += n - 1;
+                        continue;
+                    }
+                    if (rm) {
+                        int own_amb = in->own_ambient && s->nlights;
+                        if (own_amb)
+                            glLightModelfv(GL_LIGHT_MODEL_AMBIENT,
+                                           (float[4]){ in->ambient[0], in->ambient[1], in->ambient[2], 1 });
+                        glLoadMatrixf(view_mv);      /* (the palette holds the pieces' world matrices) */
+                        xbox_mv_loaded = 0;
+                        int merged = rig_draw(r, rm, i);
+                        for (uint32_t j = 0; j < n; j++) {
+                            if (merged && !rm->left[j])
+                                continue;
+                            const DrawItem *jt = &s->items[i + j];
+                            r->bat_keys = merged ? rm->keys[j] : NULL;
+                            xbox_item_matrix(view_mv, jt->world.m);
+                            xbox_mv_loaded = 1;
+                            draw_mesh(r, &s->meshes[jt->mesh], NULL, t);
+                        }
+                        r->bat_keys = NULL;
+                        if (own_amb)
+                            glLightModelfv(GL_LIGHT_MODEL_AMBIENT, amb);
+                        i += n - 1;
+                        continue;
+                    }
+                    rig_skip = i + n;                /* not merged: its items one by one, and no shorter run of
+                                                      * them tried as a model of its own */
+                }
+            }
 #else
             int seen = item_seen(r, it, view_mv, tx, ty);
 #endif
             if (!seen)
                 continue;
+#ifdef RAMPAGE_XBOX
+            /* An item whose parts are all in batches has nothing left to draw here: no ambient, no matrix (each
+             * crossed gl4es, for several hundred standing items a frame). */
+            if (g_xbox_item_skip && r->bat_keys && !it->skin &&
+                r->bitem[i].nkeys >= s->meshes[it->mesh].mesh.nparts) {
+                const Mesh *im = &s->meshes[it->mesh].mesh;
+                uint32_t k = 0;
+                while (k < im->nparts && (!im->parts[k].ntris || r->bat_keys[k] >= 0))
+                    k++;
+                if (k == im->nparts)
+                    continue;
+            }
+#endif
             int own = in->own_ambient && s->nlights;   /* an adornment's ambient (0x2CD060), the scene's after it */
             if (own)
                 glLightModelfv(GL_LIGHT_MODEL_AMBIENT, (float[4]){ in->ambient[0], in->ambient[1], in->ambient[2], 1 });
+#ifdef RAMPAGE_XBOX
+            xbox_item_matrix(view_mv, it->world.m);
+            xbox_mv_loaded = 1;
+            draw_mesh(r, &s->meshes[it->mesh], it->skin, t);
+#else
             glPushMatrix();
             glMultMatrixf(it->world.m);
             draw_mesh(r, &s->meshes[it->mesh], it->skin, t);
             glPopMatrix();
+#endif
             if (own)
                 glLightModelfv(GL_LIGHT_MODEL_AMBIENT, amb);
         }
+#ifdef RAMPAGE_XBOX
+        if (xbox_mv_loaded) {                        /* the view matrix again, for what follows */
+            glLoadMatrixf(view_mv);
+            xbox_mv_loaded = 0;
+        }
+#endif
 #ifdef RAMPAGE_XBOX
         r->bat_keys = NULL;
         r->cur_inst = NULL;

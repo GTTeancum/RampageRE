@@ -1,0 +1,54 @@
+diff --git a/gles_texture.c b/gles_texture.c
+index df2dcd3..00f6fdf 100644
+--- a/gles_texture.c
++++ b/gles_texture.c
+@@ -1748,6 +1748,49 @@ static GLboolean gliTextureUnpackDxt(texture_object_t *object, xgu_texture_t *te
+     return GL_TRUE;
+ }
+ 
++/* The bound texture's image given as it is stored: 8-bit indices in rows (width x height, no padding) and a
++ * palette of 256 RGBA byte quads. For an application whose source images are paletted already: gliTextureTryPalette
++ * reaches the same storage from a full-colour upload, at the cost of that upload, a wait for the GPU and a read
++ * back out of write-combined memory to find the colours again.
++ * The caller has just given the texture an empty full-colour image of that size (glTexImage2D with no pixels) and
++ * has not drawn with it, so nothing the GPU was sent refers to the storage replaced here. GL_FALSE leaves the
++ * texture as it was (the caller uploads full colour). */
++GLboolean gliTexturePalette8(GLsizei width, GLsizei height, const GLubyte *indices, const GLubyte *palette_rgba)
++{
++    gli_context_t *context = gliGetContext();
++    GLuint unit = context->texture_environment.server_active_texture - GL_TEXTURE0;
++    texture_object_t *object = context->texture_environment.texture_units[unit].bound_texture_object;
++    xgu_texture_t *texture = object ? (xgu_texture_t *)object->texture_2d : NULL;
++    if (!indices || !palette_rgba || !texture || !texture->data || texture->palette_offset || !texture->swizzled ||
++        texture->mipmap_levels != 1 || object->generate_mipmap ||
++        texture->format != XGU_TEXTURE_FORMAT_A8R8G8B8_SWIZZLED || texture->bytes_per_pixel != 4 ||
++        width < 8 || height < 8 || texture->tex_width != width || texture->tex_height != height ||
++        texture->data_width != width || texture->data_height != height || width > 4096 || height > 4096)
++        return GL_FALSE;
++    size_t count = (size_t)width * (size_t)height;
++    size_t palette_offset = (count + 63u) & ~(size_t)63u;
++    size_t size = palette_offset + 1024;
++    GLubyte *data = MmAllocateContiguousMemoryEx(size, 0, 0x03FFAFFF, 0x1000, PAGE_READWRITE | PAGE_WRITECOMBINE);
++    if (!data) return GL_FALSE;
++    swizzle_rect(indices, (unsigned)width, (unsigned)height, data, (unsigned)width, 1);
++    uint32_t *palette = (uint32_t *)(data + palette_offset);
++    for (unsigned i = 0; i < 256; ++i) {
++        const GLubyte *c = palette_rgba + 4u * i; /* stored as the GPU's A8R8G8B8 words */
++        palette[i] = ((uint32_t)c[3] << 24) | ((uint32_t)c[0] << 16) | ((uint32_t)c[1] << 8) | (uint32_t)c[2];
++    }
++    __asm__ volatile("sfence" ::: "memory");
++    MmFreeContiguousMemory(texture->data);
++    texture->data = data;
++    texture->data_physical_address = (GLubyte *)MmGetPhysicalAddress(data);
++    texture->data_size = size;
++    texture->bytes_per_pixel = 1;
++    texture->pitch = texture->data_width;
++    texture->palette_offset = palette_offset;
++    texture->format = (XguTexFormatColor)NV097_SET_TEXTURE_FORMAT_COLOR_SZ_I8_A8R8G8B8;
++    object->texture_object_dirty = GL_TRUE;
++    return GL_TRUE;
++}
++
+ /* Preserve ordinary GL semantics if a paletted image later becomes mutable,
+  * gains mipmaps, or is attached as a render target. Failure leaves it intact. */
+ GLboolean gliTextureUnpackPalette(texture_object_t *object)

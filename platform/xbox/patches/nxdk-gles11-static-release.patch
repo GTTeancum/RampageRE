@@ -1,0 +1,37 @@
+--- a/gles_staging.c
++++ b/gles_staging.c
+@@ -92,8 +92,12 @@
+ {
+     size = (size + 31u) & ~31u;
+     if (!size || size > ST_CHUNK_BYTES) return NULL;
++    /* Every chunk there is first, then a new one in the first empty slot: since chunks are given back (st_free), an
++     * empty slot can come before chunks that have room. */
++    for (int pass = 0; pass < 2; pass++)
+     for (int c = 0; c < ST_MAX_CHUNKS; c++) {
+         st_chunk_t *ch = &st_chunks[c];
++        if (pass ? ch->base != NULL : ch->base == NULL) continue;
+         if (!ch->base) {
+             MM_STATISTICS ms;
+             memset(&ms, 0, sizeof ms);
+@@ -161,6 +165,21 @@
+             if (prev && !prev->used) {
+                 prev->size += n->size; prev->next = n->next; free(n);
+             }
++            /* A chunk with nothing left in it goes back to the system, unless it is the only empty one (one is kept
++             * so a release and an allocation that follow each other do not free and take a chunk each time). The
++             * store grew to a level's peak and stayed there: several megabytes of a 64 MiB console after the
++             * arrays of a block's loading and of every remade copy were gone. */
++            if (ch->free == ST_CHUNK_BYTES) {
++                int spare = 0;
++                for (int k = 0; k < ST_MAX_CHUNKS; k++)
++                    if (k != c && st_chunks[k].base && st_chunks[k].free == ST_CHUNK_BYTES) spare++;
++                if (spare) {
++                    for (st_node_t *x = ch->nodes; x;) { st_node_t *y = x->next; free(x); x = y; }
++                    MmFreeContiguousMemory(ch->base);
++                    ch->base = NULL; ch->nodes = NULL; ch->first_free = NULL; ch->free = 0;
++                    if (gli_static_stats[4]) gli_static_stats[4]--;
++                }
++            }
+             return;
+         }
+         return;

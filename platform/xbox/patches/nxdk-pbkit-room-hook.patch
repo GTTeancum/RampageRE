@@ -3,7 +3,7 @@ index bd6e31e..0f740af 100644
 --- a/lib/pbkit/pbkit.c
 +++ b/lib/pbkit/pbkit.c
 @@ -104,6 +104,14 @@ static  uint32_t        *pb_Put=NULL;   //where next command+params are to be wr
- #define PB_KICK_BYTES 4096u
+ #define PB_KICK_BYTES 16384u
  static  uint32_t        *pb_Kicked=NULL; //pb_Put as last given to the GPU
  static  int             pb_kick_batching=0;
 +/* pbkit never checks for room. A caller that restarts the push buffer itself sets this: it is called,

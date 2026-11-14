@@ -10,7 +10,7 @@ index b6c971a..bd6e31e 100644
 + * thousands of small blocks. Once initialised, pb_end only hands the GPU new work every
 + * PB_KICK_BYTES; everything that waits on the GPU (pb_busy, pb_finished, pb_wait_for_vbl,
 + * pb_reset, pb_kill) submits what is outstanding first. */
-+#define PB_KICK_BYTES 4096u
++#define PB_KICK_BYTES 16384u
 +static  uint32_t        *pb_Kicked=NULL; //pb_Put as last given to the GPU
 +static  int             pb_kick_batching=0;
  

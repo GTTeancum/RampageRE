@@ -6,6 +6,7 @@
 #ifndef _WINGDI_
 #define _WINGDI_                         /* gl4es must not import Win32 WGL */
 #endif
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <windows.h>
@@ -24,8 +25,20 @@ void glFlipNV2A(void);
 void glSwapInterval(int interval);
 void *APIENTRY_GL4ES nxdk_gl4es_getprocaddress(const char *name);
 void gliStagingDestroy(void);
+/* the patched pbkit's (platform/xbox/patches/nxdk-pbkit-back-buffers.patch) */
+void pb_back_buffers(int n);
+void pb_depth_on_boot_screen(int on);
+/* the patched nxdk-gles11's (nxdk-gles11-pushbuffer-frames.patch) */
+void gliPushbufferSize(uint32_t bytes);
+void gliStaticKeepFree(uint32_t bytes);   /* (nxdk-gles11-static-fit.patch) */
 
 static int context_live;
+int g_xbox_video;                        /* 0: by the dashboard's settings. A test build's --xvideo: 480 (4:3), 481
+                                          * (480 drawn for a 16:9 screen), 720 */
+int g_xbox_two_buffers = 1;              /* 1280 x 720 with a front and one back buffer (--xoff twobuf: three) */
+int g_xbox_long_pushbuffer = 1;          /* a 2 MiB push buffer, several frames long, as the game's own Xbox build has
+                                          * (--xoff longpb: pbkit's 512 KiB, restarted and the GPU waited for every
+                                          * frame) */
 static int display_width, display_height;
 static int logical_width;                /* the width the game lays its picture out for: 640, or 853 on a 16:9 screen */
 int xbox_pixel_width(void) { return display_width; }
@@ -63,21 +76,47 @@ int win_open(Window *w, const char *title, int width, int height, int hidden)
         fprintf(stderr, "Xbox: offscreen window requests are unsupported; capture the displayed frame instead.\n");
         return -1;
     }
-    /* A fixed low-memory target works on all retail cable/region combinations.
-     * Settings may still contain a desktop resolution; never let that allocate
-     * an accidental 1080p framebuffer on the console. */
-    /* 640 x 480 pixels on every console: the stock 64 MB has no room for more (1280 x 720 was drawn correctly and
-     * ran out of memory with four monsters). nxdk picks the scan from the console's settings and cable: interlaced
-     * (480i) on the standard cables, progressive (480p) on component with 480p enabled. With Widescreen set on the
-     * dashboard the same pixels are stretched over a 16:9 screen by the television, so the picture is drawn for
-     * that shape: the game is told a window 853 wide (its camera and HUD are laid out for it, as for any wide
-     * window) and the renderer maps it onto the 640 pixels (xbox_pixel_width). */
+    /* The picture's size comes from the console's own video settings and cable, as for any Xbox game:
+     *   1280 x 720  with 720p enabled on the dashboard and an HD (component) cable: always a 16:9 picture
+     *   640 x 480   otherwise: interlaced (480i) on the standard cables, progressive (480p) on component with 480p
+     *               enabled. With Widescreen set the television stretches the same pixels over a 16:9 screen, so
+     *               the picture is drawn for that shape: the game is told a window 853 wide (its camera and HUD
+     *               are laid out for it, as for any wide window) and the renderer maps it onto the 640 pixels
+     *               (xbox_pixel_width).
+     * Settings may still contain a desktop resolution; it never reaches the console.
+     * Memory (the stock 64 MB, shared with everything else): three 640 x 480 buffers and the depth buffer are
+     * 4.7 MB. At 1280 x 720 each buffer is 3.5 MB, so the picture is drawn with two buffers instead of three
+     * (pb_back_buffers: the GPU waits for the television's refresh itself) and with the depth buffer 10.6 MB. */
     display_width = 640;
     display_height = 480;
-    if (!XVideoSetMode(display_width, display_height, 32, REFRESH_DEFAULT)) {
+    int want_720 = g_xbox_video == 720;
+    if (!g_xbox_video) {                             /* by the dashboard: is 1280 x 720 among the modes it allows? */
+        VIDEO_MODE vm;
+        void *at = NULL;
+        while (XVideoListModes(&vm, 32, REFRESH_DEFAULT, &at))
+            if (vm.width == 1280 && vm.height == 720) want_720 = 1;
+    }
+    if (want_720 && XVideoSetMode(1280, 720, 32, REFRESH_DEFAULT)) {
+        display_width = 1280;
+        display_height = 720;
+    } else if (!XVideoSetMode(display_width, display_height, 32, REFRESH_DEFAULT)) {
         fprintf(stderr, "Xbox: cannot set 640x480x32 display mode.\n");
         return -1;
     }
+    if (display_height == 720 && g_xbox_two_buffers)
+        pb_back_buffers(1);
+    /* XVideoSetMode left a screen of its own allocated that is never shown again: pbkit uses it as the depth buffer
+     * instead of taking another (1.2 MB at 640 x 480, 3.5 MB at 1280 x 720) */
+    pb_depth_on_boot_screen(1);
+    /* The GPU draws a frame while the next is being sent: with pbkit's 512 KiB the buffer is restarted every frame,
+     * and a restart waits for the GPU to finish everything first. */
+    if (g_xbox_long_pushbuffer)
+        gliPushbufferSize(2u * 1024u * 1024u);
+    /* The GPU's store of static meshes stops growing when 8 MiB of RAM are left for what is loaded later. At
+     * 1280 x 720 the frame buffers have taken 6 MiB more than at 640 x 480, and what is loaded later is the same:
+     * the reserve there is 5 MiB, so the store has room for the level's meshes. */
+    if (display_height == 720)
+        gliStaticKeepFree(5u * 1024u * 1024u);
     if (SDL_InitSubSystem(SDL_INIT_TIMER | SDL_INIT_EVENTS) != 0) {
         fprintf(stderr, "Xbox: SDL event/timer initialization failed: %s\n", SDL_GetError());
         return -1;
@@ -91,7 +130,10 @@ int win_open(Window *w, const char *title, int width, int height, int hidden)
     initialize_gl4es();
     context_live = 1;
     glSwapInterval(1);
-    logical_width = XVideoGetEncoderSettings() & VIDEO_WIDESCREEN ? 853 : display_width;
+    int wide = g_xbox_video == 481 || (g_xbox_video != 480 && (XVideoGetEncoderSettings() & VIDEO_WIDESCREEN));
+    logical_width = display_height == 720 ? display_width : wide ? 853 : display_width;
+    fprintf(stdout, "Xbox video: %d x %d pixels, picture laid out %d wide, %d buffers\n", display_width, display_height,
+            logical_width, display_height == 720 && g_xbox_two_buffers ? 2 : 3);
     w->width = logical_width;
     w->height = display_height;
     w->focused = 1;

@@ -41,6 +41,9 @@ void cloth_reset(Cloth *c, const float (*skin)[16]);
 /* one frame of dt seconds (0x1D90E0). wind: a force added to every free particle this frame (0x1D6740; the flags'
  * comes from cloth_flag_wind, the monsters get none), may be NULL. dt <= 0 does nothing. */
 void cloth_step(Cloth *c, float dt, const float (*skin)[16], const float wind[3]);
+/* a frame of dt seconds that the cloth is not stepped for (the Xbox poses its flags on alternate frames): the time is
+ * kept, at most 0.1 s of it, and the next cloth_step runs for its own dt and this as one frame */
+void cloth_defer(Cloth *c, float dt);
 
 /* after a step, a flag's collisions (the entry's own spheres, 0x1D87F0, are none): every free particle on the far
  * side of the plane n.x = d (n unit) is put on it (0x1D6630, a building's flag against its wall), or every one within

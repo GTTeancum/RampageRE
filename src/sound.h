@@ -25,9 +25,15 @@
 #include <stdint.h>
 #include "data.h"
 
-#define SOUND_RATE 48000                 /* [R] the SPU2's rate; the output is 16-bit stereo at this rate */
+#define SOUND_RATE 48000                 /* [R] the SPU2's rate; the output is 16-bit stereo at this rate (on Xbox
+                                          * the effect voices are summed at half of it and stepped up: sound.c) */
 
 int  sound_init(const Vol *v);           /* read the banks from the Vol; the number of events, -1 if none */
+/* The banks' samples into memory, once, after sound_init (a load: it reads 8.6 MB), so that no sound's first use
+ * reads the disc during play. On Xbox the two PS2 banks are kept as they are stored (PS-ADPCM, 8.6 MB; decoded they
+ * would be 30 MB) and decoded from memory as they play; a bank that does not fit stays read at first use. Elsewhere
+ * nothing: the samples are decoded at first use as before. Calling it again does nothing more. */
+void sound_preload_all(void);
 void sound_free(void);
 int  sound_start(void);                  /* open the audio output (waveOut from winmm.dll loaded at run
                                           * time; SDL2 outside Windows); 0 = ok */

@@ -43,7 +43,7 @@ if [[ $stage == deps || $stage == all ]]; then
     cp -r "$NXDK_DIR/lib/pbkit" "$L/pbkit-src/lib/pbkit"
     rm -f "$L/pbkit-src/lib/pbkit/"*.obj "$L/pbkit-src/lib/pbkit/"*.d
     git -C "$L/pbkit-src" init -q .
-    for p in startup-ready-bounds dpc-scanout-fallback reset-drain-lifecycle kick-batching room-hook; do
+    for p in startup-ready-bounds dpc-scanout-fallback reset-drain-lifecycle kick-batching room-hook back-buffers; do
         apply "$L/pbkit-src" "$P/nxdk-pbkit-$p.patch"
     done
     log "build patched libpbkit.lib"
@@ -57,7 +57,7 @@ if [[ $stage == deps || $stage == all ]]; then
     nxdk-lib -out:"$L/libpbkit.lib" "${objs[@]}"
 
     checkout "$L/nxdk-gles11" https://github.com/Ryzee119/nxdk-gles11.git $GLES_COMMIT
-    for p in default-state staging-pages lighting-normal light-cache texture-telemetry exact-palette reset-drain pushbuffer-room static-arrays frame-pacing deferred-restart staging-pack direct-draw; do
+    for p in default-state staging-pages lighting-normal light-cache texture-telemetry exact-palette reset-drain pushbuffer-room static-arrays frame-pacing deferred-restart staging-pack direct-draw skin-programs pushbuffer-frames static-fit palette-direct static-release; do
         apply "$L/nxdk-gles11" "$P/nxdk-gles11-$p.patch"
     done
     # nxdk-gles11 includes <pbkit/...>; point it at the patched driver headers first

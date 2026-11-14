@@ -60,6 +60,8 @@ struct Cloth {
     float acc[3];                                    /* instance +0x60 */
     int started, simulating, resume;                 /* +0x81, +0x83, +0x80 */
     float freeze, inv_freeze;                        /* +0x84, +0x88 */
+    float owed; int owed_frames;                     /* the port's: frames' time not stepped yet (cloth_defer) */
+    int frames;                                      /* the frames the step under way stands for */
 };
 
 /* ---- small vector and matrix helpers (column-major 4x4; the game's 4x3 row matrices have the same layout) */
@@ -654,13 +656,38 @@ static void update(Cloth *c, const float (*skin)[16], float dt)
         particle_normals(c, skin);
         return;                                      /* the added force stays: the game clears it only below [R] */
     }
-    float inv_dt = dt > 0 ? 1 / dt : 0;
+    float sim = dt;                                  /* the time the particles are given: the frame's */
+#ifdef RAMPAGE_XBOX
+    float real2 = 1;
+    /* Xbox: no more than two sub-steps for each frame the step stands for (at 20 frames a second the 1/60 s sub-steps
+     * were three a frame). The time past that is dropped, as the console's own build drops its world's: the cloth
+     * then runs that much slower rather than cost more. The frame is taken to be that short throughout (the pins'
+     * mean velocity and the velocities read back are in the same time as the sub-steps), but a pin's speed is
+     * measured against MAX_VEL in the frame's real time (real2). */
+    {
+        float least = 0;
+        for (int k = 0; k < c->nparts; k++)
+            if (c->parts[k].max_dt > 0 && (least <= 0 || c->parts[k].max_dt < least))
+                least = c->parts[k].max_dt;
+        float most = 2 * least * (float)(c->frames > 1 ? c->frames : 1);
+        if (least > 0 && sim > most) {
+            sim = most;
+            real2 = (sim / dt) * (sim / dt);
+        }
+    }
+#endif
+    float inv_dt = sim > 0 ? 1 / sim : 0;
     /* the skin matrices: the game makes them here for the entry's bone list from the skeleton (node x world, then the
      * inverse bind x that: 0x1D93E8, 0x1D9768); here the caller hands them in */
     pins(c, skin, inv_dt);
     for (int k = 0; k < c->nparts; k++) {
         Part *p = &c->parts[k];
-        if (p->max_speed2 > p->max_vel * p->max_vel) {   /* a pin went faster than MAX_VEL: snap to rest, blend */
+        float fast2 = p->max_speed2;
+#ifdef RAMPAGE_XBOX
+        if (real2 != 1)
+            fast2 *= real2;
+#endif
+        if (fast2 > p->max_vel * p->max_vel) {       /* a pin went faster than MAX_VEL: snap to rest, blend */
             start_blend(c, 0, p->max_vel_time);
             c->resume = 1;
             update(c, skin, dt);
@@ -669,8 +696,8 @@ static void update(Cloth *c, const float (*skin)[16], float dt)
     }
     memcpy(c->m1c, c->world, sizeof c->m1c);
     for (int k = 0; k < c->nparts; k++) {            /* substeps of MAX_TIME_DELTA, the rest in one more (> 1e-4) */
-        float step = c->parts[k].max_dt, t = dt;
-        if (step > 0 && dt > step)
+        float step = c->parts[k].max_dt, t = sim;
+        if (step > 0 && sim > step)
             do {
                 substep(c, k, step, skin);
                 t -= step;
@@ -694,6 +721,8 @@ void cloth_reset(Cloth *c, const float (*skin)[16])
     c->resume = 0;
     c->freeze = 0;
     c->acc[0] = c->acc[1] = c->acc[2] = 0;
+    c->owed = 0;                                     /* (at rest now: no frame is owed) */
+    c->owed_frames = 0;
     particle_normals(c, skin);
 }
 
@@ -704,7 +733,27 @@ void cloth_step(Cloth *c, float dt, const float (*skin)[16], const float wind[3]
     if (wind) {                                      /* 0x1D6740 */
         c->acc[0] += wind[0]; c->acc[1] += wind[1]; c->acc[2] += wind[2];
     }
+    c->frames = 1;
+    if (c->owed > 0) {                               /* with the frames it was not stepped for (cloth_defer) */
+        dt += c->owed;
+        c->frames += c->owed_frames;
+        c->owed = 0;
+        c->owed_frames = 0;
+    }
     update(c, skin, dt);
+    c->frames = 1;
+}
+
+void cloth_defer(Cloth *c, float dt)
+{
+    if (!c || !(dt > 0))
+        return;
+    c->owed += dt;
+    c->owed_frames++;
+    if (c->owed > 0.1f) {                            /* (no more than a long frame's worth: it stays stable) */
+        c->owed = 0.1f;
+        c->owed_frames = c->owed_frames < 2 ? c->owed_frames : 2;
+    }
 }
 
 /* 0x1D61D0 / 0x1D5E00, after the push out along n: the velocity relative to the collider's, its part along n
@@ -771,6 +820,7 @@ void cloth_step_again(Cloth *c, float dt)
     if (!c)
         return;
     memcpy(c->world, c->m1c, sizeof c->world);
+    c->frames = 1;
     update(c, NULL, dt);
 }
 

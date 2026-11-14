@@ -3050,10 +3050,7 @@ static void show_loading(Shell *s, int shell)
     music(s, "");
     char name[64];
     snprintf(name, sizeof name, "Loading_%s.bdp", s->gs.city);
-    uint32_t size = 0;
-    uint8_t *data = shell ? NULL : vol_read(s->vol, name, &size);
-    l->have_b = data && bdp_load(&l->b, data, size) == 0;
-    if (!l->have_b) free(data);
+    l->have_b = !shell && bdp_open(&l->b, s->vol, name) == 0;
     l->b.scope = "Shell";
     if (l->have_b && s->gui.nb < MAX_BUNDLES)
         s->gui.bundles[s->gui.nb++] = &l->b;
@@ -5589,14 +5586,8 @@ static void idle_update(Shell *s, float dt)
 /* ---------------------------------------------------------------- the API */
 static int load_bundle(const Vol *vol, const char *name, Bundle *b)
 {
-    uint32_t size = 0;
-    uint8_t *data = vol_read(vol, name, &size);
-    if (!data)
+    if (bdp_open(b, vol, name) != 0)
         return 0;
-    if (bdp_load(b, data, size) != 0) {
-        free(data);
-        return 0;
-    }
     b->scope = "Shell";                                  /* texture packs: dumped under mods/dump/Shell (texpack.c) */
     return 1;
 }

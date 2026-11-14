@@ -9,6 +9,14 @@
 enum { TP_ASIS, TP_OPAQUE, TP_KEY };   /* what a replacement's alpha becomes: as in the PNG, 255, colour key (on/off at 128, colour black where off) */
 
 uint64_t tp_hash(char kind, const void *data, uint32_t bytes, int w, int h);   /* kind 'T' = a bundle texture (its decoded RGBA) */
+#ifdef RAMPAGE_XBOX
+/* the Xbox's replacement pictures (texpack_xbox.c: XBOXTEX.RXT beside RAMPAGE.VOL, by texture name): the Xbox button
+ * art in place of the PS2's. xtp_open: how many it holds (0 none, no file); xtp_find: its index, -1 none;
+ * xtp_decode: as tex_decode (0 ok and a malloc'd RGBA, -1 unreadable, -2 no memory) */
+int xtp_open(const char *vol_path);
+int xtp_find(const char *name);
+int xtp_decode(int i, uint8_t **rgba, int *w, int *h);
+#endif
 int tp_active(void);                 /* a pack or --dumptex is there: only then is a texture hashed (mods/ is looked at once) */
 void tp_scope(const char *name);     /* the dump subfolder for what is uploaded next (the bundle's Bundle.scope, NULL = "Common") */
 const char *tp_scope_get(void);

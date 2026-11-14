@@ -16,9 +16,6 @@
 #include <string.h>
 #include "plat.h"
 #include "sound.h"
-#ifdef RAMPAGE_XBOX
-#include "xbox_mix_headroom.h"
-#endif
 
 #define PI 3.14159265f
 #define TWO_PI 6.2831853f
@@ -57,7 +54,12 @@ static inline double spu_step(int rate)
 #ifndef RAMPAGE_AUDIO_CACHE_BYTES
 #ifdef RAMPAGE_XBOX
 /* Retail 64 MiB: leave room for four characters and the city's GPU textures.
- * This changes only idle retention; all active voices remain pinned. */
+ * This changes only idle retention; all active voices remain pinned.
+ * Decoded whole the two banks are 30.2 MB of PCM (Rampage.samp 8,268,400 bytes and
+ * RShell.samp 371,200 of PS-ADPCM; 16 bytes give 28 samples of 16 bits, 3.5 times
+ * as much): not to be kept. sound_preload_all keeps the banks themselves in memory
+ * (8.6 MB; the Xbox original keeps its 7.5 MB bank so) and this cache then holds the
+ * PCM of the samples used lately, decoded from memory as they play, never read. */
 #define RAMPAGE_AUDIO_CACHE_BYTES (2u * 1024u * 1024u)
 #elif defined(RAMPAGE_LOW_MEMORY)
 #define RAMPAGE_AUDIO_CACHE_BYTES (4u * 1024u * 1024u)
@@ -66,11 +68,24 @@ static inline double spu_step(int rate)
 #endif
 #endif
 #define AUDIO_READ_BYTES 4096u
+/* What one read of a music stream fetches of each channel. On Xbox a whole block of it (0x6000 bytes in every .mic
+ * [R]); the two channels' blocks follow each other in the file, so one read of 48 KB then serves 0.9 s of music,
+ * where 4 KB chunks took two reads, each a seek on the main thread, every 149 ms. */
+#ifdef RAMPAGE_XBOX
+#define MUSIC_READ_BYTES 0x6000u
+#else
+#define MUSIC_READ_BYTES AUDIO_READ_BYTES
+#endif
 typedef struct {
     int16_t *pcm;
     int n, loop, rate, tried;
     size_t bytes;
     uint64_t used;
+#ifdef RAMPAGE_XBOX
+    const uint8_t *src;                  /* its PS-ADPCM frames in a bank kept in memory (sound_preload_all): pcm is
+                                          * then decoded as it is played; NULL = decoded whole when asked for */
+    int done, h1, h2;                    /* the samples of pcm decoded so far, the decoder's last two there */
+#endif
 } Sample;
 typedef struct {
     uint8_t *uber;
@@ -82,6 +97,11 @@ typedef struct {
     const char **names;                  /* one per PROJ entry */
     Sample *smp;
     int wii;                             /* the Wii's ("REBU"): its tables swapped at load, its samples DSP-ADPCM */
+#ifdef RAMPAGE_XBOX
+    uint8_t *samp;                       /* the whole .samp in memory (sound_preload_all); NULL = read at first use */
+    struct { int n, loop; } *info;       /* with it, per SDIR entry: what a decode finds, the length (< 0 = not a
+                                          * sample) and the loop start (-1 none) */
+#endif
 } Bank;
 
 /* ---- an instance of an event program (0x3C bytes at 0x4CFAB0 +0x4C) */
@@ -138,8 +158,7 @@ typedef struct {
 typedef struct {
     VolFile file;
     uint32_t head;
-    uint8_t data[2][AUDIO_READ_BYTES];
-    int cached_block, cached_frame, cached_frames;
+    int cached_block, cached_frame, cached_frames;   /* what music_data holds of it */
     int on, loop, ch, rate, inter, blocks;   /* on: +0x00 (the stream's handle) not -1 */
     int block, frame;                    /* the next ADPCM frame */
     int16_t pcm[2][28];
@@ -187,6 +206,9 @@ static struct {
         int auto_stop, seen;             /* +0x1C: start's second argument, +0x1D: a frame has gone by */
     } se[16];
 } S;
+/* a music slot's frames as read: one channel's after the other's (music_next_frame). Beside S: a slot is zeroed
+ * whole each time it is opened or stopped (music_off) */
+static uint8_t music_data[2][2 * MUSIC_READ_BYTES];
 
 /* ---- PS-ADPCM ([R] the SPU's format: 16-byte frames, shift | filter << 4, flags, 28 nibbles) */
 static const int FILT[5][2] = { { 0, 0 }, { 60, 0 }, { 115, -52 }, { 98, -55 }, { 122, -60 } };
@@ -312,6 +334,24 @@ static Sample *wii_sample(Bank *b, int idx, Sample *s)
     return s;
 }
 
+#ifdef RAMPAGE_XBOX
+/* A sample of a bank kept in memory is decoded as it is played, a block ahead of its voices (the mixer asks), into
+ * PCM with room for all of it: a sound's start reads nothing and decodes nothing, where the longest samples, tens of
+ * seconds, took milliseconds to decode whole. The same decoder over the same frames in the same order: the PCM is
+ * the whole decode's, sample for sample. */
+static void sample_decode_to(Sample *s, int upto)
+{
+    int done = s->done, h1 = s->h1, h2 = s->h2;
+    if (upto > s->n)
+        upto = s->n;
+    for (; done < upto; done += 28)      /* (n is whole frames) */
+        adpcm_frame(s->src + 16 * (done / 28), s->pcm + done, &h1, &h2);
+    s->done = done;
+    s->h1 = h1;
+    s->h2 = h2;
+}
+#endif
+
 static Sample *sample_get(Bank *b, int idx)
 {
     if (idx <= 0 || idx >= b->nsdir)
@@ -328,6 +368,19 @@ static Sample *sample_get(Bank *b, int idx)
     uint32_t off = rd32(e), size = rd32(e + 4), flags = rd32(e + 8);
     if (off == 0xFFFFFFFFu || off > b->samp_size || size > b->samp_size - off)
         return NULL;
+#ifdef RAMPAGE_XBOX
+    if (b->samp) {                       /* the bank is in memory: only the PCM's room is made now */
+        int n = b->info[idx].n;
+        if (n < 0 || sample_alloc(s, sizeof(int16_t) * (size_t)n) != 0)
+            return NULL;
+        s->src = b->samp + off;
+        s->rate = (int)rd32(e + 12);
+        s->n = n;
+        s->loop = b->info[idx].loop;
+        s->done = s->h1 = s->h2 = 0;
+        return s;
+    }
+#endif
     int frames = (int)(size / 16);
     if ((uint32_t)frames > INT32_MAX / 28 ||
         sample_alloc(s, sizeof(int16_t) * 28 * (size_t)frames) != 0)
@@ -460,15 +513,56 @@ static uint8_t *program(Bank *b, int event)  /* [R] the POOL offset table; a neg
     return off < 0 ? NULL : b->pool + off;
 }
 
-static uint8_t *find_event(const char *name, Bank **bank)  /* [R] 0x272F20: the PROJ entry by name */
+static uint8_t *find_event_scan(const char *name, Bank **bank, int *bk, int *ev)
 {
     for (int k = 0; k < S.nbanks; k++)
         for (int i = 0; i < S.bank[k].nproj; i++)
             if (_stricmp(S.bank[k].names[i], name) == 0) {
                 *bank = &S.bank[k];
+                *bk = k;
+                *ev = i;
                 return S.bank[k].proj + 0x10 + 12 * i;
             }
     return NULL;
+}
+
+/* [R] 0x272F20: the PROJ entry by name. The scan is over every event of every bank, at each sound's start and,
+ * for a 3D sound refused for being out of the nearest, again every frame: the answers are remembered by the
+ * name's hash. A hit is checked against the bank as it is now (the name at that place), a miss against the
+ * banks' shape (their count and sizes), so a bank loaded or dropped needs no call here. */
+static uint8_t *find_event(const char *name, Bank **bank)
+{
+    enum { MEMO = 512 };
+    static struct { uint32_t hash, shape; int16_t bank, event; uint8_t known; char name[35]; } memo[MEMO];
+    uint32_t hash = 2166136261u, shape = (uint32_t)S.nbanks, len = 0;
+    for (const unsigned char *c = (const unsigned char *)name; *c; c++, len++)
+        hash = (hash ^ (uint32_t)(*c >= 'A' && *c <= 'Z' ? *c + 32 : *c)) * 16777619u;
+    for (int k = 0; k < S.nbanks; k++)
+        shape = shape * 31u + (uint32_t)S.bank[k].nproj;
+    unsigned slot = hash & (MEMO - 1);
+    if (memo[slot].known && memo[slot].hash == hash) {
+        int k = memo[slot].bank, i = memo[slot].event;
+        if (k < 0) {
+            if (memo[slot].shape == shape && _stricmp(memo[slot].name, name) == 0)
+                return NULL;
+        } else if (k < S.nbanks && i < S.bank[k].nproj && _stricmp(S.bank[k].names[i], name) == 0) {
+            *bank = &S.bank[k];
+            return S.bank[k].proj + 0x10 + 12 * i;
+        }
+    }
+    int k = -1, i = -1;
+    uint8_t *p = find_event_scan(name, bank, &k, &i);
+    if (!p && len >= sizeof memo[0].name)
+        return NULL;                         /* (a miss is remembered with its name: too long, not at all) */
+    memcpy(memo[slot].name, name, len < sizeof memo[0].name ? len + 1 : 1);
+    if (len >= sizeof memo[0].name)
+        memo[slot].name[0] = 0;
+    memo[slot].known = 1;
+    memo[slot].hash = hash;
+    memo[slot].shape = shape;
+    memo[slot].bank = (int16_t)k;
+    memo[slot].event = (int16_t)i;
+    return p;
 }
 
 /* ---- the listener and the 3D voice ([R] 0x26E8F0) */
@@ -1030,21 +1124,30 @@ static int music_next_frame(Music *m)
         m->block = m->frame = 0;
         memset(m->hist, 0, sizeof m->hist);
     }
+    uint8_t *data = music_data[m - S.music];
     if (m->cached_block != m->block || m->frame < m->cached_frame ||
         m->frame - m->cached_frame >= m->cached_frames) {
         m->cached_block = m->block;
         m->cached_frame = m->frame;
         m->cached_frames = m->inter / 16 - m->frame;
-        if (m->cached_frames > (int)(AUDIO_READ_BYTES / 16)) m->cached_frames = AUDIO_READ_BYTES / 16;
-        for (int c = 0; c < m->ch; c++) {
-            uint64_t offset = m->head + ((uint64_t)m->block * m->ch + c) * m->inter + 16u * m->frame;
-            if (offset > UINT32_MAX || vol_read_range(S.vol, &m->file, (uint32_t)offset,
-                    m->data[c], (size_t)m->cached_frames * 16) != 0)
+        if (m->cached_frames > (int)(MUSIC_READ_BYTES / 16)) m->cached_frames = MUSIC_READ_BYTES / 16;
+        /* each channel's frames from here, one channel after the other in data. Where they lie so in the file too
+         * (the whole of a block: the left's interleave, then the right's) one read fetches both */
+        size_t bytes = (size_t)m->cached_frames * 16;
+        if (m->ch == 2 && bytes == (size_t)m->inter) {
+            uint64_t offset = m->head + (uint64_t)m->block * m->ch * m->inter;
+            if (offset > UINT32_MAX || vol_read_range(S.vol, &m->file, (uint32_t)offset, data, 2 * bytes) != 0)
                 return 0;
-        }
+        } else
+            for (int c = 0; c < m->ch; c++) {
+                uint64_t offset = m->head + ((uint64_t)m->block * m->ch + c) * m->inter + 16u * m->frame;
+                if (offset > UINT32_MAX || vol_read_range(S.vol, &m->file, (uint32_t)offset,
+                        data + c * bytes, bytes) != 0)
+                    return 0;
+            }
     }
     for (int c = 0; c < m->ch; c++) {
-        const uint8_t *f = m->data[c] + 16 * (m->frame - m->cached_frame);
+        const uint8_t *f = data + ((size_t)c * m->cached_frames + (m->frame - m->cached_frame)) * 16;
         adpcm_frame(f, m->pcm[c], &m->hist[c][0], &m->hist[c][1]);
     }
     if (++m->frame == m->inter / 16) {
@@ -1212,17 +1315,11 @@ void music_for_state(int state, const char *block_music)
 /* ---- the mixer: the voices' volume registers as the SPU2 takes them (spu_amp) and the master volume at full: the
  * boot logos' sound start (0x1AF608) sets MVOL to 0x3FFF on both cores and nothing sets it again [R]. [G: the
  * SPU2 interpolates a voice with its 4-point gaussian table, a hardware matter, not in the ELF: linear here] */
+#ifndef RAMPAGE_XBOX
 static float mixbuf[2 * 1024];
-
-#ifdef RAMPAGE_XBOX
-static int32_t xmix_acc[2 * 1024];       /* the voices' sum, 8 fraction bits (mix_block) */
-#endif
 
 static void mix_block(float *out, int frames)
 {
-#ifdef RAMPAGE_XBOX
-    int xmix_used = 0;
-#endif
     memset(out, 0, sizeof(float) * 2 * frames);
     for (int i = 0; i < MAX_INST; i++) {
         Voice *vc = &S.voice[i];
@@ -1230,59 +1327,6 @@ static void mix_block(float *out, int frames)
             continue;
         const Sample *s = vc->s;
         float g = S.sfx_gain * S.inst[i].gain, al = spu_amp(vc->l) * g, ar = spu_amp(vc->r) * g;
-#ifdef RAMPAGE_XBOX
-        /* The same resampler in whole numbers: the position in 32.32 fixed point, the two volumes in 4.12, the sum
-         * of the voices in a 32-bit buffer (acc, 8 fraction bits) that is made floats once for all of them. With the
-         * double position and float samples every sample of every voice went through the x87 several times, and the
-         * mixer was a sixteenth of a frame with a city's voices playing. A voice at volume 0 on both sides is only
-         * moved along. */
-        if (vc->pos >= 0 && vc->step >= 0 && vc->pos < 2147483647.0 && vc->step < 65536.0 && s->n > 0) {
-            uint64_t pos = (uint64_t)(vc->pos * 4294967296.0), step = (uint64_t)(vc->step * 4294967296.0);
-            const int n = s->n, loop = s->loop;
-            const int16_t *pcm = s->pcm;
-            float fl = al * 4096.0f, fr = ar * 4096.0f;
-            int gl = (int)(fl > 16384 ? 16384 : fl < -16384 ? -16384 : fl);
-            int gr = (int)(fr > 16384 ? 16384 : fr < -16384 ? -16384 : fr);
-            if (!gl && !gr) {                        /* unheard: where it would be after the block */
-                pos += step * (uint64_t)frames;
-                if ((int)(pos >> 32) >= n) {
-                    if (loop < 0 || loop >= n)
-                        vc->on = 0;
-                    else {
-                        uint64_t span = (uint64_t)(n - loop) << 32, base = (uint64_t)loop << 32;
-                        pos = base + (pos - base) % span;
-                    }
-                }
-                vc->pos = (double)pos * (1.0 / 4294967296.0);
-                continue;
-            }
-            if (!xmix_used) {
-                memset(xmix_acc, 0, sizeof(int32_t) * 2 * (size_t)frames);
-                xmix_used = 1;
-            }
-            int32_t *acc = xmix_acc;
-            for (int f = 0; f < frames; f++) {
-                int k = (int)(pos >> 32);
-                if (k >= n) {
-                    if (loop < 0 || loop >= n) {
-                        vc->on = 0;
-                        break;
-                    }
-                    pos -= (uint64_t)(n - loop) << 32;
-                    k = (int)(pos >> 32);
-                    if (k >= n)                      /* (a step longer than the loop) */
-                        k = n - 1;
-                }
-                int k1 = k + 1 < n ? k + 1 : loop >= 0 ? loop : k;
-                int a0 = pcm[k], x = a0 + (((pcm[k1] - a0) * (int)(((uint32_t)pos) >> 17)) >> 15);
-                acc[2 * f] += (x * gl) >> 4;
-                acc[2 * f + 1] += (x * gr) >> 4;
-                pos += step;
-            }
-            vc->pos = (double)pos * (1.0 / 4294967296.0);
-            continue;
-        }
-#endif
         for (int f = 0; f < frames; f++) {
             int k = (int)vc->pos;
             if (k >= s->n) {
@@ -1300,38 +1344,12 @@ static void mix_block(float *out, int frames)
             vc->pos += vc->step;
         }
     }
-#ifdef RAMPAGE_XBOX
-    if (xmix_used)                                   /* the voices, summed in whole numbers above */
-        for (int i = 0; i < 2 * frames; i++)
-            out[i] = (float)xmix_acc[i] * (1.0f / 256.0f);
-#endif
     for (int i = 0; i < 2; i++) {
         Music *m = &S.music[i];
         if (!m->on)
             continue;
         float a = spu_amp(pack_vol(m->vol)) * S.music_gain;   /* [R] 0x26FE00: byte << 7 on its two voices */
         double step = (double)m->rate / SOUND_RATE;   /* 1: the streams are at 48 kHz [R] */
-#ifdef RAMPAGE_XBOX
-        if (m->rate == SOUND_RATE && m->phase == 0) {    /* (one sample out for one in: no phase to keep) */
-            const int16_t *l = m->pcm[0], *rr = m->pcm[m->ch - 1];
-            int f = 0, ended = 0;
-            while (f < frames && !ended) {
-                if (m->at >= m->have && !music_next_frame(m)) {
-                    music_off(m);
-                    ended = 1;
-                    break;
-                }
-                int run = m->have - m->at;
-                if (run > frames - f) run = frames - f;
-                for (int q = 0; q < run; q++, f++) {
-                    out[2 * f] += (float)l[m->at + q] * a;
-                    out[2 * f + 1] += (float)rr[m->at + q] * a;
-                }
-                m->at += run;
-            }
-            continue;
-        }
-#endif
         for (int f = 0; f < frames; f++) {
             if (m->at >= m->have && !music_next_frame(m)) {
                 music_off(m);
@@ -1346,13 +1364,244 @@ static void mix_block(float *out, int frames)
     if (S.pull) {                        /* a movie's sound */
         static int16_t st[2 * 1024];
         S.pull(S.pull_ctx, st, frames);
-#ifdef RAMPAGE_XBOX
-        S.stream_frames += frames;
-#endif
         for (int i = 0; i < 2 * frames; i++)
             out[i] += st[i];                         /* full scale (0x1AF5C0: MVOL 0x3FFF, BVOL 0x7FFF) [R] */
     }
 }
+#else
+/* The Xbox's mixer: the same voices, music and film sound, in whole numbers from the samples to the 16-bit output.
+ * With a double position and float samples every sample of every voice went through the x87 several times, and the
+ * float sum, limiter and float-to-int of every output sample again: the mixer was a sixteenth of a frame with a
+ * city's voices playing.
+ *
+ * The effect voices are summed at half the output rate, into a bus at 24 kHz stepped up to 48 kHz after: half the
+ * passes of the per-voice loop. Their samples are 7.5 to 22.05 kHz [R], nothing in them above 11 kHz, so the bus
+ * keeps their whole band. What it costs: the step up draws a straight line between two bus samples, which takes
+ * 1.4 dB off at 6 kHz, 2.5 dB at 8 kHz and 4 dB at 10 kHz; and what linear interpolation leaves above a 22.05 kHz
+ * sample's band (a tone f comes again at 22.05 kHz - f, 32 dB under it for 3 kHz, 13 dB for 7 kHz) folds back under
+ * 12 kHz, 2 kHz over the tone, where at 48 kHz it lay above 12 kHz. A voice's place and step stay in source samples
+ * as before and only the step is doubled, so pitch, loops and ends are the same (an end is seen at most a bus sample,
+ * 42 us, later); volumes and pans are per block as before. The music, a film's sound and the output stay at 48 kHz.
+ * RAMPAGE_XBOX_SFX_HALF_RATE=0 sums the effects at 48 kHz again, to compare by ear. */
+#ifndef RAMPAGE_XBOX_SFX_HALF_RATE
+#define RAMPAGE_XBOX_SFX_HALF_RATE 1
+#endif
+static int32_t xmix_out[2 * 1024];       /* a block at 48 kHz: left, right with 8 fraction bits */
+#if RAMPAGE_XBOX_SFX_HALF_RATE
+static int32_t xmix_bus[2 * 512];        /* the effects' bus for it, the same units */
+static int32_t xmix_last[2];             /* the bus sample before the block's first */
+static int xmix_odd;                     /* 1: that sample's own output frame is still to come (an odd block before) */
+#endif
+
+/* The effect voices over m samples of the bus (acc, zeroed here once a voice is heard); 1 = one was. The position in
+ * 32.32 fixed point, the two volumes in 4.12, the sum with 8 fraction bits. A voice at volume 0 on both sides is only
+ * moved along. */
+static int xmix_voices(int32_t *acc, int m)
+{
+    int used = 0;
+    for (int i = 0; i < MAX_INST; i++) {
+        Voice *vc = &S.voice[i];
+        if (!vc->on || S.inst[i].paused)
+            continue;
+        Sample *s = vc->s;
+        const int n = s->n, loop = s->loop;
+        if (!(vc->pos >= 0 && vc->step >= 0 && vc->pos < 2147483647.0 && vc->step < 65536.0) || n <= 0) {
+            vc->on = 0;                  /* (never: a place counts up from 0, spu_step gives 0 .. 21.8) */
+            continue;
+        }
+        uint64_t pos = (uint64_t)(vc->pos * 4294967296.0);
+        uint64_t step = (uint64_t)(vc->step * 4294967296.0) << RAMPAGE_XBOX_SFX_HALF_RATE;
+        float g = S.sfx_gain * S.inst[i].gain, fl = spu_amp(vc->l) * g * 4096.0f, fr = spu_amp(vc->r) * g * 4096.0f;
+        int gl = (int)(fl > 16384 ? 16384 : fl < -16384 ? -16384 : fl);
+        int gr = (int)(fr > 16384 ? 16384 : fr < -16384 ? -16384 : fr);
+        if (s->src && s->done < n) {     /* a sample of a bank in memory: decoded as far as this block reads it (an
+                                          * unheard voice's too, so that none is owed when it is heard) */
+            uint64_t reach = ((pos + step * (uint64_t)m) >> 32) + 2;
+            sample_decode_to(s, reach < (uint64_t)n ? (int)reach : n);
+        }
+        if (!gl && !gr) {                /* unheard: where it would be after the block */
+            pos += step * (uint64_t)m;
+            if ((int)(pos >> 32) >= n) {
+                if (loop < 0 || loop >= n)
+                    vc->on = 0;
+                else {
+                    uint64_t span = (uint64_t)(n - loop) << 32, base = (uint64_t)loop << 32;
+                    pos = base + (pos - base) % span;
+                }
+            }
+            vc->pos = (double)pos * (1.0 / 4294967296.0);
+            continue;
+        }
+        if (!used) {
+            memset(acc, 0, sizeof(int32_t) * 2 * (size_t)m);
+            used = 1;
+        }
+        const int16_t *pcm = s->pcm;
+        if (n >= 2 && pos + step * (uint64_t)(m - 1) < ((uint64_t)(n - 1) << 32)) {
+            /* the whole block lies before the sample's last: no end and no loop to look for at each step */
+            for (int f = 0; f < m; f++) {
+                int k = (int)(pos >> 32);
+                int a0 = pcm[k], x = a0 + (((pcm[k + 1] - a0) * (int)(((uint32_t)pos) >> 17)) >> 15);
+                acc[2 * f] += (x * gl) >> 4;
+                acc[2 * f + 1] += (x * gr) >> 4;
+                pos += step;
+            }
+        } else
+            for (int f = 0; f < m; f++) {
+                int k = (int)(pos >> 32);
+                if (k >= n) {
+                    if (loop < 0 || loop >= n) {
+                        vc->on = 0;
+                        break;
+                    }
+                    pos -= (uint64_t)(n - loop) << 32;
+                    k = (int)(pos >> 32);
+                    if (k >= n)                      /* (a step longer than the loop) */
+                        k = n - 1;
+                }
+                int k1 = k + 1 < n ? k + 1 : loop >= 0 ? loop : k;
+                int a0 = pcm[k], x = a0 + (((pcm[k1] - a0) * (int)(((uint32_t)pos) >> 17)) >> 15);
+                acc[2 * f] += (x * gl) >> 4;
+                acc[2 * f + 1] += (x * gr) >> 4;
+                pos += step;
+            }
+        vc->pos = (double)pos * (1.0 / 4294967296.0);
+    }
+    return used;
+}
+
+/* A block's sum to 16 bits. limit: the port's output protection (xbox_mix_headroom.h has the curve and the why: not
+ * the SPU2's doing), in whole numbers. Under the knee, -2.5 dBFS, a sample goes out as it is; above it the louder
+ * side's peak p becomes knee + span x (p - knee) / (span + p - knee) = ceiling - span^2 / (p - knee + span) and both
+ * sides take that gain. Two 32-bit divides, and only above the knee. Against the float curve: the peak is taken to
+ * the nearest whole sample and the gain to 16 bits, at most 2 steps of the 16-bit output apart for peaks up to twice
+ * full scale (half a step more for each doubling beyond). Without limit (a film's sound) only the clip. The division
+ * by 256 rounds to zero as the float-to-int did. */
+static void xmix_emit(int16_t *out, const int32_t *v, int frames, int limit)
+{
+    enum { KNEE = 24576, CEILING = 32766, SPAN = CEILING - KNEE };
+    for (int f = 0; f < frames; f++, v += 2, out += 2) {
+        int32_t l = v[0], r = v[1];
+        uint32_t al = l < 0 ? 0u - (uint32_t)l : (uint32_t)l, ar = r < 0 ? 0u - (uint32_t)r : (uint32_t)r;
+        uint32_t peak = al > ar ? al : ar;
+        if (peak <= (uint32_t)KNEE << 8) {
+            out[0] = (int16_t)(l / 256);
+            out[1] = (int16_t)(r / 256);
+            continue;
+        }
+        if (limit) {
+            uint32_t p = (peak + 128) >> 8;          /* >= KNEE */
+            uint32_t limited = ((uint32_t)CEILING << 4) - ((uint32_t)(SPAN * SPAN) << 4) / (p - (KNEE - SPAN));
+            uint32_t gain = ((limited << 12) + (p >> 1)) / p;   /* 0.16, at most 1 */
+            l = (int32_t)(((int64_t)l * gain) >> 16);
+            r = (int32_t)(((int64_t)r * gain) >> 16);
+        }
+        l /= 256;
+        r /= 256;
+        out[0] = (int16_t)(l > 32767 ? 32767 : l < -32768 ? -32768 : l);
+        out[1] = (int16_t)(r > 32767 ? 32767 : r < -32768 ? -32768 : r);
+    }
+}
+
+/* a block of at most 1024 frames; out NULL: nobody listens, the voices and streams only move on */
+static void xmix_block(int16_t *out, int frames)
+{
+    if (frames <= 0)
+        return;
+    int32_t *o = xmix_out;
+#if RAMPAGE_XBOX_SFX_HALF_RATE
+    /* A bus sample b gives two output frames: half way from the one before it, then itself. A block of an odd number
+     * of frames ends half way: the next begins with the sample's own frame, before any new one. */
+    int odd = xmix_odd, nb = (frames - odd + 1) / 2;
+    int used = nb ? xmix_voices(xmix_bus, nb) : 0;
+    if (!used && !(xmix_last[0] | xmix_last[1]))
+        memset(o, 0, sizeof(int32_t) * 2 * (size_t)frames);   /* silence before and now */
+    else {
+        if (!used)
+            memset(xmix_bus, 0, sizeof(int32_t) * 2 * (size_t)nb);
+        int32_t pl = xmix_last[0], pr = xmix_last[1], *w = o, *end = o + 2 * frames;
+        const int32_t *b = xmix_bus;
+        if (odd) {
+            w[0] = pl;
+            w[1] = pr;
+            w += 2;
+        }
+        for (int j = 0; j < nb; j++, b += 2) {
+            int32_t bl = b[0], br = b[1];
+            w[0] = (pl >> 1) + (bl >> 1);
+            w[1] = (pr >> 1) + (br >> 1);
+            w += 2;
+            if (w < end) {
+                w[0] = bl;
+                w[1] = br;
+                w += 2;
+            }
+            pl = bl;
+            pr = br;
+        }
+        xmix_last[0] = pl;
+        xmix_last[1] = pr;
+    }
+    xmix_odd = (frames - odd) & 1;
+#else
+    if (!xmix_voices(o, frames))
+        memset(o, 0, sizeof(int32_t) * 2 * (size_t)frames);
+#endif
+    for (int i = 0; i < 2; i++) {
+        Music *m = &S.music[i];
+        if (!m->on)
+            continue;
+        /* [R] 0x26FE00: byte << 7 on its two voices. In 4.12 as a voice's: the byte x 32, exact (the viewer's own
+         * gain, 1 in the game, to the nearest 4096th) */
+        float a = spu_amp(pack_vol(m->vol)) * S.music_gain * 4096.0f;
+        a += a < 0 ? -0.5f : 0.5f;
+        int ga = (int)(a > 32767 ? 32767 : a < -32767 ? -32767 : a);
+        if (m->rate == SOUND_RATE && m->phase == 0) {    /* (one sample out for one in: no phase to keep) [R] */
+            int f = 0;
+            while (f < frames) {
+                if (m->at >= m->have && !music_next_frame(m)) {
+                    music_off(m);
+                    break;
+                }
+                int run = m->have - m->at;
+                if (run > frames - f) run = frames - f;
+                if (ga) {
+                    const int16_t *l = m->pcm[0] + m->at, *rr = m->pcm[m->ch - 1] + m->at;
+                    for (int q = 0; q < run; q++) {
+                        o[2 * (f + q)] += (l[q] * ga) >> 4;
+                        o[2 * (f + q) + 1] += (rr[q] * ga) >> 4;
+                    }
+                }
+                f += run;
+                m->at += run;
+            }
+            continue;
+        }
+        double step = (double)m->rate / SOUND_RATE;
+        for (int f = 0; f < frames; f++) {
+            if (m->at >= m->have && !music_next_frame(m)) {
+                music_off(m);
+                break;
+            }
+            o[2 * f] += (m->pcm[0][m->at] * ga) >> 4;
+            o[2 * f + 1] += (m->pcm[m->ch - 1][m->at] * ga) >> 4;
+            for (m->phase += step; m->phase >= 1; m->phase -= 1)
+                m->at++;
+        }
+    }
+    if (S.pull) {                        /* a movie's sound */
+        static int16_t st[2 * 1024];
+        S.pull(S.pull_ctx, st, frames);
+        S.stream_frames += frames;
+        for (int i = 0; i < 2 * frames; i++)
+            o[i] += st[i] * 256;                     /* full scale (0x1AF5C0: MVOL 0x3FFF, BVOL 0x7FFF) [R] */
+    }
+    /* Port output protection, not an emulation of SPU2 DSP. Movie PCM is
+     * authored full scale and must not pass through the gameplay limiter. */
+    if (out)
+        xmix_emit(out, o, frames, !S.pull);
+}
+#endif
 
 #ifdef RAMPAGE_XBOX
 static void out_stream_reset(void);
@@ -1376,18 +1625,16 @@ int sound_mix(int16_t *out, int frames)
     int done = 0;
     while (done < frames) {
         int n = frames - done > 1024 ? 1024 : frames - done;
-        mix_block(mixbuf, n);
 #ifdef RAMPAGE_XBOX
-        /* Port output protection, not an emulation of SPU2 DSP. Movie PCM is
-         * authored full scale and must not pass through the gameplay limiter. */
-        if (!S.pull)
-            xbox_mix_headroom(mixbuf, n);
-#endif
+        xmix_block(out ? out + 2 * done : NULL, n);
+#else
+        mix_block(mixbuf, n);
         if (out)
             for (int i = 0; i < 2 * n; i++) {
                 float v = mixbuf[i];
                 out[2 * done + i] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
             }
+#endif
         done += n;
     }
     return frames;
@@ -1499,6 +1746,8 @@ static SDL_AudioDeviceID g_dev;
 static int16_t g_pcm[BUF_FRAMES * 2];
 #ifdef RAMPAGE_XBOX
 static int g_emulated_audio, g_stream_priming;
+static unsigned g_feed_left, g_feed_took[3];   /* out_feed: the bytes queued when it last returned; the blocks its last
+                                                * three calls found taken since the call before */
 extern unsigned rampage_audio_pending_frames(void);
 
 static void out_stream_reset(void)
@@ -1538,8 +1787,27 @@ static void out_feed(void)
     unsigned ahead = AHEAD;
 #ifdef RAMPAGE_XBOX
     if (g_emulated_audio) ahead = S.pull ? 24 : 8;
+    /* After one slow frame the queue is short by several blocks, and mixing them all in the next frame made that one
+     * slow as well. So on the console's own output, in the game: a call mixes at most two blocks, or one more than
+     * the calls have usually found taken (the middle of the last three counts: one long frame among short ones does
+     * not move it, a run of long frames does, and those are then given what they take), and the queue comes back to
+     * its length over the next calls. A queue found empty has run dry or is about to (only the hardware's own two
+     * buffers are left): it is filled whole as before. Films and the emulated codec's longer queues fill whole too. */
+    unsigned have = SDL_GetQueuedAudioSize(g_dev), limit = ~0u;
+    g_feed_took[2] = g_feed_took[1];
+    g_feed_took[1] = g_feed_took[0];
+    g_feed_took[0] = g_feed_left > have ? (g_feed_left - have + (unsigned)sizeof g_pcm - 1) / (unsigned)sizeof g_pcm : 0;
+    if (have && !g_emulated_audio && !S.pull && !g_stream_priming) {
+        unsigned a = g_feed_took[0], b = g_feed_took[1], c = g_feed_took[2];
+        unsigned lo = a < b ? a : b, hi = a < b ? b : a, usual = c < lo ? lo : c > hi ? hi : c;
+        limit = usual + 1 > 2 ? usual + 1 : 2;
+    }
 #endif
     while (SDL_GetQueuedAudioSize(g_dev) < ahead * sizeof g_pcm) {
+#ifdef RAMPAGE_XBOX
+        if (!limit--)
+            break;
+#endif
         int manual = S.manual_mix;
         sound_mix(g_pcm, BUF_FRAMES);
         S.manual_mix = manual;
@@ -1551,6 +1819,7 @@ static void out_feed(void)
         }
     }
 #ifdef RAMPAGE_XBOX
+    g_feed_left = SDL_GetQueuedAudioSize(g_dev);
     if (g_stream_priming) {
         g_stream_priming = 0;
         SDL_PauseAudioDevice(g_dev, 0);
@@ -1648,7 +1917,11 @@ void sound_update(float dt)
         S.pending -= (float)frames / SOUND_RATE;
         for (int done = 0; done < frames;) {
             int n = frames - done > 1024 ? 1024 : frames - done;
+#ifdef RAMPAGE_XBOX
+            xmix_block(NULL, n);
+#else
             mix_block(mixbuf, n);
+#endif
             done += n;
         }
     }
@@ -1706,12 +1979,70 @@ void sound_free(void)
         free(b->smp);
         free((void *)b->names);
         free(b->uber);
+#ifdef RAMPAGE_XBOX
+        free(b->samp);
+        free(b->info);
+#endif
         memset(b, 0, sizeof *b);
     }
     S.nbanks = 0;
     S.sample_bytes = S.sample_peak = 0;
     S.sample_clock = 0;
     S.ready = 0;
+}
+
+/* The banks' samples into memory, so that no sound's start reads the disc (sound.h). On Xbox: each PS2 bank's .samp
+ * whole and as it is (PS-ADPCM: decoded it would be 3.5 times the size, 30 MB for the two), with what a decode
+ * would find of each sample's length and loop; sample_get then takes a sample from there and the mixer decodes it as
+ * it plays (sample_decode_to). A bank that does not fit or does not read stays as it was, read at first use. The
+ * Wii's banks (another codec, only the events the PS2's lack) are left so too. */
+void sound_preload_all(void)
+{
+#ifdef RAMPAGE_XBOX
+    enum { STEP = 256 * 1024 };
+    if (!S.ready)
+        return;
+    for (int k = 0; k < S.nbanks; k++) {
+        Bank *b = &S.bank[k];
+        if (b->wii || b->samp || !b->samp_size || b->nsdir <= 0)
+            continue;
+        uint8_t *samp = malloc(b->samp_size);
+        void *info = malloc(sizeof *b->info * (size_t)b->nsdir);
+        int ok = samp && info;
+        for (uint32_t at = 0; ok && at < b->samp_size; at += STEP) {
+            uint32_t left = b->samp_size - at;
+            ok = vol_read_range(b->vol, &b->sample_file, at, samp + at, left > STEP ? STEP : left) == 0;
+            sound_pump();                /* (a music or a film playing meanwhile plays on) */
+        }
+        if (!ok) {
+            free(samp);
+            free(info);
+            continue;
+        }
+        b->info = info;
+        for (int idx = 0; idx < b->nsdir; idx++) {   /* as sample_get's decode walks the frames */
+            const uint8_t *e = b->sdir + 0x10 + 16 * idx;
+            uint32_t off = rd32(e), size = rd32(e + 4), flags = rd32(e + 8);
+            int frames = (int)(size / 16), n = 0, start = 0;
+            b->info[idx].n = b->info[idx].loop = -1;
+            if (idx == 0 || off == 0xFFFFFFFFu || off > b->samp_size || size > b->samp_size - off ||
+                (uint32_t)frames > INT32_MAX / 28)
+                continue;
+            for (int i = 0; i < frames; i++) {
+                const uint8_t *f = samp + off + 16u * (uint32_t)i;
+                if (f[1] & 4)            /* [R] loop start */
+                    start = n;
+                n += 28;
+                if (f[1] & 1)            /* [R] the end */
+                    break;
+            }
+            b->info[idx].n = n;
+            if (flags & 1)               /* [R] SDIR flags bit 0: a looping sample */
+                b->info[idx].loop = start;
+        }
+        b->samp = samp;                  /* from here sample_get takes this bank's samples from memory */
+    }
+#endif
 }
 
 int sound_play(const char *name, const float pos[3], float volume)
@@ -1870,6 +2201,10 @@ int sound_sample_pcm(int bank, int index, const int16_t **pcm, int *n, int *rate
     Sample *s = sample_get(&S.bank[bank], index);
     if (!s)
         return -1;
+#ifdef RAMPAGE_XBOX
+    if (s->src)                          /* one of a bank in memory: the caller is given all of it */
+        sample_decode_to(s, s->n);
+#endif
     *pcm = s->pcm;
     *n = s->n;
     *rate = s->rate;
