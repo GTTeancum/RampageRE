@@ -1,19 +1,19 @@
 {
   "schema": 1,
   "file": "default.xbe",
-  "sha256": "e7208769c1ebac39ba34e56fd89021ef8040fd982180651d0b347e436853e1a1",
-  "bytes": 3518464,
+  "sha256": "8c16df3e3777a750a9bf87d578c236bf72998a383447c399b1a69f3a3b934840",
+  "bytes": 3674112,
   "source_snapshot": "source-snapshot.json",
-  "source_snapshot_sha256": "5b9ec6b3988f602f8c8399e1e778cf91d35e38f934efcb99ac70bde1498c3bee",
-  "build_type": "ordinary non-fixture Xbox executable, exact validated build retained",
+  "source_snapshot_sha256": "946b4ba4d484ae689b361a7664fb1f5710ebc6ecc6f4e2b4935fee9fc37e4d77",
+  "build_type": "ordinary Xbox executable (no built-in test command line), built from the source snapshot with platform/xbox and its patches",
   "cpu": "original Xbox x86",
-  "game_source_units": 52,
   "game_objects_reused": 0,
   "original_game_assets_embedded": false,
   "nxdk_commit": "004fefbfe8fd93a5ea8ee9a95ff187b0f58ec8ed",
   "gles_commit": "5a726e61f1af5c3e9682af2c833c9703cab5022e",
   "gl4es_commit": "81547d986798e876de8b434193920b606a72363f",
-  "compiler": "LLVM 18.1.8",
+  "compiler": "clang 21.1.8 (nxdk toolchain)",
   "physical_xbox_tested": false,
-  "notes": "This artifact is packaged unchanged. Actions builds the Windows asset-preparation tool, not this prevalidated XBE. See platform/xbox for dependency patches and reproduction limits."
+  "notes": "This artifact is packaged unchanged. Actions builds the Windows asset-preparation tool, not this XBE: it was built on the maintainer's PC from the snapshot's source. Test builds of the same source ran on a stock 64 MB console on 2026-11-14 (docs/XBOX_PERF_PLAN.md); this exact file has not been booted on one. See platform/xbox for dependency patches and reproduction limits.",
+  "source_files": 285
 }

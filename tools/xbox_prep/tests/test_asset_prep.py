@@ -122,6 +122,13 @@ class EngineTests(unittest.TestCase):
         self.assertFalse((self.target/'data/old').exists())
         self.assertEqual((self.target/'save.dat').read_text(),'progress')
         self.assertEqual((self.target/'wii/keep').read_text(),'keep')
+    def test_confirmed_replace_keeps_own_button_pictures(self):
+        (self.target/'data').mkdir();(self.target/'data/old').write_text('old')
+        (self.target/'data/XBOXTEX.RXT').write_bytes(b'RXTP own pictures')
+        e.prepare(self.package,self.source,allow_replace=True)
+        self.assertFalse((self.target/'data/old').exists())
+        self.assertEqual((self.target/'data/XBOXTEX.RXT').read_bytes(),b'RXTP own pictures')
+        self.assertTrue((self.target/'data/RAMPAGE.VOL').is_file())
     def test_cancel_before_copy(self):
         cancel=threading.Event();cancel.set()
         with self.assertRaises(e.Cancelled):e.prepare(self.package,self.source,cancel=cancel)

@@ -23,6 +23,7 @@ CHUNK = 4 * 1024 * 1024
 VOL_COUNT = 352
 VOL_END = 1_342_827_563
 TARGET_NAME = 'Rampage Xbox'
+KEPT_DATA = 'data/xboxtex.rxt'
 WII_FOLDERS = ('Game', 'Shell', 'Audio')
 WII_MONSTERS = ('Boris', 'Ruby', 'Plucky', 'Fifi', 'Cyril', 'Squirmy', 'Flea', 'Sarah', 'Brian', 'Vern')
 WII_REQUIRED = ('Dallas.bdg', 'Dallas_Props.bdg', 'ShellData.bdg', 'Shell.bdg',
@@ -658,7 +659,8 @@ def _prepare(package, ps2, wii=None, *, allow_replace=False, cancel=None, progre
                     raise PrepError('Invalid Wii image file size.')
         else:
             wii_entries = wii_folder_plan(wii)
-    keep = [e for e in current.values() if e.name.split('/')[0].casefold() != 'data'
+    # (data/XBOXTEX.RXT is the user's own Xbox button pictures, made with tools/xbox_glyphs.py: no disc has it)
+    keep = [e for e in current.values() if (e.name.split('/')[0].casefold() != 'data' or e.name.casefold() == KEPT_DATA)
             and not (wii and e.name.split('/')[0].casefold() == 'wii')
             and e.name.casefold() != 'asset-manifest.json']
     total = sum(e.size for e in planned+keep) + (sum(e['size'] for e in probe['files']) if probe else

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import zipfile
 
@@ -31,6 +32,14 @@ def verify_runtime(root=ROOT):
     return runtime
 
 
+def version(root=ROOT):
+    """The release's version: the preparation tool's own (tools/xbox_prep/gui.py VERSION)."""
+    found = re.search(r"^VERSION = '(\d+\.\d+\.\d+)'$", (root / 'tools/xbox_prep/gui.py').read_text(encoding='utf-8'), re.M)
+    if not found:
+        raise ValueError('tools/xbox_prep/gui.py has no VERSION')
+    return found[1]
+
+
 def build(exe, output, root=ROOT):
     runtime = verify_runtime(root)
     exe = Path(exe).resolve()
@@ -40,7 +49,7 @@ def build(exe, output, root=ROOT):
     commit = os.environ.get('GITHUB_SHA') or subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip()
     repo = os.environ.get('GITHUB_REPOSITORY', 'GTTeancum/RampageRE')
     run = os.environ.get('GITHUB_RUN_ID')
-    info = dict(schema=1, source_commit=commit, source_url=f'https://github.com/{repo}/tree/{commit}',
+    info = dict(schema=1, version=version(root), source_commit=commit, source_url=f'https://github.com/{repo}/tree/{commit}',
                 workflow_run=f'https://github.com/{repo}/actions/runs/{run}' if run else None,
                 runtime=runtime, asset_tool_sha256=sha256(gui), original_game_assets_included=False)
     payload = {
@@ -65,7 +74,7 @@ def build(exe, output, root=ROOT):
     payload['SHA256SUMS.txt'] = ''.join(f'{sha256(data)}  {name}\n' for name, data in sorted(payload.items())).encode()
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
-    target = output / f'Rampage-Xbox-hardware-test-{commit[:12]}.zip'
+    target = output / f'RampageRE-Xbox-{version(root)}-{commit[:12]}.zip'
     with zipfile.ZipFile(target, 'x', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         for name, data in sorted(payload.items()):
             entry = zipfile.ZipInfo(name, (2026, 11, 7, 0, 0, 0))
@@ -90,8 +99,9 @@ if __name__ == '__main__':
     parser.add_argument('--verify-runtime', action='store_true')
     args = parser.parse_args()
     if args.verify_runtime:
-        verify_runtime()
-        print('Xbox binary and 282 source/test files match their frozen hashes')
+        runtime = verify_runtime()
+        count = len(json.loads((ROOT / 'packaging/xbox' / runtime['source_snapshot']).read_text()))
+        print(f'Xbox binary and {count} source/test files match their frozen hashes (version {version()})')
     else:
         if not args.exe:
             parser.error('--exe is required')

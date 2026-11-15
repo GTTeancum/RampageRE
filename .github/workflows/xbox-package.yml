@@ -1,4 +1,4 @@
-name: Xbox hardware-test package
+name: Xbox package
 on:
   workflow_dispatch:
   push:
@@ -46,7 +46,7 @@ jobs:
           if ($LASTEXITCODE) { throw 'Rust license collection failed' }
       - name: Build the single-file GUI
         working-directory: tools/xbox_prep
-        run: python -m PyInstaller --clean --noconfirm --onefile --windowed --name "Prepare Rampage Xbox" --icon ../../res/rampagere.ico --add-binary "disc_reader/target/release/rampage-disc-reader.exe;." gui.py
+        run: python -m PyInstaller --clean --noconfirm --onefile --windowed --name "Prepare Rampage Xbox" --icon ../../res/rampagere.ico --paths .. --hidden-import wii2ps2 --hidden-import sound --hidden-import bdp --hidden-import mesh --add-binary "disc_reader/target/release/rampage-disc-reader.exe;." gui.py
       - name: Exercise the frozen GUI
         shell: pwsh
         run: |
@@ -73,10 +73,10 @@ jobs:
           python -m pip freeze > dist/python-build-dependencies.txt
           cargo --version > dist/rust-build-version.txt
           Get-ChildItem dist -File | Where-Object Name -ne SHA256SUMS.txt | Sort-Object Name | ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } | Set-Content -Encoding ascii dist/SHA256SUMS.txt
-      - name: Upload the console hardware-test download
+      - name: Upload the console download
         uses: actions/upload-artifact@v4
         with:
-          name: Rampage-Xbox-hardware-test
+          name: RampageRE-Xbox
           path: dist/*
           if-no-files-found: error
           retention-days: 30

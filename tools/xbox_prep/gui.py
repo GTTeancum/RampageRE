@@ -12,7 +12,7 @@ from tkinter import filedialog, messagebox, ttk
 from asset_engine import (PrepError, Cancelled, TARGET_NAME, existing_asset_paths,
                           pending_recovery, prepare, recover_transaction)
 
-VERSION = '0.1.0'
+VERSION = '0.8.0'
 
 
 def package_root():
@@ -31,7 +31,7 @@ class App:
         self.wii = tk.StringVar()
         self.with_wii = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value='Choose your own PS2 disc image to begin.')
-        self.root.title('Rampage Xbox • Asset Preparation')
+        self.root.title('Rampage Xbox • Asset Preparation ' + VERSION)
         self.root.geometry('790x660')
         self.root.minsize(740, 620)
         style = ttk.Style()
@@ -57,7 +57,7 @@ class App:
         wbox.pack(fill='x', pady=(14,0))
         toggle = ttk.Checkbutton(wbox, text='Add Wii content from my WBFS/ISO or full extracted disc', variable=self.with_wii, command=self.toggle_wii)
         toggle.pack(anchor='w'); self.inputs.append(toggle)
-        ttk.Label(wbox, text='Adds the Wii monsters and Dallas. PS2 data is still required.\nExperimental: not yet tested with a full Wii disc. Split WBFS is not supported.').pack(anchor='w', pady=(4,0))
+        ttk.Label(wbox, text='Adds the Wii monsters and Dallas. PS2 data is still required.\nTakes about a minute longer: the Wii files are converted for the console. Split WBFS is not supported.').pack(anchor='w', pady=(4,0))
         row = ttk.Frame(wbox); row.pack(fill='x', pady=(8,0))
         field = ttk.Entry(row, textvariable=self.wii); field.pack(side='left', fill='x', expand=True)
         self.wii_inputs = [field]
@@ -232,6 +232,12 @@ def smoke_test(status_path):
                     raise RuntimeError('Bundled Wii reader did not return its controlled invalid-input error: '+str(exc)) from exc
             else:
                 raise RuntimeError('Bundled Wii reader unexpectedly accepted invalid input')
+            # The Wii converter (tools/wii2ps2.py and what it imports) must be inside a frozen build.
+            converter = engine.wii_converter()
+            for name in ('convert_bank', 'convert_models'):
+                if not callable(getattr(converter, name, None)):
+                    raise RuntimeError('The Wii converter is incomplete: '+name)
+            import bdp, mesh, sound
             source = Path(temp)/'disc'
             source.mkdir()
             names = struct.pack('<II',1,8)+b'fixture.bdp\0'
@@ -275,7 +281,7 @@ def smoke_test(status_path):
             root.update()
             root.destroy()
             root = None
-            status.update(ok=True, checks=['bundled Wii helper launches and rejects invalid input','GUI opens and closes','missing input rejected','double click guarded',
+            status.update(ok=True, checks=['bundled Wii helper launches and rejects invalid input','Wii converter present','GUI opens and closes','missing input rejected','double click guarded',
                 'background prepare completes','staged bytes match','success dialog reached','replacement requires confirmation'])
     except Exception as exc:
         status['error'] = str(exc)
