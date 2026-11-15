@@ -52,9 +52,8 @@ Measured on a stock console with four monsters on screen (test builds of
 this source, November 2026): 1280x720 runs at about 30 frames a second in
 the PS2's cities and in most of Dallas with the Wii's monsters; Dallas's
 two busiest blocks (Fountain Place, Downtown) drop to 26 or 27. 640x480
-runs faster. A 60 frames a second widescreen picture is not reached yet.
-The first time a sound, a damaged building part or a texture is needed in
-a level the picture can hold for about a tenth of a second.
+runs faster. The first time a sound, a damaged building part or a texture
+is needed in a level the picture can hold for about a tenth of a second.
 
 Xbox button pictures
 --------------------
