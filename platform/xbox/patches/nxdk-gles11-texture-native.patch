@@ -1,0 +1,120 @@
+--- a/gles_texture.c
++++ b/gles_texture.c
+@@ -840,6 +840,11 @@
+     return offset;
+ }
+ 
++/* Set by gliTexturePlaceholderNext for the next glTexImage2D without pixels (see there). */
++static GLboolean gli_texture_placeholder_next;
++void gliTexturePlaceholderNext(void) { gli_texture_placeholder_next = GL_TRUE; }
++
++
+ GL_API void GL_APIENTRY glTexImage2D(GLenum target,
+                                      GLint level,
+                                      GLint internalformat,
+@@ -1071,6 +1076,13 @@
+ 
+     // Allocate space for mipmaps immediately if GL_GENERATE_MIPMAP is enabled and it's swizzled
+     GLuint alloc_size = xgu_texture->pitch * xgu_texture->data_height;
++    /* gliTexturePlaceholderNext: this image's storage is about to be replaced whole (gliTextureNative,
++     * gliTexturePalette8), so only a page is allocated for it now. A 1024 x 1024 image would otherwise take
++     * 4 MB of contiguous memory, cleared, for the moment between the two calls. */
++    GLboolean placeholder = gli_texture_placeholder_next && pixels == NULL && xgu_texture->swizzled &&
++                            !texture_object->generate_mipmap;
++    gli_texture_placeholder_next = GL_FALSE;
++    if (placeholder) alloc_size = 4096;
+     if (xgu_texture->swizzled && texture_object->generate_mipmap) {
+         GLuint required_size;
+         uint8_t required_levels;
+@@ -1132,7 +1144,7 @@
+             GLI_FREE((void *)src_pixels);
+         }
+     } else {
+-        gli_memset(xgu_texture->data, 0, xgu_texture->pitch * xgu_texture->data_height);
++        gli_memset(xgu_texture->data, 0, placeholder ? alloc_size : xgu_texture->pitch * xgu_texture->data_height);
+     }
+ 
+     if (texture_object->texture_2d != NULL) {
+@@ -1742,11 +1754,82 @@
+     return GL_TRUE;
+ }
+ 
++/* The bound texture's storage replaced by an image that is already in one of the GPU's own formats, with its
++ * mip levels: no expansion to full colour on the way. The texture must be the one glTexImage2D has just made
++ * (level 0, full colour, a power of two each way: the frontend's size and the storage's).
++ *   kind 1: DXT1. data: each level's 4 x 4 blocks in rows (8 bytes a block; a level under 4 texels a side is
++ *           one block), the levels one after the other. Stored as it is.
++ *   kind 2: A1R5G5B5, kind 3: A4R4G4B4. data: each level's texels in rows, 16 bits little endian, the levels
++ *           one after the other. Each level is swizzled here.
++ * levels: 1 or more (each half the one before, down to 1 texel a side at the least); size: the bytes of data,
++ * which must be exactly what the levels come to. With more than one level the texture is sampled from the
++ * level that fits (GL_LINEAR_MIPMAP_NEAREST). GL_FALSE and nothing changed when the texture is not as expected
++ * or there is no memory. A DXT1 texture is not written to again (glTexSubImage2D and the mipmap generator
++ * refuse it: gliTextureUnpackPalette). */
++GLboolean gliTextureNative(GLsizei width, GLsizei height, GLint kind, const GLubyte *data, GLsizei size, GLsizei levels)
++{
++    gli_context_t *context = gliGetContext();
++    GLuint unit = context->texture_environment.server_active_texture - GL_TEXTURE0;
++    texture_object_t *object = context->texture_environment.texture_units[unit].bound_texture_object;
++    xgu_texture_t *texture = object ? (xgu_texture_t *)object->texture_2d : NULL;
++    if (!data || !texture || !texture->data || texture->palette_offset || !texture->swizzled ||
++        texture->mipmap_levels != 1 || object->generate_mipmap ||
++        texture->format != XGU_TEXTURE_FORMAT_A8R8G8B8_SWIZZLED || texture->bytes_per_pixel != 4 ||
++        width < 4 || height < 4 || texture->tex_width != width || texture->tex_height != height ||
++        texture->data_width != width || texture->data_height != height || width > 4096 || height > 4096 ||
++        kind < 1 || kind > 3 || levels < 1 || levels > 13 || size <= 0)
++        return GL_FALSE;
++    size_t expected = 0;
++    {
++        GLuint w = (GLuint)width, h = (GLuint)height;
++        for (GLsizei l = 0; l < levels; l++) {
++            if (l && w == 1 && h == 1) return GL_FALSE;          /* (more levels than the size has) */
++            if (l) { w = w > 1 ? w / 2 : 1; h = h > 1 ? h / 2 : 1; }
++            expected += kind == 1 ? (size_t)(w >= 4 ? w / 4 : 1) * (h >= 4 ? h / 4 : 1) * 8u : (size_t)w * h * 2u;
++        }
++    }
++    if (expected != (size_t)size) return GL_FALSE;
++    size_t bytes = (expected + 63u) & ~(size_t)63u;
++    GLubyte *store = MmAllocateContiguousMemoryEx(bytes, 0, 0x03FFAFFF, 0x1000, PAGE_READWRITE | PAGE_WRITECOMBINE);
++    if (!store) return GL_FALSE;
++    if (kind == 1)
++        gli_memcpy(store, data, expected);
++    else {
++        GLuint w = (GLuint)width, h = (GLuint)height;
++        size_t at = 0;
++        for (GLsizei l = 0; l < levels; l++) {
++            if (l) { w = w > 1 ? w / 2 : 1; h = h > 1 ? h / 2 : 1; }
++            swizzle_rect(data + at, w, h, store + at, w * 2u, 2);
++            at += (size_t)w * h * 2u;
++        }
++    }
++    __asm__ volatile("sfence" ::: "memory");
++    MmFreeContiguousMemory(texture->data);
++    texture->data = store;
++    texture->data_physical_address = (GLubyte *)MmGetPhysicalAddress(store);
++    texture->data_size = bytes;
++    texture->bytes_per_pixel = kind == 1 ? 1 : 2;            /* (DXT1: half a byte; nothing reads it for one) */
++    texture->pitch = texture->data_width * texture->bytes_per_pixel;
++    texture->format = (XguTexFormatColor)(kind == 1 ? NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT1_A1R5G5B5 :
++                                          kind == 2 ? NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A1R5G5B5 :
++                                                      NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A4R4G4B4);
++    texture->mipmap_levels = (uint8_t)levels;
++    if (levels > 1)
++        object->min_filter = GL_LINEAR_MIPMAP_NEAREST;        /* (the frontend above still believes GL_LINEAR) */
++    object->texture_object_dirty = GL_TRUE;
++    return GL_TRUE;
++}
++
+ /* Preserve ordinary GL semantics if a paletted image later becomes mutable,
+  * gains mipmaps, or is attached as a render target. Failure leaves it intact. */
+ GLboolean gliTextureUnpackPalette(texture_object_t *object)
+ {
+     xgu_texture_t *texture = object ? (xgu_texture_t *)object->texture_2d : NULL;
++    if (texture && texture->data &&
++        texture->format == (XguTexFormatColor)NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT1_A1R5G5B5) {
++        gliSetError(GL_INVALID_OPERATION);                    /* gliTextureNative's blocks: not written to again */
++        return GL_FALSE;
++    }
+     if (!texture || !texture->palette_offset) return GL_TRUE;
+     size_t count = (size_t)texture->data_width * texture->data_height;
+     GLubyte *data = MmAllocateContiguousMemoryEx(count * 4, 0, 0x03FFAFFF, 0x1000, PAGE_READWRITE | PAGE_WRITECOMBINE);

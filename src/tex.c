@@ -94,7 +94,19 @@ static void gx_tile(int fmt, const uint8_t *p, uint8_t *tile)
     }
 }
 
-static int gx_decode(const BdpEntry *e, uint8_t **rgba, int *w_out, int *h_out)
+/* a format's tile: its width and height in texels and its bytes; 0 for a format that is none of the Wii's */
+static int gx_tile_size(int fmt, int *tw, int *th)
+{
+    if (fmt != GX_I4 && fmt != GX_I8 && fmt != GX_IA8 && fmt != GX_RGB5A3 && fmt != GX_RGBA8 && fmt != GX_CMPR)
+        return 0;
+    *tw = fmt == GX_I4 || fmt == GX_I8 || fmt == GX_CMPR ? 8 : 4;
+    *th = fmt == GX_I4 || fmt == GX_CMPR ? 8 : 4;
+    int bits = fmt == GX_I4 || fmt == GX_CMPR ? 4 : fmt == GX_I8 ? 8 : fmt == GX_RGBA8 ? 32 : 16;
+    return *tw * *th * bits / 8;
+}
+
+/* p: the texture's pixels (the entry's data2, or as much of it as avail bytes read from the disc) */
+static int gx_decode(const BdpEntry *e, const uint8_t *p, size_t avail, uint8_t **rgba, int *w_out, int *h_out)
 {
     if (e->size < 0x10)
         return -1;
@@ -107,12 +119,11 @@ static int gx_decode(const BdpEntry *e, uint8_t **rgba, int *w_out, int *h_out)
     int tiles_x = (w + tw - 1) / tw, tiles_y = (h + th - 1) / th, tile_bytes = tw * th * bits / 8;
     size_t pixels = (size_t)w * h;
     if (pixels > SIZE_MAX / 4 ||
-        (size_t)tiles_x * tiles_y > e->size2 / (size_t)tile_bytes)
+        (size_t)tiles_x * tiles_y > avail / (size_t)tile_bytes)
         return TEX_DECODE_ERROR;
     uint8_t *out = malloc(pixels * 4), tile[8 * 8 * 4];
     if (!out)
         return TEX_DECODE_NOMEM;
-    const uint8_t *p = e->data2;
     for (int ty = 0; ty < tiles_y; ty++)
         for (int tx = 0; tx < tiles_x; tx++, p += tile_bytes) {
             gx_tile(fmt, p, tile);
@@ -201,10 +212,167 @@ int tex_indexed(const Bundle *b, const BdpEntry *e, uint8_t **index, uint8_t pal
 }
 #endif
 
+#ifdef RAMPAGE_XBOX
+/* A Wii texture in a format the Xbox's GPU reads, with the mip levels its file has: no expansion to full colour,
+ * which the console has no memory for (Dallas's 213 textures are 21 MB that way, and 4 as they are).
+ *   CMPR -> TEX_NATIVE_DXT1. A CMPR tile is four DXT1 blocks: the same two colours and sixteen 2-bit choices,
+ *           the colours big endian and a row's texels from the high bits down. The same picture, exactly.
+ *   RGB5A3 -> TEX_NATIVE_A1R5G5B5 when every texel is of the opaque kind (the same 15 bits: exact), else
+ *           TEX_NATIVE_A4R4G4B4 (an opaque texel loses each colour's lowest bit, a see-through one's three bits
+ *           of alpha become four).
+ *   I8 -> TEX_NATIVE_I8: the first level's bytes in rows (for an 8-bit texture with a grey palette).
+ * skip: that many of the largest levels left out, while levels are left and both sides stay at least 8.
+ * *data is malloc'd: the levels one after the other (DXT1: 8 bytes a block, rows of blocks; 16-bit: little
+ * endian texels in rows). TEX_DECODE_ERROR for any other texture: the caller decodes it as before. */
+int tex_gx_native(const Bundle *b, const BdpEntry *e, int skip, int *kind, uint8_t **data, uint32_t *size, int *w_out,
+                  int *h_out, int *levels_out)
+{
+    extern int xtp_find(const char *name);
+    if (!e || !b->wii || e->type != ET_TEXTURE || e->size < 0x10 || !e->size2 ||
+        (!e->data2 && (!e->at2 || !b->src)) || xtp_find(bdp_name(b, e->name)) >= 0)
+        return TEX_DECODE_ERROR;
+    int fmt = (int)rd32(e->data + 4), w = rd16(e->data + 8), h = rd16(e->data + 10), levels = rd16(e->data + 12);
+    int tw = 0, th = 0, tile_bytes = gx_tile_size(fmt, &tw, &th);
+    if ((fmt != GX_CMPR && fmt != GX_RGB5A3 && fmt != GX_I8) || w < 8 || h < 8 || w > 1024 || h > 1024 ||
+        (w & (w - 1)) || (h & (h - 1)) || !tile_bytes)
+        return TEX_DECODE_ERROR;
+    if (levels < 1)
+        levels = 1;
+    /* the levels the file holds: each half the one before, in whole tiles */
+    size_t at[16], bytes[16], have = 0;
+    int n = 0;
+    for (int l = 0; l < levels && l < 16; l++) {
+        int lw = w >> l > 0 ? w >> l : 1, lh = h >> l > 0 ? h >> l : 1;
+        size_t need = (size_t)((lw + tw - 1) / tw) * (size_t)((lh + th - 1) / th) * (size_t)tile_bytes;
+        if (need > e->size2 - have)
+            break;
+        at[n] = have;
+        bytes[n] = need;
+        have += need;
+        n++;
+        if (lw == 1 && lh == 1)
+            break;
+    }
+    if (!n)
+        return TEX_DECODE_ERROR;
+    int first = 0;
+    while (skip > 0 && first + 1 < n && (w >> (first + 1)) >= 8 && (h >> (first + 1)) >= 8) {
+        first++;
+        skip--;
+    }
+    if (fmt == GX_I8)
+        n = first + 1;                                   /* (the 8-bit path makes its own smaller levels) */
+    size_t src_bytes = at[n - 1] + bytes[n - 1] - at[first];
+    const uint8_t *src = e->data2 ? e->data2 + at[first] : NULL;
+    uint8_t *fetched = NULL;
+    if (!src) {
+        fetched = malloc(src_bytes);
+        if (!fetched)
+            return TEX_DECODE_NOMEM;
+        if (vol_read_range(b->src, &b->src_file, e->at2 + (uint32_t)at[first], fetched, src_bytes) != 0) {
+            free(fetched);
+            return TEX_DECODE_ERROR;
+        }
+        src = fetched;
+    }
+    int bw = w >> first, bh = h >> first, k = fmt == GX_CMPR ? TEX_NATIVE_DXT1 : fmt == GX_I8 ? TEX_NATIVE_I8 :
+                                                               TEX_NATIVE_A1R5G5B5;
+    size_t out_bytes = 0;
+    for (int l = first; l < n; l++) {
+        int lw = w >> l > 0 ? w >> l : 1, lh = h >> l > 0 ? h >> l : 1;
+        out_bytes += fmt == GX_CMPR ? (size_t)(lw >= 4 ? lw / 4 : 1) * (size_t)(lh >= 4 ? lh / 4 : 1) * 8u :
+                     fmt == GX_I8 ? (size_t)lw * lh : (size_t)lw * lh * 2u;
+    }
+    if (fmt == GX_RGB5A3)                                /* any texel of the see-through kind: four bits each */
+        for (size_t i = 0; i + 1 < src_bytes; i += 2)
+            if (!(src[i] & 0x80)) {
+                k = TEX_NATIVE_A4R4G4B4;
+                break;
+            }
+    uint8_t *out = malloc(out_bytes ? out_bytes : 1), *o = out;
+    if (!out) {
+        free(fetched);
+        return TEX_DECODE_NOMEM;
+    }
+    for (int l = first; l < n; l++) {
+        int lw = w >> l > 0 ? w >> l : 1, lh = h >> l > 0 ? h >> l : 1;
+        int tiles_x = (lw + tw - 1) / tw, tiles_y = (lh + th - 1) / th;
+        const uint8_t *p = src + (at[l] - at[first]);
+        if (fmt == GX_CMPR) {
+            int blocks_x = lw >= 4 ? lw / 4 : 1, blocks_y = lh >= 4 ? lh / 4 : 1;
+            for (int ty = 0; ty < tiles_y; ty++)
+                for (int tx = 0; tx < tiles_x; tx++, p += 32)
+                    for (int s = 0; s < 4; s++) {
+                        int bx = 2 * tx + (s & 1), by = 2 * ty + (s >> 1);
+                        if (bx >= blocks_x || by >= blocks_y)
+                            continue;
+                        const uint8_t *q = p + 8 * s;
+                        uint8_t *d = o + 8 * ((size_t)by * blocks_x + bx);
+                        d[0] = q[1]; d[1] = q[0]; d[2] = q[3]; d[3] = q[2];
+                        for (int r = 0; r < 4; r++) {
+                            uint8_t v = q[4 + r];
+                            d[4 + r] = (uint8_t)((v & 0x03) << 6 | (v & 0x0C) << 2 | (v & 0x30) >> 2 | (v & 0xC0) >> 6);
+                        }
+                    }
+            o += (size_t)blocks_x * blocks_y * 8u;
+        } else if (fmt == GX_I8) {
+            for (int ty = 0; ty < tiles_y; ty++)
+                for (int tx = 0; tx < tiles_x; tx++, p += 32)
+                    for (int y = 0; y < 4 && ty * 4 + y < lh; y++)
+                        for (int x = 0; x < 8 && tx * 8 + x < lw; x++)
+                            o[(size_t)(ty * 4 + y) * lw + tx * 8 + x] = p[y * 8 + x];
+            o += (size_t)lw * lh;
+        } else {
+            for (int ty = 0; ty < tiles_y; ty++)
+                for (int tx = 0; tx < tiles_x; tx++, p += 32)
+                    for (int y = 0; y < 4 && ty * 4 + y < lh; y++)
+                        for (int x = 0; x < 4 && tx * 4 + x < lw; x++) {
+                            uint16_t c = rd16be(p + 2 * (y * 4 + x)), v;
+                            if (k == TEX_NATIVE_A1R5G5B5)
+                                v = c;
+                            else if (c & 0x8000)
+                                v = (uint16_t)(0xF000 | ((c >> 11) & 15) << 8 | ((c >> 6) & 15) << 4 | ((c >> 1) & 15));
+                            else
+                                v = (uint16_t)(((((c >> 12) & 7) * 15 + 3) / 7) << 12 | (c & 0x0FFF));
+                            uint8_t *d = o + 2 * ((size_t)(ty * 4 + y) * lw + tx * 4 + x);
+                            d[0] = (uint8_t)v;
+                            d[1] = (uint8_t)(v >> 8);
+                        }
+            o += (size_t)lw * lh * 2u;
+        }
+    }
+    free(fetched);
+    *kind = k;
+    *data = out;
+    *size = (uint32_t)out_bytes;
+    *w_out = bw;
+    *h_out = bh;
+    *levels_out = n - first;
+    return TEX_DECODE_OK;
+}
+#endif
+
 int tex_decode(const Bundle *b, const BdpEntry *e, uint8_t **rgba, int *w_out, int *h_out)
 {
     if (e && b->wii && e->type == ET_TEXTURE && e->data2)
-        return gx_decode(e, rgba, w_out, h_out);
+        return gx_decode(e, e->data2, e->size2, rgba, w_out, h_out);
+    if (e && b->wii && e->type == ET_TEXTURE && e->at2 && e->size2 && b->src && e->size >= 0x10) {
+        /* a lean bundle's (bdp_open): its pixels are on the disc; the first level's are all that is decoded */
+        int tw = 0, th = 0, tile_bytes = gx_tile_size((int)rd32(e->data + 4), &tw, &th);
+        int w = rd16(e->data + 8), h = rd16(e->data + 10);
+        if (!tile_bytes || w <= 0 || h <= 0)
+            return TEX_DECODE_ERROR;
+        size_t need = (size_t)((w + tw - 1) / tw) * (size_t)((h + th - 1) / th) * (size_t)tile_bytes;
+        if (need > e->size2)
+            return TEX_DECODE_ERROR;
+        uint8_t *px = malloc(need);
+        if (!px)
+            return TEX_DECODE_NOMEM;
+        int result = vol_read_range(b->src, &b->src_file, e->at2, px, need) == 0
+                         ? gx_decode(e, px, need, rgba, w_out, h_out) : TEX_DECODE_ERROR;
+        free(px);
+        return result;
+    }
     if (!e || e->type != ET_TEXTURE || e->size < 0x24)
         return -1;
 #ifdef RAMPAGE_XBOX

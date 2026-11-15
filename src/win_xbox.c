@@ -32,6 +32,7 @@ void pb_depth_on_boot_screen(int on);
 /* the patched nxdk-gles11's (nxdk-gles11-pushbuffer-frames.patch) */
 void gliPushbufferSize(uint32_t bytes);
 void gliStaticKeepFree(uint32_t bytes);   /* (nxdk-gles11-static-fit.patch) */
+int g_xbox_keep_free_kb;                  /* --xkeepfree KB: the store's reserve of free memory (0: by the picture) */
 
 static int context_live;
 int g_xbox_video;                        /* 0: by the dashboard's settings. A test build's --xvideo: 480 (4:3), 481
@@ -165,9 +166,14 @@ int win_open(Window *w, const char *title, int width, int height, int hidden)
         gliPushbufferSize(display_height == 720 ? 1024u * 1024u : 2u * 1024u * 1024u);
     /* The GPU's store of static meshes stops growing when 8 MiB of RAM are left for what is loaded later. At
      * 1280 x 720 the frame buffers have taken 6 MiB more than at 640 x 480, and what is loaded later is the same:
-     * the reserve there is 3.5 MiB, so the store has room for the level's meshes. */
-    if (display_height == 720)
-        gliStaticKeepFree(3u * 1024u * 1024u + 512u * 1024u);
+     * the reserve there is 2.25 MiB, so the store has room for the level's meshes. (3.5 until the Wii's Dallas:
+     * its busiest blocks then drew a quarter of their triangles the slow way, their arrays refused, at 20 frames
+     * a second; a console went through five block loads and a city's with 2 MiB and no failure. A texture's
+     * upload no longer needs room of its own: gliTexturePlaceholderNext.) */
+    if (g_xbox_keep_free_kb > 0)
+        gliStaticKeepFree((uint32_t)g_xbox_keep_free_kb * 1024u);
+    else if (display_height == 720)
+        gliStaticKeepFree(2u * 1024u * 1024u + 256u * 1024u);
     if (SDL_InitSubSystem(SDL_INIT_TIMER | SDL_INIT_EVENTS) != 0) {
         fprintf(stderr, "Xbox: SDL event/timer initialization failed: %s\n", SDL_GetError());
         return -1;

@@ -45,6 +45,18 @@ pass identity checking but are not independently verified. Wii Video and Wii
 Rampage.elf are not used or copied. Split WBFS (.wbfs plus .wbf1) is rejected with
 an explicit message; use a single image or a full extracted folder.
 
+Wii preparation does three things beyond copying (`asset_engine.py` `wii_prework`). The rigid models of the Wii's
+bundles (Dallas, the effects' shapes, the shell's) are rewritten in the PS2's mesh format (`tools/wii2ps2.py`
+models), each one read back and compared triangle for triangle before it is accepted; the monsters' skins are
+left as they are (the PS2's format holds two bones a vertex, theirs up to four). The Wii's sound bank is
+converted to the PS2's format (`tools/wii2ps2.py`: the events the PS2 bank has not got, their samples decoded from
+DSP-ADPCM and encoded as PS-ADPCM), because a console has no time to convert formats while it plays; this takes
+about a minute. And the Wii files the game never reads are left out (the Wii's copies of the seven PS2 cities and
+the thirty shared monsters, the scripts, the .zip twins): about 65 MB are installed, not 315. A frozen build must
+carry `tools/wii2ps2.py`, `tools/sound.py`, `tools/bdp.py` and `tools/mesh.py` (PyInstaller: `--paths ..` and
+`--hidden-import wii2ps2 --hidden-import sound --hidden-import bdp --hidden-import mesh`); they need the standard
+library alone.
+
 A small Rust helper uses the maintained MIT/Apache-2.0 nod 1.4.4 library for Wii
 partition reading/decryption. There is no key prompt, downloaded firmware,
 external program installation, or private-key file in this package. The helper

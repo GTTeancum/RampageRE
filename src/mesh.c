@@ -268,7 +268,9 @@ int mesh_read(const BdpEntry *e, Mesh *m)
 static int mesh_read_in(const BdpEntry *e, Mesh *m)
 {
     memset(m, 0, sizeof *m);
-    if (e->wii)
+    /* A Wii bundle's mesh is a GX display list, but a rigid one of a bundle the preparation tool has converted
+     * (tools/wii2ps2.py models; Bundle.ps2_mesh) is the PS2's, strips and all, and is read as one below. */
+    if (e->wii && !(e->type == ET_MESH && e->owner && ((const Bundle *)e->owner)->ps2_mesh))
         return wii_mesh_read(e, m);
     const uint8_t *d = e->data;
     uint32_t count, first, stride, mat_at, desc_at;

@@ -1,0 +1,67 @@
+--- a/gles_xbox_direct.c
++++ b/gles_xbox_direct.c
+@@ -116,6 +116,35 @@
+     return pb;
+ }
+ 
++/* gliDirectSphereMap(GL_TRUE, ks, kt): from here on gliDirectDraw takes unit 0's texture coordinates from the
++ * GPU's own sphere mapping (GL_SPHERE_MAP: made from each vertex's place and normal in eye space) and scales them
++ * about the middle, s' = 0.5 + ks (s - 0.5), t' = 0.5 + kt (t - 0.5); the arrays' own coordinates are not read.
++ * gliDirectSphereMap(GL_FALSE, 0, 0): the vertices' own again. GLES 1.1 has no texture coordinate generation, so
++ * a GL above this library makes such coordinates itself, for every vertex of every frame, and sends them as a
++ * client array: a mirror-glass tower's 6,000 triangles took 10 ms of a console's frame that way. The NV2A's
++ * fixed-function pipeline has it (NV097_SET_TEXGEN_S). The normals need the inverse modelview matrix, which
++ * gliTransformFlush sends while this is set, lit or not. */
++GLboolean gli_direct_sphere_map;
++static GLfloat direct_sphere_scale[2];
++
++void gliDirectSphereMap(GLboolean on, GLfloat ks, GLfloat kt)
++{
++    gli_context_t *c = gliGetContext();
++    if (!on && !gli_direct_sphere_map)
++        return;
++    gli_direct_sphere_map = on;
++    direct_sphere_scale[0] = ks;
++    direct_sphere_scale[1] = kt;
++    c->transformation_state.modelview_matrix_dirty = GL_TRUE;       /* (its inverse sent with it, or no longer) */
++    if (!on) {
++        uint32_t *pb = pb_begin();
++        pb = pb_push4(pb, NV097_SET_TEXGEN_S, NV097_SET_TEXGEN_S_DISABLE, NV097_SET_TEXGEN_S_DISABLE,
++                      NV097_SET_TEXGEN_S_DISABLE, NV097_SET_TEXGEN_S_DISABLE);
++        pb_end(pb);
++        c->transformation_state.texture_matrix_dirty[0] = GL_TRUE;  /* (unit 0's own matrix at the next draw) */
++    }
++}
++
+ /* Triangles from arrays that are in GPU memory (addresses as gliStaticArrayAlloc or gliStaticArrayAddress gave
+  * them, or inside such an array): 3 floats a position, 3 a normal, 2 a texture coordinate, 4 a colour; nrm, uv
+  * and col may be NULL. The GL state is what it is, as for glDrawElements. */
+@@ -129,6 +158,16 @@
+     direct_flush_state();
+     uint32_t *pb = pb_begin();
+     pb = direct_common_arrays(pb, c, pos, nrm, uv, col);
++    if (gli_direct_sphere_map) {                     /* (after the flush: unit 0's matrix is this draw's) */
++        const GLfloat ks = direct_sphere_scale[0], kt = direct_sphere_scale[1];
++        const float m[16] = { ks, 0.0f, 0.0f, 0.0f,  0.0f, kt, 0.0f, 0.0f,  0.0f, 0.0f, 1.0f, 0.0f,
++                              0.5f * (1.0f - ks), 0.5f * (1.0f - kt), 0.0f, 1.0f };   /* (columns, as GL's) */
++        pb = pb_push4(pb, NV097_SET_TEXGEN_S, NV097_SET_TEXGEN_S_SPHERE_MAP, NV097_SET_TEXGEN_S_SPHERE_MAP,
++                      NV097_SET_TEXGEN_S_DISABLE, NV097_SET_TEXGEN_S_DISABLE);
++        pb = pb_push1(pb, NV097_SET_TEXGEN_VIEW_MODEL, NV097_SET_TEXGEN_VIEW_MODEL_LOCAL_VIEWER);
++        pb = xgu_set_texture_matrix_enable(pb, 0, true);
++        pb = pb_push_transposed_matrix(pb, NV097_SET_TEXTURE_MATRIX, m);
++    }
+     pb = pb_push1(pb, NV097_BREAK_VERTEX_BUFFER_CACHE, 0);
+     pb_end(pb);
+     direct_elements16(idx, (unsigned int)count);
+--- a/gles_transform.c
++++ b/gles_transform.c
+@@ -342,7 +342,8 @@
+             mat4 *modelview = &ts->modelview_matrix_stack[ts->modelview_matrix_stack_depth - 1];
+             pb = pb_push_transposed_matrix(pb, NV097_SET_MODEL_VIEW_MATRIX, (const float *)(*modelview));
+ 
+-            if (c->lighting_state.lighting_enabled) {
++            extern GLboolean gli_direct_sphere_map;  /* (gles_xbox_direct.c: the GPU's sphere mapping reads it too) */
++            if (c->lighting_state.lighting_enabled || gli_direct_sphere_map) {
+                 mat4 modelview_inv;
+                 glm_mat4_inv(*modelview, modelview_inv);
+                 pb = pb_push_4x4_matrix(pb, NV097_SET_INVERSE_MODEL_VIEW_MATRIX, (const float *)modelview_inv);

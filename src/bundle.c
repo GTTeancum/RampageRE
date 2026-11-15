@@ -317,6 +317,7 @@ static int load(Bundle *b, uint8_t *file, uint32_t size, const Lean *lm)
     if (size < 0x60 || memcmp(file, MAGIC, sizeof MAGIC - 1) != 0)
         goto failed;
     b->wii = file[sizeof MAGIC - 1] == '4';
+    b->ps2_mesh = b->wii && file[0x2B] == 'P';           /* (tools/wii2ps2.py models: its rigid meshes are the PS2's) */
     uint32_t (*r32)(const uint8_t *) = b->wii ? rd32be : rd32;
     uint16_t (*r16)(const uint8_t *) = b->wii ? rd16be : rd16;
     if ((file[sizeof MAGIC - 1] != '3' && !b->wii) || r32(file + 0x30) != (b->wii ? 1400u : 1300u))
@@ -401,19 +402,27 @@ static int lean_cmp(const void *a, const void *b)
  * its tables, names and entry data below the payload area and the payloads last (checked over the whole VOL), so
  * the image is that lower part followed by the payloads that are kept (meshes, palettes, cloth), packed in file
  * order; a texture's pixels are read from the disc when it is decoded (BdpEntry.at2). Anything unexpected returns
- * -1 and the caller reads the whole file as before. */
+ * -1 and the caller reads the whole file as before.
+ * The Wii folder's bundles (1.4) the same way: they are laid out alike, their numbers big endian (all 129 of the
+ * Wii's checked: tables, names and entry data below the payload area). They need it more: Dallas.bdg is 9.4 MB,
+ * 5.2 of it textures and 2.8 mesh streams; Shell.bdg 12 MB, 11.7 of it textures. */
 static int lean_open(Bundle *b, const Vol *v, const VolFile *f)
 {
     uint8_t head[0x60], sh[0x18];
     if (f->size < sizeof head || vol_read_range(v, f, 0, head, sizeof head) != 0 ||
-        memcmp(head, MAGIC, sizeof MAGIC - 1) != 0 || head[sizeof MAGIC - 1] != '3' || rd32(head + 0x30) != 1300u)
+        memcmp(head, MAGIC, sizeof MAGIC - 1) != 0)
         return -1;
-    uint32_t seg = rd32(head + 0x38);
+    int wii = head[sizeof MAGIC - 1] == '4';
+    uint32_t (*r32)(const uint8_t *) = wii ? rd32be : rd32;
+    uint16_t (*r16)(const uint8_t *) = wii ? rd16be : rd16;
+    if ((head[sizeof MAGIC - 1] != '3' && !wii) || r32(head + 0x30) != (wii ? 1400u : 1300u))
+        return -1;
+    uint32_t seg = r32(head + 0x38);
     if (seg > f->size - sizeof sh || vol_read_range(v, f, seg, sh, sizeof sh) != 0)
         return -1;
-    uint32_t count = rd16(sh + 2), table = rd32(sh + 4), d_off = rd32(sh + 8), d2_off = rd32(sh + 16);
+    uint32_t count = r16(sh + 2), table = r32(sh + 4), d_off = r32(sh + 8), d2_off = r32(sh + 16);
     if (d2_off < sizeof head || d2_off > f->size || seg > d2_off || 0x18 + 0x12 * (uint64_t)count > d2_off - seg ||
-        table > d2_off || 16 * (uint64_t)count > d2_off - table || d_off > d2_off || rd32(head + 0x34) >= d2_off)
+        table > d2_off || 16 * (uint64_t)count > d2_off - table || d_off > d2_off || r32(head + 0x34) >= d2_off)
         return -1;
     uint32_t area = f->size - d2_off;                    /* the payload area's size */
     uint8_t *low = malloc(d2_off);
@@ -421,8 +430,9 @@ static int lean_open(Bundle *b, const Vol *v, const VolFile *f)
     int result = -1;
     if (!low || !run || vol_read_range(v, f, 0, low, d2_off) != 0)
         goto done;
-    /* the name table and every entry's data must be in the lower part: the entry loop reads them from it */
-    uint32_t names_at = rd32(low + 0x34);
+    /* the name table and every entry's data must be in the lower part: the entry loop reads them from it (the
+     * table itself is little endian on the Wii too) */
+    uint32_t names_at = r32(low + 0x34);
     if (d2_off - names_at < 4 || rd32(low + names_at) > (d2_off - names_at - 4) / 4)
         goto done;
     for (uint32_t i = 0, nn = rd32(low + names_at); i < nn; i++) {
@@ -433,7 +443,7 @@ static int lean_open(Bundle *b, const Vol *v, const VolFile *f)
     uint32_t n = 0, textures = 0;
     for (uint32_t i = 0; i < count; i++) {
         const uint8_t *rec = low + seg + 0x18 + 0x12 * i, *ent = low + table + 16 * i;
-        uint32_t o1 = rd32(rec + 2), s1 = rd32(rec + 6), o2 = rd32(rec + 10), s2 = rd32(rec + 14);
+        uint32_t o1 = r32(rec + 2), s1 = r32(rec + 6), o2 = r32(rec + 10), s2 = r32(rec + 14);
         if (s1 && (o1 > d2_off - d_off || s1 > d2_off - d_off - o1))
             goto done;
         if (!s2)
@@ -509,6 +519,7 @@ const uint8_t *bdp_payload(const BdpEntry *e)
         free(mem);
         return NULL;
     }
+    XHITCH(meshes, 1);
     payload_slot.mem = mem;
     payload_slot.e = e;
     return mem;
@@ -526,7 +537,7 @@ int bdp_open(Bundle *b, const Vol *v, const char *name)
     memset(b, 0, sizeof *b);
 #ifdef RAMPAGE_XBOX
     const VolFile *f = g_xbox_tex_drop && v ? vol_find(v, name) : NULL;
-    if (f && !f->path && lean_open(b, v, f) == 0)
+    if (f && lean_open(b, v, f) == 0)                    /* (the VOL's, or a file of the Wii folder) */
         return 0;
     memset(b, 0, sizeof *b);
 #endif

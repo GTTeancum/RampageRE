@@ -231,9 +231,21 @@ static void adpcm_frame(const uint8_t *f, int16_t *out, int *h1, int *h2)
     }
 }
 
+/* how much decoded sound is kept. The Xbox at more than 480 lines: half, where the screens have taken 8 MB more
+ * of the console's memory and the GPU's store of models goes short */
+static size_t audio_cache_bytes(void)
+{
+#ifdef RAMPAGE_XBOX
+    extern int xbox_pixel_height(void);
+    if (xbox_pixel_height() > 480)
+        return RAMPAGE_AUDIO_CACHE_BYTES / 2u;
+#endif
+    return RAMPAGE_AUDIO_CACHE_BYTES;
+}
+
 static void sample_make_room(size_t bytes)
 {
-    size_t target = RAMPAGE_AUDIO_CACHE_BYTES;
+    size_t target = audio_cache_bytes();
     if (!target)
         return;
     while (S.sample_bytes > target || bytes > target - S.sample_bytes) {
@@ -303,25 +315,29 @@ static Sample *wii_sample(Bank *b, int idx, Sample *s)
     uint64_t after = end / 16 * 14 + (end % 16 > 2 ? end % 16 - 2 : 0);
     if (count > INT32_MAX || sample_alloc(s, sizeof(int16_t) * (size_t)(after - before)) != 0)
         return NULL;
-    uint8_t chunk[AUDIO_READ_BYTES];
-    uint32_t chunk_at = UINT32_MAX, chunk_size = 0;
+    /* The sample's frames in one read (they were fetched 4 KB at a time, each a call that opened the bank's file
+     * on a console), and its nibbles walked with 32-bit arithmetic (a 64-bit division for each was most of a long
+     * voice's 50 ms). The same samples result. */
+    if (end > UINT32_MAX) {
+        sample_discard(s);
+        return NULL;
+    }
+    uint32_t first_byte = start / 16 * 8, last_byte = (uint32_t)((end + 15) / 16 * 8);
+    if (last_byte > b->samp_size)
+        last_byte = b->samp_size;
+    uint8_t *frames = last_byte > first_byte ? malloc(last_byte - first_byte) : NULL;
+    if (!frames || vol_read_range(b->vol, &b->sample_file, first_byte, frames, last_byte - first_byte) != 0) {
+        free(frames);
+        sample_discard(s);
+        return NULL;
+    }
     s->rate = (int)rd32be(e + 12);
     int h1 = 0, h2 = 0, n = 0;
-    for (uint64_t a = start; a < (uint64_t)start + count; a++) {
-        if (a % 16 < 2)                  /* the frame's header */
+    for (uint32_t a = start; a < (uint32_t)end; a++) {
+        if ((a & 15u) < 2u)              /* the frame's header */
             continue;
-        uint32_t byte_at = a / 2;
-        if (chunk_at == UINT32_MAX || byte_at < chunk_at || byte_at - chunk_at >= chunk_size) {
-            chunk_at = (byte_at / AUDIO_READ_BYTES) * AUDIO_READ_BYTES;
-            chunk_size = b->samp_size - chunk_at;
-            if (chunk_size > AUDIO_READ_BYTES) chunk_size = AUDIO_READ_BYTES;
-            if (vol_read_range(b->vol, &b->sample_file, chunk_at, chunk, chunk_size) != 0) {
-                sample_discard(s);
-                return NULL;
-            }
-        }
-        uint8_t ps = chunk[a / 16 * 8 - chunk_at], byte = chunk[byte_at - chunk_at];
-        int nib = a % 2 ? byte & 15 : byte >> 4;
+        uint8_t ps = frames[(a >> 4) * 8u - first_byte], byte = frames[(a >> 1) - first_byte];
+        int nib = a & 1u ? byte & 15 : byte >> 4;
         int v = ((nib ^ 8) - 8) * (1 << (ps & 15)) * 2048;   /* the signed nibble, scaled */
         v = (v + 1024 + coef[2 * (ps >> 4)] * h1 + coef[2 * (ps >> 4) + 1] * h2) >> 11;
         v = v < -32768 ? -32768 : v > 32767 ? 32767 : v;
@@ -329,6 +345,7 @@ static Sample *wii_sample(Bank *b, int idx, Sample *s)
         h2 = h1;
         h1 = v;
     }
+    free(frames);
     s->n = n;
     s->loop = flags & 1 ? 0 : -1;
     return s;
@@ -352,6 +369,8 @@ static void sample_decode_to(Sample *s, int upto)
 }
 #endif
 
+static Sample *sample_get_new(Bank *b, int idx, Sample *s);
+
 static Sample *sample_get(Bank *b, int idx)
 {
     if (idx <= 0 || idx >= b->nsdir)
@@ -362,6 +381,20 @@ static Sample *sample_get(Bank *b, int idx)
         return s->pcm ? s : NULL;
     }
     s->tried = 1;
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+    double t0 = win_time();
+    Sample *got = sample_get_new(b, idx, s);
+    g_xhitch.sounds++;
+    g_xhitch.sound_bytes += got ? (uint32_t)got->n * 2u : 0u;
+    g_xhitch.sound_s += win_time() - t0;
+    return got;
+#else
+    return sample_get_new(b, idx, s);
+#endif
+}
+
+static Sample *sample_get_new(Bank *b, int idx, Sample *s)
+{
     if (b->wii)
         return wii_sample(b, idx, s);
     const uint8_t *e = b->sdir + 0x10 + 16 * idx;
@@ -385,20 +418,17 @@ static Sample *sample_get(Bank *b, int idx)
     if ((uint32_t)frames > INT32_MAX / 28 ||
         sample_alloc(s, sizeof(int16_t) * 28 * (size_t)frames) != 0)
         return NULL;
-    uint8_t chunk[AUDIO_READ_BYTES];
+    uint8_t *all = malloc(16u * (size_t)frames + 1u);    /* (its frames in one read, not one for each 4 KB) */
+    if (!all || vol_read_range(b->vol, &b->sample_file, off, all, 16u * (size_t)frames) != 0) {
+        free(all);
+        sample_discard(s);
+        return NULL;
+    }
     s->rate = (int)rd32(e + 12);
     s->loop = -1;
     int h1 = 0, h2 = 0, n = 0, start = 0;
     for (int i = 0; i < frames; i++) {
-        if (i % (AUDIO_READ_BYTES / 16) == 0) {
-            uint32_t left = size - 16u * (uint32_t)i;
-            if (left > AUDIO_READ_BYTES) left = AUDIO_READ_BYTES;
-            if (vol_read_range(b->vol, &b->sample_file, off + 16u * (uint32_t)i, chunk, left) != 0) {
-                sample_discard(s);
-                return NULL;
-            }
-        }
-        const uint8_t *f = chunk + 16 * (i % (AUDIO_READ_BYTES / 16));
+        const uint8_t *f = all + 16 * (size_t)i;
         if (f[1] & 4)                    /* [R] loop start */
             start = n;
         adpcm_frame(f, s->pcm + n, &h1, &h2);
@@ -406,6 +436,7 @@ static Sample *sample_get(Bank *b, int idx)
         if (f[1] & 1)                    /* [R] the end (with bit 1: jump to the loop start) */
             break;
     }
+    free(all);
     s->n = n;
     if (flags & 1)                       /* [R] SDIR flags bit 0: a looping sample (0x26E670 passes it on) */
         s->loop = start;
@@ -463,10 +494,13 @@ static int bank_load(Bank *b, const Vol *v, const char *name, int wii)
             if (!_stricmp(v->wii[i].name, path)) { vf = &v->wii[i]; break; }
     b->vol = v;
     if (vf) { b->sample_file = *vf; b->samp_size = vf->size; }
-    if (!b->uber || !vf || b->uber_size < 0x20 || memcmp(b->uber, wii ? "REBU" : "UBER", 4) != 0 ||
-        (wii && wii_tables(b) != 0))
+    /* A bank of the Wii folder that the preparation tool has converted (tools/wii2ps2.py) is a PS2 bank, "UBER"
+     * with PS-ADPCM samples, and is read as one; as the disc has it, "REBU" with DSP-ADPCM. */
+    int rebu = wii && b->uber && b->uber_size >= 4 && memcmp(b->uber, "REBU", 4) == 0;
+    if (!b->uber || !vf || b->uber_size < 0x20 || memcmp(b->uber, rebu ? "REBU" : "UBER", 4) != 0 ||
+        (rebu && wii_tables(b) != 0))
         goto bad;
-    b->wii = wii;
+    b->wii = rebu;
     uint32_t o[6];
     for (int i = 0; i < 6; i++) {
         o[i] = rd32(b->uber + 8 + 4 * i);
@@ -1928,7 +1962,7 @@ void sound_update(float dt)
 #if RAMPAGE_AUDIO_CACHE_BYTES > 0
     /* A pinned burst may exceed the soft budget. Reclaim newly idle samples
      * after voices advance, even when no later sound causes another decode. */
-    if (S.sample_bytes > (size_t)RAMPAGE_AUDIO_CACHE_BYTES)
+    if (S.sample_bytes > audio_cache_bytes())
         sample_make_room(0);
 #endif
 

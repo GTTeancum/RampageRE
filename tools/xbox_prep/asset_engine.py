@@ -323,6 +323,133 @@ def validate_wii_entries(entries):
                 raise PrepError(f'Invalid Wii bundle: {e.name}')
 
 
+# The Wii files the game never reads (docs/XBOX_PERF_PLAN.md): it asks the PS2 archive first, so the Wii's copies of
+# the seven PS2 cities and the thirty shared monsters are dead weight on a console's small hard disc, as are the
+# scripts (the port does not run them) and the .zip twins of the bundles. 316 MB becomes about 66.
+WII_PS2_CITIES = ('Chicago', 'HongKong', 'LasVegas', 'London', 'LosAngeles', 'NewYork', 'SanFrancisco')
+
+
+def wii_wanted(name):
+    """name: wii/<Folder>/<file>. False for a file the game does not read."""
+    parts = name.split('/')
+    if len(parts) != 3 or parts[1].casefold() != 'game':
+        return True
+    low = parts[2].casefold()
+    if low.endswith(('.zip', '.bsf')) or low.endswith('_scripts.bdg') or low == 'debug.bdg':
+        return False
+    if low.endswith('.bdg') and low[:-4] in {c.casefold() for c in WII_PS2_CITIES}:
+        return False
+    if low.endswith('.cmg'):
+        monster = low[:-4]
+        if monster.endswith('_anims'):
+            monster = monster[:-6]
+        return monster in {m.casefold() for m in WII_MONSTERS}
+    return True
+
+
+def vol_member(vol, name):
+    """A file of RAMPAGE.VOL (vol: its Entry, already validated) as bytes, None when it has none of that name."""
+    head = vol.read(16)
+    _, _, count, names_size = struct.unpack('<4sIII', head)
+    with plain_path(vol.source).open('rb') as f:
+        raw = exact(f, vol.offset + 16, 12 * count + names_size)
+        index, block = raw[:12 * count], raw[12 * count:]
+        for i in range(count):
+            offset, size, _ = struct.unpack_from('<III', index, i * 12)
+            at = struct.unpack_from('<I', block, 4 + 4 * i)[0]
+            if block[at:block.index(b'\0', at)].decode('ascii', 'replace').casefold() == name.casefold():
+                return exact(f, vol.offset + offset, size, vol.offset + vol.size)
+    return None
+
+
+def wii_converter():
+    """tools/wii2ps2.py, from the folder above (after the library's own modules: that folder has a dis.py)."""
+    tools = str(Path(__file__).resolve().parent.parent)
+    if tools not in sys.path:
+        sys.path.append(tools)
+    import wii2ps2
+    return wii2ps2
+
+
+def wii_models(entries, work, cancel=None, progress=None):
+    """The Wii's bundles (.bdg) with their rigid meshes rewritten in the PS2's mesh format (tools/wii2ps2.py
+    models): Dallas, the effects' shapes, the shell's. The monsters' (.cmg) are left: their skins hold up to four
+    bones a vertex and the PS2's format two. Every converted mesh is read back and compared triangle for triangle
+    before it is accepted."""
+    todo = [e for e in entries if e.name.casefold().endswith('.bdg')]
+    if not todo:
+        return entries
+    wii2ps2 = wii_converter()
+    src, out = work / 'wii-models-in', work / 'wii-models-out'
+    src.mkdir()
+    out.mkdir()
+    result = []
+    for e in entries:
+        if e not in todo:
+            result.append(e)
+            continue
+        check_cancel(cancel)
+        base = Path(e.name).name
+        if (e.size < 0x100 or e.read(0x2C)[0x2B:0x2C] == b'P' or
+                not e.read(0x30).startswith(b'Pipeworks Bundle File version 1.4')):
+            result.append(e)                             # (no tables in it, converted already, or not a Wii bundle)
+            continue
+        if progress:
+            progress(0, 0, f'Converting the Wii models to the PS2 format ({base})…')
+        (src / base).write_bytes(e.read())
+        try:
+            done = wii2ps2.convert_models(str(src / base), str(out / base), log=lambda *a: None)
+        except (ValueError, AssertionError, struct.error, IndexError, KeyError) as exc:
+            raise PrepError(f'The Wii bundle {base} could not be converted: {exc}') from exc
+        (src / base).unlink()
+        if done:
+            result.append(Entry(e.name, out / base, 0, (out / base).stat().st_size))
+        else:
+            result.append(e)
+    return result
+
+
+def wii_prework(entries, vol, work, cancel=None, progress=None):
+    """The conversions a console has no time for while it plays, done here once (tools/wii2ps2.py): the Wii's
+    sound bank (DSP-ADPCM, big endian) becomes a PS2-format bank holding the sounds the PS2's bank has not got.
+    And the files the game never reads are left out. entries: the Wii's (wii/Game/..., wii/Shell/...,
+    wii/Audio/...); vol: the PS2's RAMPAGE.VOL. Returns the entries to install."""
+    kept = [e for e in entries if wii_wanted(e.name)]
+    kept = wii_models(kept, work, cancel, progress)
+    by_name = {e.name.casefold(): e for e in kept}
+    banks = [n for n in ('Rampage', 'RShell')
+             if f'wii/audio/{n.casefold()}.uber' in by_name and f'wii/audio/{n.casefold()}.samp' in by_name
+             and by_name[f'wii/audio/{n.casefold()}.uber'].read(4) == b'REBU']
+    if not banks:
+        return kept
+    wii2ps2 = wii_converter()
+    src, ps2, out = work / 'wii-sound-in', work / 'wii-sound-ps2', work / 'wii-sound-out'
+    for d in (src, ps2, out):
+        d.mkdir()
+    for n in banks:
+        check_cancel(cancel)
+        if progress:
+            progress(0, 0, f'Converting the Wii sounds to the PS2 format ({n})…')
+        for ext in ('.uber', '.samp'):
+            (src / (n + ext)).write_bytes(by_name[f'wii/audio/{n.casefold()}{ext}'].read())
+        member = vol_member(vol, n + '.uber')
+        if member is None:
+            raise PrepError(f'RAMPAGE.VOL has no {n}.uber to compare the Wii sounds with.')
+        (ps2 / (n + '.uber')).write_bytes(member)
+        try:
+            done = wii2ps2.convert_bank(str(src), str(ps2), str(out), n, log=lambda *a: None)
+        except (ValueError, AssertionError, struct.error, IndexError) as exc:
+            raise PrepError(f'The Wii sound bank {n} could not be converted: {exc}') from exc
+        for ext in ('.uber', '.samp'):
+            key = f'wii/audio/{n.casefold()}{ext}'
+            name = by_name[key].name
+            kept = [e for e in kept if e.name.casefold() != key]
+            if done:                                 # (nothing the PS2 bank lacks: the bank is not needed at all)
+                made = out / (n + ext)
+                kept.append(Entry(name, made, 0, made.stat().st_size))
+    return kept
+
+
 def bundled_reader():
     root = Path(getattr(sys, '_MEIPASS', Path(__file__).parent))
     return root / ('rampage-disc-reader.exe' if os.name == 'nt' else 'rampage-disc-reader')
@@ -516,6 +643,7 @@ def _prepare(package, ps2, wii=None, *, allow_replace=False, cancel=None, progre
     planned = ps2_plan(ps2)
     image_wii = bool(wii and not Path(wii).is_dir())
     probe = None
+    wii_entries = []
     if wii:
         if progress:
             progress(0, 0, 'Checking the full Wii source…')
@@ -529,11 +657,12 @@ def _prepare(package, ps2, wii=None, *, allow_replace=False, cancel=None, progre
                 if not isinstance(e['size'], int) or e['size'] < 0:
                     raise PrepError('Invalid Wii image file size.')
         else:
-            planned.extend(wii_folder_plan(wii))
+            wii_entries = wii_folder_plan(wii)
     keep = [e for e in current.values() if e.name.split('/')[0].casefold() != 'data'
             and not (wii and e.name.split('/')[0].casefold() == 'wii')
             and e.name.casefold() != 'asset-manifest.json']
-    total = sum(e.size for e in planned+keep) + (sum(e['size'] for e in probe['files']) if probe else 0)
+    total = sum(e.size for e in planned+keep) + (sum(e['size'] for e in probe['files']) if probe else
+                                                 sum(e.size for e in wii_entries) if wii else 0)
     # Wii images are extracted into temporary storage before staged verification.
     required = total + (sum(e['size'] for e in probe['files']) if probe else 0) + 64*1024*1024
     if shutil.disk_usage(package).free < required:
@@ -561,7 +690,10 @@ def _prepare(package, ps2, wii=None, *, allow_replace=False, cancel=None, progre
             expected = {e['path'].casefold(): e['size'] for e in probe['files']}
             if actual != expected:
                 raise PrepError('Wii extraction does not match the inspected disc file list.')
-            planned.extend(wii_entries)
+        if wii:
+            vol = next(e for e in planned if e.name == 'data/RAMPAGE.VOL')
+            planned.extend(wii_prework(wii_entries, vol, work, cancel, progress))
+            total = sum(e.size for e in planned+keep)
         unique(planned+keep)
         manifest = []
         for entry in keep+planned:

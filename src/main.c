@@ -9494,7 +9494,17 @@ static int viewer_main(int argc, char **argv)
             else if (!strcmp(n, "longpb")) { extern int g_xbox_long_pushbuffer; g_xbox_long_pushbuffer = 0; }
             else if (!strcmp(n, "texdrop")) { extern int g_xbox_tex_drop; g_xbox_tex_drop = 0; }
             else if (!strcmp(n, "glyphs")) { extern int g_xbox_glyphs; g_xbox_glyphs = 0; }
+            else if (!strcmp(n, "gxnative")) { extern int g_xbox_gx_native; g_xbox_gx_native = 0; }
+            else if (!strcmp(n, "gpusphere")) { extern int g_xbox_gpu_sphere; g_xbox_gpu_sphere = 0; }
             printf("xbox test switch off: %s\n", n);
+        }
+        else if (strcmp(argv[i], "--xkeepfree") == 0 && i + 1 < argc) {  /* (win_xbox.c g_xbox_keep_free_kb) */
+            extern int g_xbox_keep_free_kb;
+            g_xbox_keep_free_kb = atoi(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--xgxskip") == 0 && i + 1 < argc) {    /* (render_gl.c g_xbox_gx_skip) */
+            extern int g_xbox_gx_skip;
+            g_xbox_gx_skip = atoi(argv[++i]);
         }
         else if (strcmp(argv[i], "--xfxbudget") == 0 && i + 1 < argc) {  /* (render_gl.c g_xbox_fx_budget) */
             extern int g_xbox_fx_budget;
@@ -9518,6 +9528,8 @@ static int viewer_main(int argc, char **argv)
             const char *n = argv[++i];
             if (!strcmp(n, "sndpre")) g_xbox_sound_preload = 1;
             else if (!strcmp(n, "twobuf")) { extern int g_xbox_two_buffers; g_xbox_two_buffers = 1; }
+            else if (!strcmp(n, "magenta")) { extern int g_xbox_clear_color; g_xbox_clear_color = 2; }
+            else if (!strcmp(n, "clearcolor")) { extern int g_xbox_clear_color; g_xbox_clear_color = 1; }
             printf("xbox test switch on: %s\n", n);
         }
 #endif
@@ -9704,11 +9716,7 @@ static int viewer_main(int argc, char **argv)
         Bundle *wii_b[3] = { &v.wii_fx, &v.wii_world, &v.wii_common };
         int *wii_have[3] = { &v.have_wii_fx, &v.have_wii_world, &v.have_wii_common };
         for (int k = 0; k < 3 && v.vol.nwii; k++) {  /* the Wii's (the VOL has no .bdg: its folder's) */
-            uint32_t wsize = 0;
-            uint8_t *wd = vol_read(&v.vol, wii_names[k], &wsize);
-            *wii_have[k] = wd && bdp_load(wii_b[k], wd, wsize) == 0;
-            if (wd && !*wii_have[k])
-                free(wd);
+            *wii_have[k] = bdp_open(wii_b[k], &v.vol, wii_names[k]) == 0;
             wii_b[k]->scope = k ? "GUI" : "fx";
         }
         if (bdp_open(&v.fx_bundle, &v.vol, "fx.bdp") == 0) {
@@ -9937,9 +9945,17 @@ static int viewer_main(int argc, char **argv)
         if (!v.shell && (scene_construction_stop(&v) || v.exit_game))
             goto leave_world;                       /* no capture/audio or game callbacks before failed-world teardown */
 #ifdef RAMPAGE_XBOX
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+        { double xlap_at = win_time(); plat_xbox_memory_tick(); g_xhitch.lap[0] += win_time() - xlap_at; }
+#else
         plat_xbox_memory_tick();
 #endif
+#endif
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+        { double xlap_at = win_time(); win_poll(&w); g_xhitch.lap[0] += win_time() - xlap_at; }
+#else
         win_poll(&w);
+#endif
         double now = win_time();
         float dt = (float)(now - last);
         last = now;
@@ -9970,7 +9986,11 @@ static int viewer_main(int argc, char **argv)
             world_t += dt;
         if (v.pads_live) {                           /* this frame's controllers, the vibration on them */
             memcpy(v.pads_prev, v.pads, sizeof v.pads);
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+            { double xlap_at = win_time(); v.pads_on = pad_poll(v.pads, w.focused, (unsigned)w.dev_changes); g_xhitch.lap[1] += win_time() - xlap_at; }
+#else
             v.pads_on = pad_poll(v.pads, w.focused, (unsigned)w.dev_changes);
+#endif
 #ifdef __ANDROID__
             v.pads_on |= touch_pad(v.pads, v.pads_on);   /* the on-screen pad: slot 0's */
             if (touch_tapped() && v.movie && v.shell)   /* [port extra] a tap anywhere on a movie (the boot's,
@@ -10211,11 +10231,23 @@ leave_world:
                                                       * menu's: not a jump too (one on a wall lets go of it) */
                         memset(v.mon[k].pad.pressed, 0, sizeof v.mon[k].pad.pressed);
                 }
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+            double step_at = win_time();
+#endif
             play_step(&v, shot && !v.ap ? 0 : (dt > 0.1f ? 0.1f : dt), aspect);
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+            g_xhitch.step_s += win_time() - step_at;
+#endif
             if (scene_construction_stop(&v) || v.exit_game)
                 continue;
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+            double xlap_pose = win_time();
+#endif
             pose_monsters(&v, shot && !v.ap ? shot_time : world_t);   /* the clips at the states' times (clip_at),
                                                       * against the clock the scene poses by (scene_update's t) */
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+            g_xhitch.lap[5] += win_time() - xlap_pose;
+#endif
             memcpy(cam.pos, v.view.pos, sizeof cam.pos);
             cam_shaken(v.view.pos, (const float (*)[3])v.view.rows, v.shakes, 8 + MONSTERS - 1, cam.rows);   /* after the
                                                       * smoothing */
@@ -10252,9 +10284,17 @@ leave_world:
         double t = shot && !v.ap ? shot_time : world_t;
         rnd_hud_time(v.rnd, shot && !v.ap ? shot_time : now - start);   /* the GUI's 3D layers: the frame's time */
         sound_listener(cam.pos, (const float (*)[3])cam.rows);   /* the camera (its rows when it is the game's) */
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+        { double xlap_at = win_time(); sound_update(shot && !cap_v ? 0 : (dt > 0.1f ? 0.1f : dt)); g_xhitch.lap[2] += win_time() - xlap_at; }
+#else
         sound_update(shot && !cap_v ? 0 : (dt > 0.1f ? 0.1f : dt));
+#endif
         if (v.have_scene) {
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+            { double xlap_at = win_time(); scene_update(&v.scene, t); g_xhitch.lap[3] += win_time() - xlap_at; }
+#else
             scene_update(&v.scene, t);
+#endif
             if (scene_construction_stop(&v))
                 continue;
             if (playing)
@@ -10317,15 +10357,29 @@ leave_world:
 #ifdef RAMPAGE_XBOX
         /* Scene preparation and the GPU wait can each be expensive under
          * emulation. Refill between them without ticking events/game time. */
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+        { double xlap_at = win_time(); sound_pump(); g_xhitch.lap[4] += win_time() - xlap_at; }
+#else
         sound_pump();
+#endif
+#endif
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+        double draw_at = win_time();
 #endif
         if (have_view) {
             Camera fixed = { { view[0], view[1], view[2] }, view[3] / 57.2957795f, view[4] / 57.2957795f, 60 };
             rnd_frame(v.rnd, &w, &fixed, t, v.fog);
         } else
             rnd_frame(v.rnd, &w, &cam, t, v.fog);
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+        g_xhitch.draw_s += win_time() - draw_at;
+#endif
 #ifdef RAMPAGE_XBOX
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+        { double xlap_at = win_time(); sound_pump(); g_xhitch.lap[4] += win_time() - xlap_at; }
+#else
         sound_pump();
+#endif
 #endif
         if (cap_draw) {
             shot_raw(cap_v, w.width, w.height);
@@ -10353,9 +10407,19 @@ leave_world:
             if (shot_png(name, w.width, w.height) == 0)
                 printf("wrote %s\n", name);
         }
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+        double swap_at = win_time();
+#endif
         win_swap(&w);
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+        g_xhitch.swap_s += win_time() - swap_at;
+#endif
 #ifdef RAMPAGE_XBOX
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+        { double xlap_at = win_time(); sound_pump(); g_xhitch.lap[4] += win_time() - xlap_at; }
+#else
         sound_pump();
+#endif
 #endif
         frames++;
 #if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
@@ -10369,8 +10433,29 @@ leave_world:
                 extern volatile uint32_t g_xbox_heavy_frame;
                 g_xbox_heavy_frame = frame_last > 0 && now - frame_last > 0.0185;
             }
+            /* a long frame: what it did (data.h XboxHitch); every frame starts the tally anew */
+            static double tally_at;                  /* (the tally and the time are of the same stretch: from here
+                                                      * in the frame before to here) */
+            double tally_now = win_time(), tally_took = tally_at > 0 ? tally_now - tally_at : 0;
+            tally_at = tally_now;
+            if (tally_took > 0.070)
+                printf("xbox hitch ms=%.0f step=%.0f draw=%.0f swap=%.0f poll=%.0f pads=%.0f sound=%.0f scene=%.0f "
+                       "pump=%.0f pose=%.0f block=%s reads=%u/%uKB/%.0fms opens=%u "
+                       "sounds=%u/%uKB/%.0fms textures=%u meshes=%u\n", tally_took * 1000.0,
+                       g_xhitch.step_s * 1000.0, g_xhitch.draw_s * 1000.0, g_xhitch.swap_s * 1000.0,
+                       g_xhitch.lap[0] * 1000.0, g_xhitch.lap[1] * 1000.0, g_xhitch.lap[2] * 1000.0,
+                       g_xhitch.lap[3] * 1000.0, g_xhitch.lap[4] * 1000.0, g_xhitch.lap[5] * 1000.0,
+                       v.nblocks ? v.blocks[v.block] : "-",
+                       (unsigned)g_xhitch.reads, (unsigned)(g_xhitch.read_bytes / 1024), g_xhitch.read_s * 1000.0,
+                       (unsigned)g_xhitch.opens, (unsigned)g_xhitch.sounds, (unsigned)(g_xhitch.sound_bytes / 1024),
+                       g_xhitch.sound_s * 1000.0, (unsigned)g_xhitch.textures, (unsigned)g_xhitch.meshes);
+            memset(&g_xhitch, 0, sizeof g_xhitch);
             frame_last = now;
             fps_frames++;
+            {
+                extern void rnd_draw_stats_frame(void);
+                rnd_draw_stats_frame();
+            }
             if (fps_at == 0)
                 fps_at = now;
             else if (now - fps_at >= 5.0) {
@@ -10393,6 +10478,12 @@ leave_world:
                     gliTextureMemoryStats(tm);
                     printf("xbox textures images=%lu asked_kb=%lu held_kb=%lu\n", (unsigned long)tm[1],
                            (unsigned long)(tm[2] / 1024), (unsigned long)(tm[3] / 1024));
+                }
+                {                                    /* the draws by kind, draws / triangles a frame */
+                    extern void rnd_draw_stats(char *out, size_t cap);
+                    char line[240];
+                    rnd_draw_stats(line, sizeof line);
+                    printf("xbox draws %s\n", line);
                 }
                 {                                    /* what the effects covered (render_gl.c rnd_fx_stats) */
                     extern void rnd_fx_stats(char *out, size_t cap);

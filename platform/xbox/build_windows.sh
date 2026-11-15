@@ -57,7 +57,7 @@ if [[ $stage == deps || $stage == all ]]; then
     nxdk-lib -out:"$L/libpbkit.lib" "${objs[@]}"
 
     checkout "$L/nxdk-gles11" https://github.com/Ryzee119/nxdk-gles11.git $GLES_COMMIT
-    for p in default-state staging-pages lighting-normal light-cache texture-telemetry exact-palette reset-drain pushbuffer-room static-arrays frame-pacing deferred-restart staging-pack direct-draw skin-programs pushbuffer-frames static-fit palette-direct static-release scanout-guard skin-lighting-off palette-mips; do
+    for p in default-state staging-pages lighting-normal light-cache texture-telemetry exact-palette reset-drain pushbuffer-room static-arrays frame-pacing deferred-restart staging-pack direct-draw skin-programs pushbuffer-frames static-fit palette-direct static-release scanout-guard skin-lighting-off palette-mips texture-native direct-spheremap; do
         apply "$L/nxdk-gles11" "$P/nxdk-gles11-$p.patch"
     done
     # nxdk-gles11 includes <pbkit/...>; point it at the patched driver headers first

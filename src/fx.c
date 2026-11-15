@@ -25,7 +25,13 @@
 
 #define FX_PI 3.14159265f
 #define FX_STEP (1.0f / 60.0f)   /* the front end's step (0x309210), the default; fx_set_step */
+#ifdef RAMPAGE_XBOX
+#define MAX_PARTS 4096           /* (the console's 64 MB: the pool is 1.5 MB at 8,192. The most seen alive in the
+                                  * busiest frames of four monsters is about 1,300; an emitter that finds none
+                                  * free makes none) */
+#else
 #define MAX_PARTS 8192
+#endif
 #define MAX_EMITS 1024
 #define MAX_FX 256
 #define MAX_TEX 8

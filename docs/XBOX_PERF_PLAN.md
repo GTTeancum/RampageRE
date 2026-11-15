@@ -370,6 +370,143 @@ shows only in motion.
 What is left of a 1280x720 frame without effects is 27 ms; the unskinned items of the main pass (cars, debris,
 damaged buildings' own parts) are 5 ms of it and the next thing to look at.
 
+## The Wii's monsters and Dallas on the console (2026-11-14)
+
+The port's Wii extras (docs/WII_PLAN.md) on the Xbox: a `wii` folder beside `default.xbe` (`Game`, `Shell`, `Audio`)
+switches them on. As it stood they did not fit: Dallas with PS2 monsters used all 64 MB at 640x480 and the scene
+failed to build. Measured on the console at 1280x720, four computer-controlled monsters (Boris, Sarah, Brian,
+Cyril), lowest / median / highest over 5-second windows outside the block loads:
+
+| Scene | Frame rate | Free RAM at worst |
+|---|---|---|
+| Dallas, blocks 1 to 4 | 27.7 / 31.3 / 38.0 | 4.3 MB |
+| Dallas, blocks 4 to 7 (Fountain Place and Downtown the busiest: 65,000 triangles a frame) | 23.4 / 29.2 / 36.9 | 2.4 MB |
+| Las Vegas with the four Wii monsters | 28.0 / 31.9 / 39.8 | 4.5 MB |
+| Las Vegas with PS2 monsters, the Wii folder present (40 monsters in the roster) | 29.2 / 32.2 / 39.8 | 8.0 MB |
+
+(The Las Vegas run with Wii monsters was made before the last memory and reflection changes.)
+
+What was written:
+
+- **Lean images of the Wii's bundles** (`bundle.c` `lean_open`): laid out as the PS2's, their numbers big endian
+  (all 129 checked). Dallas.bdg is 9.4 MB, 5.2 of it textures and 2.8 mesh streams; Shell.bdg 12 MB, 11.7 of it
+  textures. `tex.c` reads a Wii texture's pixels from the disc as it does a PS2 one's.
+- **The Wii's textures in the GPU's own formats** (`tex.c` `tex_gx_native`, `render_gl.c` `xbox_texture_gx`,
+  patches/nxdk-gles11-texture-native.patch `gliTextureNative`; `--xoff gxnative`): a CMPR texture is DXT1 with
+  its bytes in another order, converted exactly; RGB5A3 goes to 16 bits (A1R5G5B5 exactly when all its texels are
+  opaque, else A4R4G4B4); I8 to 8 bits with a grey palette. With the mip levels of the file. Dallas's textures in
+  memory: 11.5 MB to 4. Checked on the console by captures.
+- **A page for a texture about to be replaced** (`gliTexturePlaceholderNext`): the full-colour image the 8-bit
+  and native paths made only to replace it was up to 4 MB of contiguous memory for a moment.
+- **The largest Wii textures halved above 480 lines** (`g_xbox_gx_skip`, `--xgxskip N`): the level under the
+  largest for textures of 512 a side or more (Dallas has four of 1024; the Wii's monsters' are 512, the PS2's
+  256). 4 MB to 2.5.
+- **HUD layouts' nodes sixteen at a time** (`hud.c`): each layout had a fixed table of 136 KB and a game has some
+  fifteen: 2 MB to about 0.5. (Found by walking the heap of a RAM snapshot in xemu.)
+- **Particle pool 4,096** on the Xbox (1.5 MB at 8,192; about 1,300 alive at the most seen); **decoded sound
+  kept: 1 MB above 480 lines** (2 at 480); **the vertex store's reserve 2.25 MiB at 1280x720** (3.5 before).
+- **Reflections' coordinates from the GPU** (patches/nxdk-gles11-direct-spheremap.patch `gliDirectSphereMap`,
+  `--xoff gpusphere`): GLES 1.1 has no texture coordinate generation, so gl4es made the sphere-map coordinates
+  of every reflective part for every vertex of every frame and sent them as client arrays. Fountain Place's
+  mirror-glass towers were 6,000 triangles that way and 10 ms of the frame (42 ms to 32 without them). The NV2A's
+  fixed-function pipeline does it itself (NV097_SET_TEXGEN_S = sphere map, the texture matrix for the scale).
+  Checked on the console by captures of the towers both ways.
+- **The effects' budget** may now go down to a quarter of the fixed one, and one particle in seven.
+- Test builds: `xbox draws` (draws and triangles a frame by kind), `xbox slow draw` (what goes through gl4es and
+  why), `wii read` (the Wii files read), `--xskip` 512 / 1024 / 2048, `--xkeepfree KB`.
+
+What the measurements showed:
+
+- With the store short of memory a block is slow whatever its size: refused arrays are drawn through gl4es from
+  client arrays (thousands of triangles a frame) and a GPU-posed model is posed by the CPU from then on. Dallas's
+  slow blocks at 20 to 23 a second were this until the memory was found.
+- The Wii's monsters are 19,500 triangles a frame for four (the PS2's: about 10,500), 4.7 ms of a 1280x720
+  frame; posed by the CPU instead they cost 3 ms more (the CPU is then the limit).
+- At 640x480 the same Dallas block takes 26 ms without effects and 29 with: the game's own work on the CPU is
+  4 ms more than in Las Vegas. At 1280x720 it is 31 ms without effects, so the effects' budget sits at its floor
+  there.
+- The GPU's occlusion culling register (NV097 0x1D84, Direct3D's D3DRS_OCCLUSIONCULLENABLE) made no difference
+  set or not (30.5 and 31.2 ms against 30.8 twice). Not kept.
+- The level-change frame with the Wii's data is 4.7 to 5 s (2.8 with the PS2's): the textures are converted and
+  the meshes read from a folder's files, opened for each read.
+
+Where that leaves 1280x720 with the Wii's content: at or just under 30 in most of Dallas and in the PS2's
+cities; 24 to 30 in Dallas's two busiest blocks, where the frame is 60,000 to 65,000 triangles.
+
+The Wii files a console needs (74 MB of the disc's 316): the ten monsters' `.cmg` and `_anims.cmg`, `Dallas.bdg`,
+every `.bdg` of `Game` but the seven PS2 cities' own and the `_scripts` ones, all of `Shell` and `Audio`. The 30
+shared monsters' and the seven cities' Wii copies are never read (`vol_find` asks the PS2's archive first).
+
+### Long frames (the owner's report: frequent short freezes)
+
+Test builds log every frame over 70 ms with what it did (`xbox hitch`: the time in the game's step, the drawing,
+the sound, the scene's update, and the disc reads, sounds decoded, textures made and mesh streams fetched in it).
+A console run that nothing touches while it plays (no log pulls, no captures: a capture pauses the game for 2.5 s,
+and the test builds' own log write every 5 s was a 0.1 s frame, now every 30 s), Dallas, four Wii monsters,
+165 s of play:
+
+| Cause | Frames | Typical | Longest |
+|---|---|---|---|
+| a sound heard for the first time (read from the disc and decoded) | 19 | 86 ms | 175 ms |
+| mesh streams read from the disc (a building's next damage state) | 27 | 84 ms | 115 ms |
+| a texture used for the first time | 6 | 87 ms | 104 ms |
+| a block change | 4 | 4.4 s | 12 s (the city again) |
+| none of these | 1 | 81 ms | |
+
+Every one is the disc read in the middle of play, and nearly all of it was the Wii folder's files. The same run
+with the PS2's monsters in Las Vegas (nothing of the Wii's in play) has 7 long frames in 195 s. What made the Wii's
+content different, each measured on the console:
+
+| Step | Long frames in play (about 170 s of Dallas, four Wii monsters) | Block change |
+|---|---|---|
+| as above | 53 | 4.4 s |
+| the Wii's sound bank converted to the PS2's format by the preparation tool | 51 | 4.4 s |
+| every file of the Wii folder kept open once read | 14 | 2.45 s |
+| (the PS2's monsters in Las Vegas, for comparison) | 7 | 2.8 s |
+
+- **Opening a file is 30 to 45 ms on the console.** The Wii folder's files were opened for every read, then (a
+  first fix) only the last one read was kept open: 44 of 51 long frames still had a file opened in them, the
+  city's bundle and the sound bank taking turns. `vol.c` `path_read` keeps up to twelve open (Win32 handles). The
+  PS2's data never paid this: it is one archive, open from the start. A block change went from 4.4 s to 2.45 s
+  with it (about 400 reads).
+- **The Wii's sounds are converted before the first launch** (the owner's direction: conversions belong in the
+  installer, not in the running game). `tools/wii2ps2.py sound` writes a PS2-format bank (little endian tables,
+  16-byte sample entries, PS-ADPCM) with the Wii bank's events and programs as they are and the samples its 153
+  extra events can play (136 samples, 288 s; the game asks the PS2's bank first, so the rest are never played and
+  are left absent): 5.1 MB instead of 13.1. Each sound is decoded and encoded once more (signal to noise against
+  the Wii's decoded sound: median 32 dB, lowest 20.5). `sound.c` `bank_load` reads a bank of the Wii folder by
+  what it is ("UBER": the PS2's reader; "REBU": the Wii's, still there for an unconverted folder). A sound's
+  load in a long frame: 49 ms typical before, 10 ms after both changes (the PS2's: 8).
+- **The preparation tool does it** (`tools/xbox_prep/asset_engine.py` `wii_prework`), and leaves out the Wii
+  files the game never reads: 82 files and 65 MB go to the console instead of 380 and 315.
+- **Dallas's models are converted to the PS2's mesh format before the first launch** (the owner: "Dallas should
+  be PS2 format", with no fidelity lost to the eye). `tools/wii2ps2.py models` rewrites every rigid mesh (entry
+  type 0) of a Wii bundle as the PS2's: little endian part records, each part one section of vertices in strips.
+  The header's byte 0x2B becomes 'P' and `mesh.c` reads such a bundle's rigid meshes with the PS2's reader
+  (`Bundle.ps2_mesh`). The rest of the bundle is the Wii's, byte for byte: its tables' byte order is still
+  converted when the bundle is loaded, never in play. Dallas.bdg: 1,059 meshes, 64,508 triangles; 77,967 vertices
+  in the Wii's indexed lists, 104,223 in strips (1.62 a triangle). Also fx.bdg (10 meshes) and Shell.bdg (11).
+  - What the PS2's format holds less finely is rounded to it: a normal to 1/127, a colour to 1/128, a texture
+    coordinate to 1/4096 and, where it is beyond the format's range of 8 (151 vertices of Dallas), moved by whole
+    repeats of the texture. Positions and triangles are exact. Every converted mesh is read back with the PS2's
+    reader and its triangles compared corner for corner with the Wii's.
+  - On the console, four fixed views of Dallas with no monsters, the Wii's file against the converted one, frame
+    for frame out of the console's memory: the buildings are the same pixels but for one level in 255 on under
+    2 % of them; the ground plane (one texture repeated far past 8 times) is one level off on a third of its
+    pixels, never more than three. The sky and the traffic differ only by when each frame was taken.
+  - A Dallas run after it: 8 long frames in play in 170 s (14 before, the PS2's content 7), blocks 1 to 4 at
+    30.2 / 32.1 / 35.7; Fountain Place 27 to 33 (24 to 30 before), Downtown 26 to 34 (23 to 33). Free memory at
+    worst 1.9 MB in Fountain Place (2.4 before: the strips' extra vertices), the store refusing nothing.
+- **The Wii's monsters stay as the Wii has them.** Counted: every one of the ten has 10 to 45 % of its skin's
+  vertices on three or four bones (Boris 691 of 2,941, Sarah 304, Brian 1,348), the third bone's weight up to a
+  third. The PS2's skinned format holds two. None converts without changing how it bends.
+
+The frame is also no longer cleared to the fog's colour where the sky is drawn late; what the scene leaves bare
+(a strip at the bottom edge in Dallas, found with a magenta clear) is filled by one far rectangle
+(`xbox_far_fill`): 1.2 ms of a 1280x720 frame, measured twice. No bare pixel in any of the eight cities (two
+blocks each, three captures each).
+
+
 ### Not written
 
 - Building walls in fixed buffers rewritten one building a frame (the studio's design): the port's changed parts

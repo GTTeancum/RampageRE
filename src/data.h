@@ -26,6 +26,26 @@ typedef struct {
 enum { VOL_UNREADABLE = -1, VOL_NOT_IN_IMAGE = -2 };
 int vol_open(Vol *v, const char *path);
 /* case-insensitive: the VOL's file, else the Wii folder's of that name, else its .bdg / .cmg for a .bdp / .cmp */
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+/* test builds: what a frame did that can make it a long one, for main.c's "xbox hitch" line (vol.c holds it) */
+typedef struct {
+    uint32_t reads, read_bytes, opens;   /* reads of the VOL or a Wii file, their bytes, files opened for them */
+    double read_s;                       /* the time in them */
+    uint32_t sounds, sound_bytes;        /* samples decoded from the disc, their PCM bytes */
+    double sound_s;
+    uint32_t textures;                   /* textures made */
+    double texture_s;
+    uint32_t meshes;                     /* a lean bundle's mesh streams fetched */
+    double step_s, draw_s, swap_s;       /* the game's step, the frame's drawing, the wait for the GPU and the screen */
+    double lap[6];                       /* the window's events, the pads, the sound's update, the scene's, the
+                                          * sound's output, the monsters' poses */
+} XboxHitch;
+extern XboxHitch g_xhitch;
+double win_time(void);
+#define XHITCH(field, n) (g_xhitch.field += (n))
+#else
+#define XHITCH(field, n) ((void)0)
+#endif
 const VolFile *vol_find(const Vol *v, const char *name);
 /* A checked, allocation-free slice of a VOL/Wii/APK member. Main-thread use only: the
  * underlying FILE position is shared, so every caller seeks before reading. 0 = ok. */
@@ -62,6 +82,8 @@ typedef struct {
      * tables and MONSTER_DATA into the PS2's layout, so they read as the PS2's, and its textures' headers (u32 kind,
      * u32 GX format, u16 width, height, mips: tex_decode reads their GX pixels) */
     int wii;
+    int ps2_mesh;                                        /* a Wii bundle whose rigid meshes (type 0) the preparation tool
+                                                          * has rewritten in the PS2's format (header byte 0x2B = 'P') */
     const Vol *src; VolFile src_file;                    /* a lean bundle's file (bdp_open), NULL: all in memory */
     uint32_t *name_slot; uint32_t name_mask;             /* the Xbox's: bdp_find_name's hash table (name index + 1,
                                                           * 0 empty), NULL: the names are compared one by one */
@@ -94,6 +116,10 @@ int tex_decode(const Bundle *b, const BdpEntry *e, uint8_t **rgba, int *w, int *
 /* an 8-bit texture unexpanded: its indices in rows (malloc'd, w x h bytes) and its 256 RGBA colours; the same
  * results as tex_decode, TEX_DECODE_ERROR for a texture that is not 8-bit (tex.c) */
 int tex_indexed(const Bundle *b, const BdpEntry *e, uint8_t **index, uint8_t pal[256][4], int *w, int *h);
+/* the Xbox: a Wii texture in one of the GPU's own formats, with its file's mip levels (tex.c) */
+enum { TEX_NATIVE_DXT1 = 1, TEX_NATIVE_A1R5G5B5 = 2, TEX_NATIVE_A4R4G4B4 = 3, TEX_NATIVE_I8 = 4 };
+int tex_gx_native(const Bundle *b, const BdpEntry *e, int skip, int *kind, uint8_t **data, uint32_t *size, int *w,
+                  int *h, int *levels);
 #endif
 
 /* ---- meshes (types 0 and 17): one strip per part, triangulated */

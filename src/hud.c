@@ -549,11 +549,34 @@ typedef struct Node {
     struct Node *parent, *child, *next;
 } Node;
 
+/* A layout's nodes, sixteen at a time as they are needed: where they are stays (they point at each other). One
+ * table of MAX_NODES each was 136 KB a layout, and a game has some fifteen of them loaded (a clock and a HUD a
+ * player, the challenge bars, the results), most with twenty to forty nodes: 2 MB of a console's 64. */
+#define NODE_CHUNK 16
 typedef struct {
-    Node nodes[MAX_NODES];
+    Node *chunk[MAX_NODES / NODE_CHUNK];
     int n;
     Node *root;
 } Layout;
+
+static Node *layout_node(Layout *L)                      /* the next node, NULL when there is no room or no memory */
+{
+    if (L->n >= MAX_NODES)
+        return NULL;
+    int c = L->n / NODE_CHUNK;
+    if (!L->chunk[c] && (L->chunk[c] = calloc(NODE_CHUNK, sizeof(Node))) == NULL)
+        return NULL;
+    return &L->chunk[c][L->n++ % NODE_CHUNK];
+}
+
+static void layout_free(Layout *L)
+{
+    if (!L)
+        return;
+    for (int c = 0; c < MAX_NODES / NODE_CHUNK; c++)
+        free(L->chunk[c]);
+    free(L);
+}
 
 /* a tiny reader for the layout XML: <tag a="v" ...>text or elements</tag> (no comments, no entities) */
 typedef struct { const char *p, *end; } Xml;
@@ -773,9 +796,9 @@ static int node_kind(const char *tag)
 
 static Node *node_new(Layout *L, int kind)
 {
-    if (L->n >= MAX_NODES)
+    Node *nd = layout_node(L);
+    if (!nd)
         return NULL;
-    Node *nd = &L->nodes[L->n++];
     memset(nd, 0, sizeof *nd);
     nd->kind = kind;
     nd->m = 1;
@@ -909,7 +932,7 @@ static Layout *layout_load(Gui *g, const Bundle *b, const char *name)
     while (x.p < x.end && *x.p && xml_element(g, L, &x, NULL))
         xml_skip_ws(&x);
     if (!L->root) {
-        free(L);
+        layout_free(L);
         return NULL;
     }
     return L;
@@ -930,9 +953,9 @@ static Node *layout_find(Node *nd, const char *name)
  * addChild 0x242540 with no place given, which links it after the last] */
 static Node *node_copy(Layout *L, const Node *src, Node *parent)
 {
-    if (L->n >= MAX_NODES)
+    Node *c = layout_node(L);
+    if (!c)
         return NULL;
-    Node *c = &L->nodes[L->n++];
     *c = *src;
     c->child = NULL;
     node_attach(c, parent);
@@ -1790,19 +1813,19 @@ Hud *hud_open(const Bundle *worldgui, const Bundle *common, const HudConfig *cfg
     return h;
 }
 
-static void rage_free(Rage *r) { if (r) { free(r->L); free(r); } }
-static void screen_free(Screen *s) { if (s) { free(s->L); free(s); } }
-static void ctext_free(ChText *c) { if (c) { free(c->L); free(c); } }
+static void rage_free(Rage *r) { if (r) { layout_free(r->L); free(r); } }
+static void screen_free(Screen *s) { if (s) { layout_free(s->L); free(s); } }
+static void ctext_free(ChText *c) { if (c) { layout_free(c->L); free(c); } }
 
 void hud_close(Hud *h)
 {
     if (!h)
         return;
-    free(h->hud);
-    free(h->clock);
-    free(h->attract);
-    free(h->cs.L);
-    free(h->cs.L2);
+    layout_free(h->hud);
+    layout_free(h->clock);
+    layout_free(h->attract);
+    layout_free(h->cs.L);
+    layout_free(h->cs.L2);
     ctext_free(h->ct);
     for (int i = 0; i < h->nrages; i++)
         rage_free(h->rages[i]);

@@ -31,7 +31,10 @@ import struct
 import sys
 
 import bdp
-import tex
+try:
+    import tex                                           # (an export's textures: needs Pillow)
+except ImportError:                                      # (reading meshes does not: tools/wii2ps2.py in the
+    tex = None                                           # Xbox preparation tool, which has the library alone)
 
 Section = collections.namedtuple('Section', 'count format positions normals colours uvs closes weights bones tris',
                                  defaults=(None,))     # tris: the Wii's triangles (the PS2's come from the strip flags)

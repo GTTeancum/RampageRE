@@ -224,7 +224,16 @@ void plat_xbox_memory_tick(void)
         plat_xbox_printf("xbox memory_split heap_kb=%lu file_cache_kb=%lu pool_kb=%lu stack_kb=%lu image_kb=%lu gpu_and_other_kb=%lu\n",
                heap_kb, cache_kb, pool_kb, stack_kb, image_kb, used_kb > named ? used_kb - named : 0ul);
     }
-    fflush(stdout);
+    {
+        /* (to the disc every 30 s, not with every report: the write stalled the frame it fell in for a tenth of
+         * a second, and every fifth second of a test run had such a frame) */
+        static DWORD flushed_at;
+        if ((DWORD)(now - flushed_at) >= 30000) {
+            flushed_at = now;
+            printf("xbox log written to the disc\n");
+            fflush(stdout);
+        }
+    }
 #endif
 }
 /* The console's audio processor (the MCPX APU, registers at 0xFE800000) belongs to whatever ran before: a dashboard

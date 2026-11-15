@@ -1044,6 +1044,27 @@ static GLuint video_texture(Renderer *r)
 
 uint32_t rnd_triangles(const Renderer *r) { return r->drawn; }
 
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+/* test builds: the draws sent to the GPU and their indices, by kind (0 a batch, 1 a merged moving model, 2 a run of
+ * quads, 3 a skin posed by the GPU, 4 a part on the direct path, 5 a part through gl4es), for main.c's line every
+ * 5 s: at 1280 x 720 the frame is the GPU's, and it pays for each draw as well as for each triangle. */
+static struct { unsigned n[6], idx[6], frames; } xdraws;
+#define XDRAW(kind, indices) (xdraws.n[kind]++, xdraws.idx[kind] += (unsigned)(indices))
+void rnd_draw_stats(char *out, size_t cap)
+{
+    static const char *const NAME[6] = { "batch", "rigid", "quads", "skin", "part", "gl4es" };
+    float f = xdraws.frames ? 1.0f / xdraws.frames : 0;
+    int at = 0;
+    for (int k = 0; k < 6 && at >= 0 && (size_t)at < cap; k++)
+        at += snprintf(out + at, cap - at, "%s%s=%.0f/%.0f", k ? " " : "", NAME[k], xdraws.n[k] * f,
+                       xdraws.idx[k] * f / (k == 2 ? 2.0f : 3.0f));
+    memset(&xdraws, 0, sizeof xdraws);
+}
+void rnd_draw_stats_frame(void) { xdraws.frames++; }
+#else
+#define XDRAW(kind, indices) ((void)0)
+#endif
+
 /* a bundle's texture by name index, 0 none (a material's or a mesh's); texture_at with zero_ok: index 0 is a name too (an
  * effect's texture found by name: MemoryCard.bdp's Mem_arrow is name 0) */
 static BundleTex *bundle_tex(Renderer *r, const Bundle *b)
@@ -1090,7 +1111,8 @@ int g_xbox_p8_mips = 1;                  /* the 8-bit world textures with their 
                                           * whole 256 x 256 texture for a wall a few pixels high */
 /* test builds' --xskip N: kinds of drawing left out, to measure on a console what each costs. 1 the sky, 2 the
  * street, 4 the opaque batches, 8 the blended batches, 16 the items of the main pass, 32 the effects, 64 the HUD,
- * 128 the shadows, 256 the water, 512 the main pass's skinned items, 1024 its others. Always 0 in a normal build. */
+ * 128 the shadows, 256 the water, 512 the main pass's skinned items, 1024 its others, 2048 the parts that go through
+ * gl4es. Always 0 in a normal build. */
 int g_xbox_skip;
 #ifdef RAMPAGE_XBOX_TEST_ARGS
 #define XSKIP(bit) (g_xbox_skip & (bit))
@@ -1105,17 +1127,57 @@ int g_xbox_skip;
 int g_xbox_fx_budget = 200;
 /* Above 480 lines the budget follows the frame: what the rest of the frame takes is measured (the frame's time less
  * FX_SCREEN_MS for each screen of effects drawn in it, averaged over about a second), and the effects get what is
- * left of g_xbox_fx_frame_ms (--xfxframe N; 0: the fixed budget), between 0.4 and 1.5 of g_xbox_fx_budget. A street
+ * left of g_xbox_fx_frame_ms (--xfxframe N; 0: the fixed budget), between 0.25 and 1.5 of g_xbox_fx_budget. A street
  * that alone takes 31 ms leaves them under a screen, one that takes 26 over two. Not at 480 lines, where the frame's
  * time is the game's own work and thinner smoke would buy nothing. */
 int g_xbox_fx_frame_ms = 32;
 #define FX_SCREEN_MS 2.5f                /* a screen of blended effects at 1280 x 720 on a console's GPU (measured) */
+/* 0: a frame with a late sky (below) is not cleared to the fog's colour first; what the scene leaves bare is filled
+ * afterwards (xbox_far_fill). Clearing 1280 x 720 measured 1.2 ms of a console's frame, twice over, and the scene
+ * paints all but a strip at the bottom edge. 1 (--xon clearcolor): cleared, as before. 2 (test builds' --xon
+ * magenta): cleared to magenta and filled, to see in a capture what neither the scene nor the fill reaches. */
+int g_xbox_clear_color;
+
+/* The fog's colour behind everything that is drawn so far: one rectangle just inside the far plane, depth-tested and
+ * not written. Where the street and the buildings already are it draws nothing. */
+static void xbox_far_fill(const float colour[3], float tx, float ty)
+{
+    xs_end();
+    glPushAttrib(GL_ENABLE_BIT | GL_DEPTH_BUFFER_BIT | GL_CURRENT_BIT | GL_LIGHTING_BIT);
+    glPushClientAttrib(GL_CLIENT_VERTEX_ARRAY_BIT);
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+    glDisable(GL_TEXTURE_2D);
+    glDisable(GL_LIGHTING);
+    glDisable(GL_FOG);
+    glDisable(GL_BLEND);
+    glDisable(GL_ALPHA_TEST);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDepthMask(GL_FALSE);
+    glDisableClientState(GL_NORMAL_ARRAY);
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    glDisableClientState(GL_COLOR_ARRAY);
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glColor4f(colour[0], colour[1], colour[2], 1);
+    const float z = -2950.0f, x = 2950.0f * tx * 1.05f, y = 2950.0f * ty * 1.05f;   /* (the far plane is at 3,000) */
+    const float v[12] = { -x, -y, z,  x, -y, z,  x, y, z,  -x, y, z };
+    glVertexPointer(3, GL_FLOAT, 0, v);
+    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    glPopMatrix();
+    glPopClientAttrib();
+    glPopAttrib();
+    XS_TEXTURE_BOUND();
+}
 int g_xbox_sky_late = 1;                 /* the sky after the street and the batched buildings, behind them by the
                                           * depth test (--xoff skylate: first, over the whole screen, as the PS2) */
 #endif
 #if defined(RAMPAGE_XBOX) && defined(RAMPAGE_XBOX_EXACT_PALETTE)
 extern GLboolean gliTexturePalette8(GLsizei width, GLsizei height, const GLubyte *indices, const GLubyte *palette_rgba,
                                     GLboolean mips);
+extern void gliTexturePlaceholderNext(void);
 
 /* The PS2's world textures are 8-bit with a palette, and that is what the Xbox's GPU stores them as. They used to
  * go there the long way round: expanded to full colour, uploaded, then (try_exact_palette) the GPU waited for, the
@@ -1145,10 +1207,77 @@ static GLuint xbox_texture_p8(Renderer *r, const Bundle *b, uint32_t name)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-    /* the image's size and format for gl4es and the driver, no pixels; then the storage itself */
+    /* the image's size and format for gl4es and the driver, no pixels (the driver told to give it one page: its
+     * storage is replaced at once); then the storage itself */
+    gliTexturePlaceholderNext();
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
     GLboolean ok = gliTexturePalette8(w, h, index, &pal[0][0], g_xbox_p8_mips ? GL_TRUE : GL_FALSE);
     free(index);
+    if (!ok) {                                       /* (no memory, or not the storage expected: the ordinary way) */
+        glDeleteTextures(1, &id);
+        return 0;
+    }
+    tex_aniso();
+    pump_output(r);
+    return id;
+}
+#endif
+
+#if defined(RAMPAGE_XBOX) && defined(RAMPAGE_XBOX_EXACT_PALETTE)
+extern GLboolean gliTextureNative(GLsizei width, GLsizei height, GLint kind, const GLubyte *data, GLsizei size,
+                                  GLsizei levels);
+int g_xbox_gx_native = 1;                /* gxnative: the Wii's textures in the GPU's own formats (--xoff gxnative:
+                                          * expanded to full colour, as before) */
+int g_xbox_gx_skip = -1;                 /* --xgxskip N: that many of the largest levels left out of the Wii's
+                                          * textures of 512 texels a side or more (a half, a quarter of their
+                                          * size). -1: one at more than 480 lines, where the screens take 8 MB
+                                          * more of the console's memory, none otherwise. Dallas has four textures
+                                          * of 1024 and the Wii's monsters one of 512 each (the PS2's: 256). */
+extern void gliTexturePlaceholderNext(void);
+
+/* A Wii bundle's world texture as the GPU stores it (tex.c tex_gx_native: DXT1 for the Wii's CMPR, 16 bits for
+ * its RGB5A3, 8 bits with a grey palette for its I8), with the mip levels of its file. Expanded to full colour,
+ * as the PC does, Dallas's textures alone are 21 MB of a console's 64. Returns the GL texture, 0 for a texture
+ * that has to go the ordinary way (the HUD's, any other format or size). */
+static GLuint xbox_texture_gx(Renderer *r, const Bundle *b, uint32_t name)
+{
+    if (!g_xbox_gx_native || !b->wii || r->in_hud || r->in_hud_quad || g_mips)
+        return 0;
+    const BdpEntry *e = bdp_entry_of(b, name, ET_TEXTURE);
+    uint8_t *data = NULL;
+    uint32_t size = 0;
+    int kind = 0, w = 0, h = 0, levels = 0;
+    int xbox_pixel_height(void);
+    int big = e && e->size >= 0x10 && (rd16(e->data + 8) >= 512 || rd16(e->data + 10) >= 512);
+    int skip = g_xbox_gx_skip >= 0 ? g_xbox_gx_skip : xbox_pixel_height() > 480 ? 1 : 0;
+    if (tex_gx_native(b, e, big ? skip : 0, &kind, &data, &size, &w, &h, &levels) != TEX_DECODE_OK)
+        return 0;
+    GLuint id = 0;
+    glGenTextures(1, &id);
+    if (!id) {
+        free(data);
+        return 0;
+    }
+    glBindTexture(GL_TEXTURE_2D, id);
+    XS_TEXTURE_BOUND();
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    /* the image's size and format for gl4es and the driver, no pixels (the driver told to give it one page: its
+     * storage is replaced at once); then the storage itself */
+    gliTexturePlaceholderNext();
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    GLboolean ok;
+    if (kind == TEX_NATIVE_I8) {
+        static uint8_t grey[256][4];
+        if (!grey[255][0])
+            for (int i = 0; i < 256; i++)
+                grey[i][0] = grey[i][1] = grey[i][2] = grey[i][3] = (uint8_t)i;   /* (GX: intensity into alpha too) */
+        ok = gliTexturePalette8(w, h, data, &grey[0][0], g_xbox_p8_mips ? GL_TRUE : GL_FALSE);
+    } else
+        ok = gliTextureNative(w, h, kind, data, (GLsizei)size, levels);
+    free(data);
     if (!ok) {                                       /* (no memory, or not the storage expected: the ordinary way) */
         glDeleteTextures(1, &id);
         return 0;
@@ -1182,9 +1311,10 @@ static GLuint texture_at(Renderer *r, const Bundle *b, uint32_t name, int zero_o
         uint8_t *rgba;
         int w, h;
         slots[name] = ~0u;
+        XHITCH(textures, 1);
 #if defined(RAMPAGE_XBOX) && defined(RAMPAGE_XBOX_EXACT_PALETTE)
         {
-            GLuint direct = xbox_texture_p8(r, b, name);
+            GLuint direct = b->wii ? xbox_texture_gx(r, b, name) : xbox_texture_p8(r, b, name);
             if (direct) {
                 slots[name] = direct;
                 return direct;
@@ -1196,6 +1326,13 @@ static GLuint texture_at(Renderer *r, const Bundle *b, uint32_t name, int zero_o
             slots[name] = 0;             /* missing/invalid images stay negative-cached; OOM can retry */
             return 0;
         }
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+        if (decoded == TEX_DECODE_OK && b->wii) {    /* test builds: a Wii texture that went the full-colour way */
+            const BdpEntry *we = bdp_entry_of(b, name, ET_TEXTURE);
+            printf("wii texture full colour: %s %dx%d format %u%s\n", bdp_name(b, name), w, h,
+                   we ? (unsigned)rd32(we->data + 4) : 0u, r->in_hud_quad ? " (hud)" : r->in_hud ? " (hud 3d)" : "");
+        }
+#endif
         if (decoded == TEX_DECODE_OK) {
             GLuint id = 0;
             glGenTextures(1, &id);
@@ -1909,6 +2046,7 @@ static void bat_draw(Renderer *r, const BatKey *key, const BatSub *b)
             glDepthFunc(GL_LEQUAL);
         }
     }
+    XDRAW(0, nidx);
     if (b->registered && gl4es_xbox_predraw())
         gliDirectDraw(b->pos, b->nrm, b->uv, b->col, r->bat_idx, (int)nidx);
     else {                                           /* (gl4es has work to do for this texture) */
@@ -2471,6 +2609,7 @@ static int rig_draw(Renderer *r, RigMesh *rm, uint32_t i0)
         if (test_was)
             glDisable(GL_ALPHA_TEST);
         int ok = gl4es_xbox_predraw();
+        XDRAW(1, b->nidx);
         if (ok)
             gliSkinDraw(b->pos, b->nrm, b->uv, b->col, b->bone, b->weight, b->idx, (int)b->nidx,
                         (const float (*)[12])pal, (int)rm->n, 0);
@@ -2529,6 +2668,7 @@ static void qb_flush(void)
 {
     if (!qb.n)
         return;
+    XDRAW(2, qb.n * 4);
     if (qb.direct) {
         gliDirectQuads(qb.chunk + qb.run_at, qb.n * 4);
         qb.chunk_at = qb.run_at + (uint32_t)qb.n * 4u * QB_VERTEX;
@@ -2715,7 +2855,15 @@ typedef struct {
                                                       * a draw from the client arrays sets the texture matrix */
     float rs[2];
     const float *cpos, *cnrm, *cuv, *ccol;           /* the client arrays */
+    int sphere;                                      /* the texture goes on at the sphere-map coordinates: made
+                                                      * by the GPU on the direct path (gliDirectSphereMap), by
+                                                      * gl4es otherwise (sphere_coords) */
 } XboxDirect;
+
+static void sphere_coords(int on);
+extern void gliDirectSphereMap(GLboolean on, GLfloat ks, GLfloat kt);
+int g_xbox_gpu_sphere = 1;               /* gpusphere: a reflection's coordinates from the GPU (--xoff gpusphere:
+                                          * from gl4es, each vertex each frame, as before) */
 
 static void xbox_client_arrays(XboxDirect *d)
 {
@@ -2752,6 +2900,7 @@ static void xbox_skin_draw(Renderer *r, const SkinGpu *sg)
                 gp[j][4 * row + 3] = m[12 + row];
             }
         }
+        XDRAW(3, g->nidx);
         gliSkinDraw(g->pos, g->nrm, g->uv, g->col, g->bone, g->weight, g->idx, (int)g->nidx,
                     (const float (*)[12])gp, g->nb, g->four);
     }
@@ -2794,6 +2943,10 @@ static void xbox_skin_demote(Renderer *r, const SceneMesh *sm, const Skin *skin)
     }
 }
 
+#ifdef RAMPAGE_XBOX_TEST_ARGS
+static struct { const char *tex; int env, scroll, rid, skin, own, stale; } xslow;   /* (draw_part's, for the line below) */
+#endif
+
 static void xbox_part_draw(Renderer *r, XboxDirect *d, GLsizei count, GLenum idx_type, const void *idx)
 {
     if (d->sg) {
@@ -2803,10 +2956,35 @@ static void xbox_part_draw(Renderer *r, XboxDirect *d, GLsizei count, GLenum idx
             ((Skin *)d->skin)->gpu_skin = -1;
         return;
     }
-    if (d->ok && gl4es_xbox_predraw()) {
+    if (d->ok && (!d->sphere || (g_xbox_gpu_sphere && d->nrm)) && gl4es_xbox_predraw()) {
+        XDRAW(4, d->nidx16 ? d->nidx16 : count);
+        if (d->sphere)                               /* (sphere_coords' scale: k and -k about the middle) */
+            gliDirectSphereMap(GL_TRUE, 0.3394f * 2.828427f, -0.3394f * 2.828427f);
         gliDirectDraw(d->pos, d->nrm, d->uv, d->col, d->idx16, d->nidx16 ? (int)d->nidx16 : count);
+        if (d->sphere)
+            gliDirectSphereMap(GL_FALSE, 0, 0);
         return;
     }
+    XDRAW(5, count);
+#ifdef RAMPAGE_XBOX_TEST_ARGS
+    {                                                /* test builds: what goes this way, each texture said once */
+        static const char *said[48];
+        static int nsaid;
+        int k = 0;
+        while (k < nsaid && said[k] != xslow.tex)
+            k++;
+        if (k == nsaid && nsaid < 48) {
+            said[nsaid++] = xslow.tex;
+            printf("xbox slow draw: texture %s, %d triangles, arrays in store %d, predraw %d, env %d, scroll %d, "
+                   "region %d, skin %d, own %d, stale %d\n", xslow.tex ? xslow.tex : "-", (int)count / 3, d->ok,
+                   d->ok ? 0 : -1, xslow.env, xslow.scroll, xslow.rid, xslow.skin, xslow.own, xslow.stale);
+        }
+    }
+#endif
+    if (XSKIP(2048))
+        return;
+    if (d->sphere)
+        sphere_coords(1);
     if (!d->arrays_set)
         xbox_client_arrays(d);
     if (d->baked) {                                  /* (gl4es has work for this texture: the part's own arrays,
@@ -2822,6 +3000,8 @@ static void xbox_part_draw(Renderer *r, XboxDirect *d, GLsizei count, GLenum idx
         glLoadIdentity();
         glMatrixMode(GL_MODELVIEW);
     }
+    if (d->sphere)
+        sphere_coords(0);
 }
 
 /* part pi of a skinned scene mesh as the GPU poses it, made at its first draw; NULL: not this part (no normals,
@@ -3193,7 +3373,7 @@ static void draw_part(Renderer *r, const SceneMesh *sm, const Skin *skin, uint32
         glDisable(GL_ALPHA_TEST);
 #ifdef RAMPAGE_XBOX
     if (env_only) {
-        sphere_coords(1);
+        xd.sphere = 1;                               /* (xbox_part_draw: by the GPU, or sphere_coords) */
         xs_light(0);
         xd.col = xd.ccol = NULL;
         if (xd.arrays_set)
@@ -3210,13 +3390,24 @@ static void draw_part(Renderer *r, const SceneMesh *sm, const Skin *skin, uint32
     }
 #endif
 #ifdef RAMPAGE_XBOX
+#ifdef RAMPAGE_XBOX_TEST_ARGS
+    xslow.tex = bdp_name(sm->b, tex);
+    xslow.env = env_only + 2 * (layer != 0) + 4 * (cube != 0);
+    xslow.scroll = scroll;
+    xslow.rid = rid ? 1 + baked : 0;
+    xslow.skin = skin != NULL;
+    xslow.own = xp ? xp->own : -1;
+    xslow.stale = xp ? xp->stale + 2 * (xp->vbo == 1) : -1;
+#endif
     xbox_part_draw(r, &xd, (GLsizei)(3 * p->ntris), idx_type, idx);
 #else
     glDrawElements(GL_TRIANGLES, (GLsizei)(3 * p->ntris), idx_type, idx);
 #endif
     if (env_only) {
+#ifdef RAMPAGE_XBOX
+        xd.sphere = 0;
+#else
         sphere_coords(0);
-#ifndef RAMPAGE_XBOX
         if (lit_was)
             glEnable(GL_LIGHTING);
 #endif
@@ -3272,11 +3463,14 @@ static void draw_part(Renderer *r, const SceneMesh *sm, const Skin *skin, uint32
         glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_TEXTURE_BIT | GL_LIGHTING_BIT);
         glEnable(GL_TEXTURE_2D);
         glBindTexture(GL_TEXTURE_2D, env);
+#ifndef RAMPAGE_XBOX
         sphere_coords(1);
+#endif
         glDisable(GL_LIGHTING);
         glDisable(GL_FOG);
         glDisable(GL_ALPHA_TEST);
 #ifdef RAMPAGE_XBOX
+        xd.sphere = 1;
         xd.col = xd.ccol = NULL;
         if (xd.arrays_set)
             xs_client(&xs.col, GL_COLOR_ARRAY, 0);
@@ -3291,10 +3485,11 @@ static void draw_part(Renderer *r, const SceneMesh *sm, const Skin *skin, uint32
         glDepthMask(GL_FALSE);
 #ifdef RAMPAGE_XBOX
         xbox_part_draw(r, &xd, (GLsizei)(3 * p->ntris), idx_type, idx);
+        xd.sphere = 0;
 #else
         glDrawElements(GL_TRIANGLES, (GLsizei)(3 * p->ntris), idx_type, idx);
-#endif
         sphere_coords(0);
+#endif
         glPopAttrib();
     }
 #ifndef RAMPAGE_XBOX
@@ -3840,7 +4035,7 @@ static void draw_fx(Renderer *r, const FxQuad *fx, int nfx, const Camera *cam, f
      * particles is left out, the same ones from frame to frame (FxQuad.key; those next to go are faded, so none
      * pops), and the ones drawn are made as much denser as it takes to hide what all of them hid (fx_denser; an
      * additive quad as much brighter). A particle the game draws several times over (int.multiple_render) is
-     * drawn once, denser the same way. Never under a fifth of them; back up slowly, down at once. */
+     * drawn once, denser the same way. Never under a seventh of them; back up slowly, down at once. */
     int govern = world && g_xbox_fx_budget > 0;
     float keep = 1;
     if (govern) {
@@ -3860,11 +4055,11 @@ static void draw_fx(Renderer *r, const FxQuad *fx, int nfx, const Camera *cam, f
             if (took > 10.0f && took < 100.0f)             /* (not a load, nor the first frame) */
                 rest_ms += (took - FX_SCREEN_MS * drawn - rest_ms) * 0.05f;
             float room = ((float)g_xbox_fx_frame_ms - rest_ms) / FX_SCREEN_MS;
-            budget = room < 0.4f * budget ? 0.4f * budget : room > 1.5f * budget ? 1.5f * budget : room;
+            budget = room < 0.25f * budget ? 0.25f * budget : room > 1.5f * budget ? 1.5f * budget : room;
         }
         float want = total > budget ? budget / total : 1;
-        if (want < 0.2f)
-            want = 0.2f;
+        if (want < 0.15f)
+            want = 0.15f;
         keep = want < keep_was ? want : fminf(want, keep_was + 0.02f);
         keep_was = keep;
         drawn = total * keep;
@@ -4171,8 +4366,18 @@ void rnd_frame(Renderer *r, const Window *w, const Camera *cam, double t, int fo
     if (s && s->nitems)                                    /* port extra: MSAA / SMAA draw the 3D picture into their
                                                             * target (postfx.c; nothing while they are off) */
         postfx_begin(w->width, w->height);
+#ifdef RAMPAGE_XBOX
+    /* (g_xbox_clear_color: with a sky the colour waits until it is known whether the sky is drawn late) */
+    int far_fill = g_xbox_clear_color != 1 && s && s->sky >= 0;
+    if (g_xbox_clear_color == 2)
+        glClearColor(1, 0, 1, 1);
+    else
+        glClearColor(sky[0], sky[1], sky[2], 1);
+    glClear(far_fill && g_xbox_clear_color != 2 ? GL_DEPTH_BUFFER_BIT : GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+#else
     glClearColor(sky[0], sky[1], sky[2], 1);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+#endif
     if (!s)
         return;
     float aspect = w->height ? (float)w->width / w->height : 1;
@@ -4271,6 +4476,11 @@ void rnd_frame(Renderer *r, const Window *w, const Camera *cam, double t, int fo
 #ifdef RAMPAGE_XBOX
     if (XSKIP(1))
         sky_late = 0;
+    if (far_fill && !sky_late) {                     /* (the sky first, as the PS2: the frame cleared after all) */
+        if (g_xbox_clear_color != 2)
+            glClear(GL_COLOR_BUFFER_BIT);
+        far_fill = 0;
+    }
     if (s->sky >= 0 && !sky_late && !XSKIP(1)) {
 #else
     if (s->sky >= 0 && !sky_late) {
@@ -4331,6 +4541,8 @@ void rnd_frame(Renderer *r, const Window *w, const Camera *cam, double t, int fo
                  * its distance (sky_k, above) and tested against what is there, so it costs only where it shows;
                  * its depth is still not written, and what comes after (monsters, people, the blended parts, the
                  * effects) is drawn over it as before. */
+                if (far_fill)
+                    xbox_far_fill(sky, tx, ty);
                 glLoadMatrixf(view_mv);
                 glDepthMask(GL_FALSE);
                 glDisable(GL_FOG);

@@ -57,6 +57,98 @@ failed:
     return result;
 }
 
+#ifdef RAMPAGE_XBOX_TEST_ARGS
+/* test builds: each file of the Wii folder said once when it is first read (which of them a console needs) */
+static void wii_read_said(const Vol *v, const VolFile *f)
+{
+    static uint8_t said[1024];
+    if (!v || !f || !f->path || f < v->wii || f >= v->wii + v->nwii)
+        return;
+    uint32_t i = (uint32_t)(f - v->wii);
+    if (i < sizeof said && !said[i]) {
+        said[i] = 1;
+        printf("wii read %s %u\n", f->name, (unsigned)f->size);
+    }
+}
+#else
+#define wii_read_said(v, f) ((void)0)
+#endif
+
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+XboxHitch g_xhitch;
+#endif
+
+/* The files of the Wii folder that have been read stay open. A lean bundle's textures and meshes and a sound
+ * bank's samples are read from their files a piece at a time, in play too (a building's next damage state, a
+ * sound heard for the first time), and opening a file is 30 to 45 ms on a console's hard disc: with the file
+ * opened for each read, and then with only the last one kept open, 44 of 51 long frames of a Dallas run were a
+ * file being opened again (the bundle and the sound bank taking turns). The PS2's data never pays it: it is one
+ * archive, open from the start. Main thread only, as every read of the game's data is. */
+#ifdef RAMPAGE_XBOX
+#define PATH_FILES 12                    /* (in play: the city, the sound bank, the effects, the HUD, four monsters) */
+static struct { const char *path; HANDLE h; uint32_t used; } path_files[PATH_FILES];
+static uint32_t path_clock;
+
+static HANDLE path_handle(const char *path)
+{
+    int slot = -1, oldest = -1;
+    for (int i = 0; i < PATH_FILES; i++) {
+        if (path_files[i].path == path) {
+            path_files[i].used = ++path_clock;
+            return path_files[i].h;
+        }
+        if (!path_files[i].path) {
+            if (slot < 0) slot = i;
+        } else if (oldest < 0 || path_files[i].used < path_files[oldest].used)
+            oldest = i;
+    }
+    char resolved[MAX_PATH];
+    if (!plat_xbox_path(path, resolved, sizeof resolved, 0))
+        return INVALID_HANDLE_VALUE;
+    HANDLE h = CreateFileA(resolved, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    XHITCH(opens, 1);
+    if (h == INVALID_HANDLE_VALUE)
+        return h;
+    if (slot < 0) {                                      /* (all in use: the one read longest ago gives way) */
+        slot = oldest;
+        CloseHandle(path_files[slot].h);
+    }
+    path_files[slot].path = path;
+    path_files[slot].h = h;
+    path_files[slot].used = ++path_clock;
+    return h;
+}
+
+/* size bytes at `at` of the file `path`, 0 when read */
+static int path_read(const char *path, uint64_t at, void *out, size_t size)
+{
+    HANDLE h = path_handle(path);
+    if (h == INVALID_HANDLE_VALUE)
+        return -1;
+    LONG high = (LONG)(at >> 32);
+    if (SetFilePointer(h, (LONG)(uint32_t)at, &high, FILE_BEGIN) == INVALID_SET_FILE_POINTER &&
+        GetLastError() != NO_ERROR)
+        return -1;
+    DWORD got = 0;
+    return ReadFile(h, out, (DWORD)size, &got, NULL) && got == (DWORD)size ? 0 : -1;
+}
+#else
+static FILE *path_file;
+static const char *path_file_of;
+
+static int path_read(const char *path, uint64_t at, void *out, size_t size)
+{
+    if (!path_file || path_file_of != path) {
+        if (path_file)
+            fclose(path_file);
+        path_file = fopen(path, "rb");
+        path_file_of = path_file ? path : NULL;
+    }
+    return path_file && _fseeki64(path_file, (int64_t)at, SEEK_SET) == 0 &&
+           fread(out, 1, size, path_file) == size ? 0 : -1;
+}
+#endif
+
 static const VolFile *find_in(const VolFile *files, uint32_t n, const char *name)
 {
     for (uint32_t i = 0; i < n; i++)
@@ -87,15 +179,21 @@ int vol_read_range(const Vol *v, const VolFile *file, uint32_t offset, void *out
         return -1;
     if (!size)
         return 0;
-    FILE *h = file->path ? fopen(file->path, "rb") : v->f;
+    wii_read_said(v, file);
     int64_t base = file->path ? 0 : v->base;
-    if (base < 0 || base > INT64_MAX - (int64_t)file->offset - offset) {
-        if (file->path && h) fclose(h);
+    if (base < 0 || base > INT64_MAX - (int64_t)file->offset - offset)
         return -1;
-    }
-    int ok = h && _fseeki64(h, base + file->offset + offset, SEEK_SET) == 0 && fread(out, 1, size, h) == size;
-    if (file->path && h)
-        fclose(h);
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+    double t0 = win_time();
+#endif
+    int ok = file->path ? path_read(file->path, (uint64_t)file->offset + offset, out, size) == 0
+                        : v->f && _fseeki64(v->f, base + file->offset + offset, SEEK_SET) == 0 &&
+                          fread(out, 1, size, v->f) == size;
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+    g_xhitch.reads++;
+    g_xhitch.read_bytes += (uint32_t)size;
+    g_xhitch.read_s += win_time() - t0;
+#endif
     return ok ? 0 : -1;
 }
 
@@ -104,12 +202,19 @@ uint8_t *vol_read(const Vol *v, const char *name, uint32_t *size)
     const VolFile *f = vol_find(v, name);
     if (!f)
         return NULL;
+    wii_read_said(v, f);
     uint8_t *buf = malloc(f->size ? f->size : 1);
-    FILE *h = f->path ? fopen(f->path, "rb") : v->f;
-    int ok = buf && h && _fseeki64(h, (f->path ? 0 : v->base) + f->offset, SEEK_SET) == 0 &&
-             fread(buf, 1, f->size, h) == f->size;
-    if (f->path && h)
-        fclose(h);
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+    double t0 = win_time();
+#endif
+    int ok = buf && (f->path ? path_read(f->path, f->offset, buf, f->size) == 0
+                             : v->f && _fseeki64(v->f, v->base + f->offset, SEEK_SET) == 0 &&
+                               fread(buf, 1, f->size, v->f) == f->size);
+#if defined RAMPAGE_XBOX && defined RAMPAGE_XBOX_TEST_ARGS
+    g_xhitch.reads++;
+    g_xhitch.read_bytes += f->size;
+    g_xhitch.read_s += win_time() - t0;
+#endif
     if (!ok) {
         free(buf);
         return NULL;
@@ -122,11 +227,9 @@ uint8_t *vol_read(const Vol *v, const char *name, uint32_t *size)
 uint8_t *vol_read_wii(const Vol *v, const char *name, uint32_t *size)
 {
     const VolFile *f = find_in(v->wii, v->nwii, name);
-    FILE *h = f ? fopen(f->path, "rb") : NULL;
-    uint8_t *buf = h ? malloc(f->size ? f->size : 1) : NULL;
-    int ok = buf && _fseeki64(h, f->offset, SEEK_SET) == 0 && fread(buf, 1, f->size, h) == f->size;
-    if (h)
-        fclose(h);
+    wii_read_said(v, f);
+    uint8_t *buf = f ? malloc(f->size ? f->size : 1) : NULL;
+    int ok = buf && path_read(f->path, f->offset, buf, f->size) == 0;
     if (!ok) {
         free(buf);
         return NULL;
