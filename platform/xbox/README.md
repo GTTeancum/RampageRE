@@ -1,6 +1,8 @@
 # Original Xbox build (work in progress)
 
-This directory is an experimental nxdk target, not a verified playable release.
+This directory is an experimental nxdk target. Version 0.8.0 is the first packaged release of it (`packaging/xbox`,
+with the Windows preparation tool of `tools/xbox_prep`); what was measured on a stock console is in
+`docs/XBOX_PERF_PLAN.md`.
 It uses the native RampageRE code rather than the PS2Recomp reference runner.
 Original game data is never included in the source repository or build output.
 

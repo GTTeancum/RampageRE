@@ -17,6 +17,8 @@ Rampage Xbox/
     Shell/
     Audio/
   asset-manifest.json   # Generated local file hashes, no input paths or keys
+                        # (data/XBOXTEX.RXT, the user's own Xbox button pictures made with
+                        # tools/xbox_glyphs.py, is kept when it is already there)
 licenses/
 ```
 
@@ -38,10 +40,9 @@ signature. It is not a cryptographic certification that the source is pristine.
 
 The optional Wii picker accepts a single-file WBFS or ISO, or a full Dolphin-
 extracted disc folder. Game/Shell/Audio are needed; Game-only folders are rejected.
-The GUI labels Wii preparation experimental because no complete real Wii source
-was available for end-to-end validation. Wii content does not replace the PS2
-base. RPGP5D is the source-backed reference release; other RPG?5D disc regions
-pass identity checking but are not independently verified. Wii Video and Wii
+Wii content does not replace the PS2 base. RPGP5D is the source-backed reference
+release and RPGE5D (USA) the one run end to end (see Verification scope); other
+RPG?5D disc regions pass identity checking but are not independently verified. Wii Video and Wii
 Rampage.elf are not used or copied. Split WBFS (.wbfs plus .wbf1) is rejected with
 an explicit message; use a single image or a full extracted folder.
 
@@ -70,8 +71,8 @@ fresh staging directory. It does not boot, emulate, or distribute the disc.
   case collisions, flat Wii basename collisions, invalid extents, short reads,
   wrong disc identity/version, and incomplete Wii selections are rejected.
 - Existing data is replaced only after explicit GUI confirmation. If Wii is
-  unchecked, existing Wii files are preserved. Saves, config, and default.xbe are
-  preserved byte for byte.
+  unchecked, existing Wii files are preserved. Saves, config, default.xbe and a
+  data/XBOXTEX.RXT are preserved byte for byte.
 - A process lock prevents simultaneous preparation of the same package.
 - All files are copied into a sibling staging directory and SHA-256 verified from
   disk before commit. Adequate staging-space headroom is checked first.
@@ -101,7 +102,7 @@ cargo test --locked --manifest-path disc_reader/Cargo.toml
 cargo build --locked --release --manifest-path disc_reader/Cargo.toml
 python -m unittest discover -s tests -v
 python collect_licenses.py licenses
-python -m PyInstaller --clean --noconfirm --onefile --windowed --name "Prepare Rampage Xbox" --add-binary "disc_reader/target/release/rampage-disc-reader.exe;." gui.py
+python -m PyInstaller --clean --noconfirm --onefile --windowed --name "Prepare Rampage Xbox" --paths .. --hidden-import wii2ps2 --hidden-import sound --hidden-import bdp --hidden-import mesh --add-binary "disc_reader/target/release/rampage-disc-reader.exe;." gui.py
 ```
 
 Preserve nod's included MIT and Apache notices, collect notices from the actual
@@ -121,7 +122,7 @@ if (-not $result.ok) { throw ($result | ConvertTo-Json -Depth 8) }
 ```
 
 The smoke test briefly opens the real GUI. It uses tiny synthetic data in a fresh
-temporary folder, validates missing input, double-click guarding, worker/staging
+temporary folder, checks that the Wii converter is inside the frozen build, validates missing input, double-click guarding, worker/staging
 completion, success notification, declined overwrite, and clean close. It never
 reads retail inputs. It patches fixture expectations only inside smoke mode.
 
@@ -142,16 +143,19 @@ python gui.py --headless --package RELEASE --ps2 OWNED.iso
 
 ## Verification scope
 
-- 50 synthetic Python tests passed on Linux, including extraction, cancellation,
+- 80 synthetic Python tests (`python -m unittest discover -s tests`), including extraction, cancellation,
   overwrite protection, recovery locking, malformed input, and license checks.
-- The complete owned USA PS2 ISO (4,627,202,048 bytes) was selected through the
-  GUI and prepared successfully on Linux. The three output file hashes matched
-  the original disc references; default.xbe was unchanged and no staging files
-  remained. Launching from a different working directory still used the tool's
-  own package folder.
-- Windows Actions compiles and tests the optional reader, builds the frozen EXE,
-  and runs a synthetic GUI test including the bundled helper. Consult that run's
-  status and gui-smoke.json for the result. Retail disc data is never uploaded
-  to CI, so this is separate from the real-input Linux GUI test.
-- No full real Wii ISO/WBFS was available. Optional Wii is not end-to-end verified.
-- Physical Xbox gameplay is not certified by these preparation checks.
+- Version 0.8.0, 2026-11-15, Windows 11: the release's own frozen EXE, unpacked from the downloaded ZIP into a
+  fresh folder, prepared the complete owned USA PS2 ISO (SLUS-21323 v1.01) and the complete owned USA Wii image
+  (RPGE5D, a single WBFS) through the same engine the window's button starts (`--headless`). RAMPAGE.VOL,
+  RAMPAGE.ELF and SYSTEM.CNF came out byte for byte the files that had run on a stock console the day before; the
+  converted Wii files (the sound bank, Dallas.bdg, fx.bdg, Shell.bdg) byte for byte the converted files that had
+  run there, and every other installed Wii file byte for byte the disc's. default.xbe was unchanged and no staging
+  folder remained.
+- Windows Actions compiles and tests the Wii reader, builds the frozen EXE, and runs a synthetic GUI test
+  including the bundled helper and the converter. Consult that run's status and gui-smoke.json for the result.
+  Retail disc data is never uploaded to CI.
+- Not covered: the European PS2 disc and the European Wii disc with this version, a Dolphin-extracted Wii folder
+  through the frozen EXE, and clicking through the window by hand with retail discs.
+- Physical Xbox gameplay is not certified by these preparation checks (docs/XBOX_PERF_PLAN.md has the console's
+  measurements).
