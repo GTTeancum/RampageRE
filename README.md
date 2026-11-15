@@ -15,6 +15,21 @@ It has two halves, the same way as [WoodyRE](https://github.com/jjmhalew/WoodyRE
 > Unofficial fan project for preservation. Not affiliated with or endorsed by Pipeworks, Midway, Warner Bros.
 > or Sony. Rampage and related names are trademarks of their owners. You need your own copy of the original game.
 
+## Screenshots
+
+The port running on a stock original Xbox at 1280x720
+([RampageRE Xbox 0.8.0](https://github.com/GTTeancum/RampageRE/releases/tag/xbox-v0.8.0)); each picture is a frame
+read out of the console's memory, four monsters in play.
+
+| | |
+|:-:|:-:|
+| ![Hong Kong](docs/screenshots/xbox-hongkong.jpg) | ![Dallas with the Wii's monsters](docs/screenshots/xbox-dallas-wii-monsters.jpg) |
+| Hong Kong | Dallas with the Wii's monsters (your own Wii disc) |
+| ![Las Vegas](docs/screenshots/xbox-lasvegas.jpg) | ![San Francisco](docs/screenshots/xbox-sanfrancisco.jpg) |
+| Las Vegas | San Francisco |
+| ![New York](docs/screenshots/xbox-newyork.jpg) | ![Los Angeles](docs/screenshots/xbox-losangeles.jpg) |
+| New York | Los Angeles |
+
 ## Status
 
 **Playable from start to end in the native port** (`RampageRE.exe`, [docs/NATIVE.md](docs/NATIVE.md)): the front end
